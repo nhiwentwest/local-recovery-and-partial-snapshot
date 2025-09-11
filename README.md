@@ -1,8 +1,8 @@
 # 1) Cơ sở & mục tiêu
 
-Ý tưởng học thuật: khi một operator stateful lỗi, chỉ phục hồi operator đó (**local recovery**), và dùng **partial snapshot**: thay vì chụp full state, ta **log delta** thay đổi để khôi phục bằng *snapshot + replay*. Đây là nội dung chính của paper *Local recovery and partial snapshot in distributed stateful stream processing* (KIIS, 30/06/2025). ([SpringerLink][1])
-Triển khai dựa FLIP-158 (Flink) – *state changelog / incremental checkpoints* để log mọi thay đổi, và **KIP-98** (Kafka) – *transactions* để bảo đảm **read→process→write** exactly-once (EOS). ([Apache Software Foundation][2])
-* **Khung dự án:** thêm 2 operator vào **ApolloFlow (Go)** – một task queue có mode Kafka/RabbitMQ, API/gRPC/WS cơ bản. ([GitHub][3])
+Ý tưởng: khi một operator stateful lỗi, chỉ phục hồi operator đó (local recovery), và dùng partial snapshot: thay vì chụp full state, ta log delta thay đổi để khôi phục bằng snapshot + replay. Đây là nội dung chính của paper Local recovery and partial snapshot in distributed stateful stream processing (KIIS, 30/06/2025). ([SpringerLink][1])
+Triển khai dựa FLIP-158 (Flink) – state changelog / incremental checkpoints để log mọi thay đổi, và KIP-98 (Kafka) – transactions để bảo đảm read→process→write exactly-once (EOS). ([Apache Software Foundation][2])
+Khung dự án: thêm 2 operator vào ApolloFlow (Go) – một task queue có mode Kafka/RabbitMQ, API/gRPC/WS cơ bản. ([GitHub][3])
 
 ---
 
@@ -102,8 +102,8 @@ Khi khởi động:
 
 ---
 
-[1]: https://link.springer.com/journal/10115/online-first?page=2&utm_source=chatgpt.com "Online first articles | Knowledge and Information Systems"
-[2]: https://cwiki.apache.org/confluence/display/FLINK/FLIP-158%3A%2BGeneralized%2Bincremental%2Bcheckpoints?utm_source=chatgpt.com "FLIP-158: Generalized incremental checkpoints"
+[1]: https://link.springer.com/journal/10115/online-first?page=2 "Online first articles | Knowledge and Information Systems"
+[2]: https://cwiki.apache.org/confluence/display/FLINK/FLIP-158%3A%2BGeneralized%2Bincremental%2Bcheckpoints "FLIP-158: Generalized incremental checkpoints"
 [3]: https://github.com/dattskoushik/apolloflow "GitHub - dattskoushik/apolloflow: This project is a distributed task queue implemented in Go, using RabbitMQ/Kafka for message passing. The system allows clients to submit tasks and receive real-time notifications via WebSockets or gRPC when their tasks have been completed"
-[4]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging?utm_source=chatgpt.com "KIP-98 - Exactly Once Delivery and Transactional Messaging"
-[5]: https://flink.apache.org/2022/05/30/improving-speed-and-stability-of-checkpointing-with-generic-log-based-incremental-checkpoints/?utm_source=chatgpt.com "Improving speed and stability of checkpointing with generic ..."
+[4]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging "KIP-98 - Exactly Once Delivery and Transactional Messaging"
+[5]: https://flink.apache.org/2022/05/30/improving-speed-and-stability-of-checkpointing-with-generic-log-based-incremental-checkpoints/ "Improving speed and stability of checkpointing with generic ..."
