@@ -1,4 +1,4 @@
-# 1) Cơ sở & mục tiêu (1 đoạn)
+# 1) Cơ sở & mục tiêu
 
 Ý tưởng học thuật: khi một operator stateful lỗi, chỉ phục hồi operator đó (**local recovery**), và dùng **partial snapshot**: thay vì chụp full state, ta **log delta** thay đổi để khôi phục bằng *snapshot + replay*. Đây là nội dung chính của paper *Local recovery and partial snapshot in distributed stateful stream processing* (KIIS, 30/06/2025). ([SpringerLink][1])
 Triển khai dựa FLIP-158 (Flink) – *state changelog / incremental checkpoints* để log mọi thay đổi, và **KIP-98** (Kafka) – *transactions* để bảo đảm **read→process→write** exactly-once (EOS). ([Apache Software Foundation][2])
@@ -24,7 +24,7 @@ orders ──▶ OpA (stateless normalize, EOS) ──▶ orders.enriched ──
 
 ApolloFlow đã có skeleton API/worker & hỗ trợ Kafka → chỉ thêm 2 service trên, tái dùng hạ tầng build/run. ([GitHub][3])
 
-## 3.2. Topics & cấu hình Kafka (dev)
+## 3.2. Topics & cấu hình Kafka
 
 ```bash
 # topics chính
@@ -83,7 +83,7 @@ Khi khởi động:
 
 ---
 
-# 4) Mô hình dữ liệu demo (dễ hiểu)
+# 4) Mô hình dữ liệu demo
 
 * `orders`: `{orderId, productId, price, qty, storeId, ts}`
 * `orders.enriched`: thêm `validated`, `normTs`… (OpA tạo)
@@ -92,7 +92,7 @@ Khi khởi động:
 
 ---
 
-# 5) Thử nghiệm bắt buộc & tiêu chí pass
+# 5) Test & tiêu chí pass
 
 1. **Local recovery:** kill -9 OpB ngẫu nhiên trong khi OpA vẫn chạy; kỳ vọng **TTR** (time-to-recover) nhỏ (ví dụ ≤ 5–10s) tính từ lúc OpB restart đến lúc lại có `orders.output`. (Theo paper, local recovery rút ngắn TTR đáng kể so với global rollback). ([SpringerLink][1])
 2. **Partial snapshot vs no-changelog:** bật/tắt ghi delta → so **thời gian snapshot**, **kích thước snapshot**, **bytes replay**. (Ý tưởng FLIP-158/GIC: snapshot nhanh & ổn định nhờ changelog). ([Apache Flink][5])
