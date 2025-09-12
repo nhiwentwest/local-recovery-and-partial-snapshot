@@ -6,7 +6,7 @@ Deadline 29/9 -> Chốt kết quả vào ngày 25/9 và làm slide.
 
 Báo cáo lần 1: họp buổi đầu ngày 19 hoặc ngày 20  - mọi người báo cáo mình đã làm những gì thôi, không cần phải xong hết. Có vấn đề gì thì có thể nhắn trong group hoặc đợi lúc báo cáo cũng được, nhưng mình sẽ xem tiến độ mỗi người ở buổi báo cáo này để điều chỉnh khối lượng công việc cho phù hợp với từng người, đặt mục tiêu để ngày 24/9 mọi người báo cáo lần nữa (lần này qua tin nhắn là okay).
 
-.
+```
 ├─ README.md
 ├─ docker-compose.yml
 ├─ Makefile
@@ -29,7 +29,7 @@ Báo cáo lần 1: họp buổi đầu ngày 19 hoặc ngày 20  - mọi ngườ
 │  └─ metrics/       # Người 3: Prometheus (TTR, lag, applied/skipped)
 └─ scripts/
    └─ topics.sh
-
+```
 
 ## Ghi chú công nghệ
 
