@@ -6,6 +6,31 @@ Deadline 29/9 -> Chốt kết quả vào ngày 25/9 và làm slide.
 
 Báo cáo lần 1: họp buổi đầu ngày 19 hoặc ngày 20  - mọi người báo cáo mình đã làm những gì thôi, không cần phải xong hết. Có vấn đề gì thì có thể nhắn trong group hoặc đợi lúc báo cáo cũng được, nhưng mình sẽ xem tiến độ mỗi người ở buổi báo cáo này để điều chỉnh khối lượng công việc cho phù hợp với từng người, đặt mục tiêu để ngày 24/9 mọi người báo cáo lần nữa (lần này qua tin nhắn là okay).
 
+.
+├─ README.md
+├─ docker-compose.yml
+├─ Makefile
+├─ contracts/
+│  └─ schema-v1.md
+├─ cmd/
+│  ├─ opa/           # Người 1: OpA (EOS KIP-98)
+│  │  └─ main.go
+│  ├─ opb/           # Người 2: OpB (agg + changelog + snapshot + recovery + EOS)
+│  │  └─ main.go
+│  └─ genorders/     # generator mẫu (TÙY CHỌN, chỉ để demo sau khi ghép; GĐ1 mỗi người dùng tool riêng trong nhánh của mình)
+│     └─ main.go
+├─ internal/
+│  ├─ eos/           # Người 1: helper Kafka transactions
+│  ├─ model/         # Người 1: struct + normalize cho orders.enriched
+│  ├─ state/         # Người 2: KV + key schema + seq/idempotency
+│  ├─ snapshot/      # Người 2: backup/restore + materialize
+│  ├─ manifest/      # Người 2: publish/read manifest (topic compacted)
+│  ├─ recovery/      # Người 3: boot OpB (load manifest -> restore -> replay)
+│  └─ metrics/       # Người 3: Prometheus (TTR, lag, applied/skipped)
+└─ scripts/
+   └─ topics.sh
+
+
 ## Ghi chú công nghệ
 
 * Ngôn ngữ: Go 1.21+
