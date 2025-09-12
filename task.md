@@ -1,5 +1,7 @@
 # README
 
+Đây là task plan tạm thời, có thể thay đổi.
+
 Deadline 29/9 -> Chốt kết quả vào ngày 25/9 và làm slide. 
 
 Báo cáo lần 1: họp buổi đầu ngày 19 hoặc ngày 20  - mọi người báo cáo mình đã làm những gì thôi, không cần phải xong hết. Có vấn đề gì thì có thể nhắn trong group hoặc đợi lúc báo cáo cũng được, nhưng mình sẽ xem tiến độ mỗi người ở buổi báo cáo này để điều chỉnh khối lượng công việc cho phù hợp với từng người. 
