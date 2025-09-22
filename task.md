@@ -27,7 +27,7 @@ Cấu trúc thư mục dưới đây, trong lúc làm mà thấy khác thì có 
 │  ├─ state/         # Người 2: KV + key schema + seq/idempotency
 │  ├─ snapshot/      # Người 2: backup/restore + materialize
 │  ├─ manifest/      # Người 2: publish/read manifest (topic compacted)
-│  ├─ recovery/      # Người 3: boot OpB (load manifest -> restore -> replay)
+│  ├─ restore/      # Người 3: boot OpB (load manifest -> restore -> replay)
 │  └─ metrics/       # Người 3: Prometheus (TTR, lag, applied/skipped)
 └─ scripts/
    └─ topics.sh
