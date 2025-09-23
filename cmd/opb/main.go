@@ -14,6 +14,8 @@ import (
 	"hpb/internal/restore"
 	"hpb/internal/snapshot"
 	"hpb/internal/state"
+
+	ck "github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 // Config holds CLI flags for OpB.
@@ -33,6 +35,9 @@ type Config struct {
 	TopicChangelog  string
 	TopicSnapshots  string
 	ManifestSource  string // file|kafka
+	// Kafka input for orders.enriched
+	InputSource   string // sample|kafka
+	TopicEnriched string
 }
 
 func main() {
@@ -58,6 +63,8 @@ func readFlags() Config {
 	flag.StringVar(&cfg.TopicChangelog, "topic-changelog", "p2.opb-changelog", "kafka topic for changelog (compacted)")
 	flag.StringVar(&cfg.TopicSnapshots, "topic-snapshots", "p2.opb-snapshots", "kafka topic for manifest (compacted)")
 	flag.StringVar(&cfg.ManifestSource, "manifest-source", "file", "manifest source for restore: file|kafka")
+	flag.StringVar(&cfg.InputSource, "input-source", "sample", "orders.enriched source: sample|kafka")
+	flag.StringVar(&cfg.TopicEnriched, "topic-enriched", "p1.orders.enriched", "kafka topic for orders.enriched input")
 	flag.Parse()
 	return cfg
 }
@@ -113,24 +120,67 @@ func run(cfg Config) error {
 		}))
 	}()
 
-	// Phase 1: simulate processing some events
-	sample := []opb.OrderEnriched{
-		{OrderID: "o1", ProductID: "p1", Price: 10000, Qty: 1, StoreID: "A", TS: 1694500000, Validated: true, NormTS: 1694500000},
-		{OrderID: "o2", ProductID: "p1", Price: 10000, Qty: 2, StoreID: "A", TS: 1694500010, Validated: true, NormTS: 1694500010},
-		{OrderID: "o3", ProductID: "p2", Price: 5000, Qty: 3, StoreID: "A", TS: 1694500020, Validated: true, NormTS: 1694500020},
-	}
-	for _, ev := range sample {
-		applied, out, seq, err := opb.AggregateAndBuildOutput(st, cfg.WindowSizeSec, ev)
+	if cfg.InputSource == "kafka" && cfg.KafkaBootstrap != "" {
+		// Consume orders.enriched from Kafka
+		c, err := ck.NewConsumer(&ck.ConfigMap{
+			"bootstrap.servers":  cfg.KafkaBootstrap,
+			"group.id":           cfg.GroupID,
+			"enable.auto.commit": false,
+			"isolation.level":    "read_committed",
+			"auto.offset.reset":  "earliest",
+		})
 		if err != nil {
-			return fmt.Errorf("aggregate: %w", err)
+			return fmt.Errorf("consumer: %w", err)
 		}
-		if applied {
-			b, _ := json.Marshal(out)
-			log.Printf("orders.output key=%s seq=%d value=%s", out.Key, seq, string(b))
-			if cfg.ChangelogOn {
-				d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
-				if err := clog.Append(d); err != nil {
-					return fmt.Errorf("append changelog: %w", err)
+		defer c.Close()
+		if err := c.SubscribeTopics([]string{cfg.TopicEnriched}, nil); err != nil {
+			return fmt.Errorf("subscribe: %w", err)
+		}
+		// Read a small batch for demo (Phase 1). Production: loop.
+		for i := 0; i < 5; i++ {
+			msg, err := c.ReadMessage(5 * time.Second)
+			if err != nil {
+				break
+			}
+			var ev opb.OrderEnriched
+			if err := json.Unmarshal(msg.Value, &ev); err != nil {
+				continue
+			}
+			applied, out, seq, err := opb.AggregateAndBuildOutput(st, cfg.WindowSizeSec, ev)
+			if err != nil {
+				return fmt.Errorf("aggregate: %w", err)
+			}
+			if applied {
+				b, _ := json.Marshal(out)
+				log.Printf("orders.output key=%s seq=%d value=%s", out.Key, seq, string(b))
+				if cfg.ChangelogOn {
+					d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
+					if err := clog.Append(d); err != nil {
+						return fmt.Errorf("append changelog: %w", err)
+					}
+				}
+			}
+		}
+	} else {
+		// Phase 1: simulate processing some events
+		sample := []opb.OrderEnriched{
+			{OrderID: "o1", ProductID: "p1", Price: 10000, Qty: 1, StoreID: "A", TS: 1694500000, Validated: true, NormTS: 1694500000},
+			{OrderID: "o2", ProductID: "p1", Price: 10000, Qty: 2, StoreID: "A", TS: 1694500010, Validated: true, NormTS: 1694500010},
+			{OrderID: "o3", ProductID: "p2", Price: 5000, Qty: 3, StoreID: "A", TS: 1694500020, Validated: true, NormTS: 1694500020},
+		}
+		for _, ev := range sample {
+			applied, out, seq, err := opb.AggregateAndBuildOutput(st, cfg.WindowSizeSec, ev)
+			if err != nil {
+				return fmt.Errorf("aggregate: %w", err)
+			}
+			if applied {
+				b, _ := json.Marshal(out)
+				log.Printf("orders.output key=%s seq=%d value=%s", out.Key, seq, string(b))
+				if cfg.ChangelogOn {
+					d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
+					if err := clog.Append(d); err != nil {
+						return fmt.Errorf("append changelog: %w", err)
+					}
 				}
 			}
 		}
