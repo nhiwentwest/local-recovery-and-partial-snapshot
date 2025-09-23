@@ -112,7 +112,11 @@ func NewRestorer(st state.Store, snap snapshot.Snapshotter, mr manifest.Reader, 
 type RestoreResult struct {
 	Applied int
 	Skipped int
-	Error   error
+	// Bytes is the total bytes of replayed deltas (Kafka/file)
+	Bytes int64
+	// LastAppliedOffset is the Kafka offset of the last applied delta (Kafka only)
+	LastAppliedOffset int64
+	Error             error
 }
 
 func (r *Restorer) RestoreFromSnapshot(snapshotID string) error {
@@ -194,6 +198,8 @@ func (r *Restorer) ReplayChangelogKafka(brokers []string, topic string, fromOffs
 	defer cancel()
 
 	applied, skipped := 0, 0
+	var bytes int64
+	var lastOffset int64 = -1
 	idx := int64(0)
 	for {
 		m, err := rd.ReadMessage(ctx)
@@ -220,8 +226,10 @@ func (r *Restorer) ReplayChangelogKafka(brokers []string, topic string, fromOffs
 		} else {
 			skipped++
 		}
+		bytes += int64(len(m.Value))
+		lastOffset = m.Offset
 	}
-	return RestoreResult{Applied: applied, Skipped: skipped}
+	return RestoreResult{Applied: applied, Skipped: skipped, Bytes: bytes, LastAppliedOffset: lastOffset}
 }
 
 func (r *Restorer) RestoreAndReplay() (RestoreResult, error) {

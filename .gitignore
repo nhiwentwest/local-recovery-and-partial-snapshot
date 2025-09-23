@@ -1,0 +1,20 @@
+# binaries
+bin/
+
+# local state (Badger)
+data/
+**/*.sst
+**/LOCK
+**/MANIFEST
+**/DISCARD
+
+# snapshots and changelog artefacts
+snapshots/**
+changelog/**
+
+# macOS
+.DS_Store
+
+# editor
+.idea/
+.vscode/
