@@ -1,0 +1,25 @@
+version: "3.8"
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.12
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9093
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,PLAINTEXT_HOST://localhost:19092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+    ports:
+      - "19092:9093"
+      - "9644:9644"
+      - "8082:8082"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536

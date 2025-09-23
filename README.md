@@ -1,10 +1,8 @@
-# 1) Cơ sở & mục tiêu
+# HPB - OpB (Aggregator, Changelog, Snapshot, Manifest)
 
-Bối cảnh: Một thành phố được chia thành nhiều khu (Quận A, Quận B…). Mỗi phút, có rất nhiều yêu cầu gọi xe phát sinh: có cuốc được bấm gọi, được ghép tài xế, hoàn tất, hoặc bị huỷ. Hệ thống theo dõi trực tuyến: cứ 60 giây lại tổng hợp cho từng khu xem có bao nhiêu yêu cầu, bao nhiêu ghép thành công, bao nhiêu hoàn tất, bao nhiêu bị huỷ. Nhờ đó, người vận hành biết khu nào đang “kẹt” để điều thêm xe hoặc điều chỉnh giá phù hợp. Điểm khác biệt của hệ thống là khi bộ phận “đếm & tổng hợp” gặp sự cố, các phần còn lại vẫn chạy bình thường. Khi bộ phận này bật lại, nó mở sổ ở lần lưu gần nhất rồi cộng bù các thay đổi vừa xảy ra để tiếp tục chính xác, không trùng và không thiếu. Vì thế, bảng điều độ không bị “đứng hình” và số liệu vẫn đúng ngay cả khi có lỗi xảy ra.
+This repository scaffolds the OpB service (Người 2) for the local-recovery-and-partial-snapshot project.
 
-Ý tưởng: khi một operator stateful lỗi, chỉ phục hồi operator đó (local recovery), và dùng partial snapshot: thay vì chụp full state, ta log delta thay đổi để khôi phục bằng snapshot + replay. Đây là nội dung chính của paper Local recovery and partial snapshot in distributed stateful stream processing (KIIS, 30/06/2025). ([SpringerLink][1])
-Triển khai dựa FLIP-158 (Flink) – state changelog / incremental checkpoints để log mọi thay đổi, và KIP-98 (Kafka) – transactions để bảo đảm read→process→write exactly-once (EOS). ([Apache Software Foundation][2])
-Khung dự án: thêm 2 operator vào ApolloFlow (Go) – một task queue có mode Kafka/RabbitMQ, API/gRPC/WS cơ bản. ([GitHub][3])
+## Components
 
 - Thành phố gửi yêu cầu liên tục (10k/s).
 - Trạm A (OpA) chuẩn hóa và đảm bảo mỗi yêu cầu chỉ được tính một lần.
@@ -19,55 +17,28 @@ Khung dự án: thêm 2 operator vào ApolloFlow (Go) – một task queue có m
 - Giải pháp? Lưu lần chụp gần nhất và ghi nhật ký thay đổi; khi hồi phục, cộng bù để tiếp tục đúng & kịp thời.
 - Lợi ích? Không đếm trùng, không dừng toàn hệ thống, phục hồi trong vài giây.
 
----
-
-# 2) Kiến trúc tối thiểu (gắn vào ApolloFlow)
-
-```
-orders ──▶ OpA (stateless normalize, EOS) ──▶ orders.enriched ──▶ OpB (stateful aggregate, EOS) ──▶ orders.output
-                                     └──────────────────────────▶ opb-changelog (compacted)
-                                     └──────────────────────────▶ opb-snapshots (manifest; compacted)
-```
-
-* **OpA** (stateless): đọc `orders` (consumer `read_committed`), chuẩn hoá, **transactional produce** sang `orders.enriched` và `SendOffsetsToTransaction` (KIP-98). ([Apache Software Foundation][4])
-* **OpB** (stateful): state local (Badger/RocksDB). **Mỗi cập nhật state** → **append delta** vào `opb-changelog` (compacted) theo tinh thần **FLIP-158**; định kỳ *materialize* snapshot + ghi **manifest** (chứa `lastChangelogOffset`) vào `opb-snapshots`. Xuất kết quả (EOS) sang `orders.output`. ([Apache Software Foundation][2])
-* **Local recovery:** khi OpB crash, **chỉ OpB** restart → load snapshot mới nhất → **replay changelog từ `lastChangelogOffset`** → resume, trong khi OpA không dừng (đúng tinh thần paper). ([SpringerLink][1])
-
----
-
-# 3) Đưa vào repo ApolloFlow 
-
-ApolloFlow đã có skeleton API/worker & hỗ trợ Kafka → chỉ thêm 2 service trên, tái dùng hạ tầng build/run. ([GitHub][3])
-
-## 3.2. Topics & cấu hình Kafka
+## Build & Run (local, Phase 1)
 
 ```bash
-# topics chính
-kafka-topics --create --topic orders            --partitions 3 --replication-factor 1
-kafka-topics --create --topic orders.enriched   --partitions 3 --replication-factor 1
-kafka-topics --create --topic orders.output     --partitions 3 --replication-factor 1
-
-# changelog & manifest (compacted)
-kafka-topics --create --topic opb-changelog \
-  --partitions 3 --replication-factor 1 \
-  --config cleanup.policy=compact --config min.cleanable.dirty.ratio=0.1
-
-kafka-topics --create --topic opb-snapshots \
-  --partitions 1 --replication-factor 1 \
-  --config cleanup.policy=compact
+make build
+./bin/opb --topic-prefix p2 --snapshot-dir ./snapshots --badger-dir ./data/opb
 ```
 
-## 3.3. OpA (stateless, EOS)
+Notes:
+- Phase 1 uses in-memory state and filesystem snapshots to validate the control flow.
+- Kafka client and BadgerDB integration will be added next.
 
-* **Consumer config:** `enable.auto.commit=false`, `isolation.level=read_committed`.
-* **Producer config:** `enable.idempotence=true`, `acks=all`, `transactional.id=opA-<env>-<instance>`.
-* **Flow:**
-  `BeginTransaction()` → transform → `Produce(orders.enriched)` → `SendOffsetsToTransaction()` → `CommitTransaction()`; nếu lỗi: `AbortTransaction()`. (Chuẩn **KIP-98**.) ([Apache Software Foundation][4])
+## Flags
 
-## 3.4. OpB (stateful, changelog + snapshot + EOS)
+- --topic-prefix: topic prefix (e.g., p2)
+- --group-id: consumer group id (default: opb)
+- --window-size: aggregation window seconds (default: 300)
+- --snapshot-interval: seconds between snapshots (default: 60)
+- --changelog: on|off toggle for changelog emission (default: on)
+- --snapshot-dir: directory to store snapshots
+- --badger-dir: directory for state (reserved for Badger; not used in Phase 1)
 
-* **State store:** Badger (Go) – nhẹ & nhanh trên laptop.
-* **Bản ghi delta changelog (keyed & idempotent):**
+## Layout
 
   ```json
   key   = "storeId#productId#windowStart"
