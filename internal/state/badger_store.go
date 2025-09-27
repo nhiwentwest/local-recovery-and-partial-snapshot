@@ -123,12 +123,19 @@ func (b *BadgerStore) Range(fn func(key string, st RecordState) error) error {
 // LoadAll loads a full snapshot into Badger by replacing all keys.
 func (b *BadgerStore) LoadAll(all map[string]RecordState) {
 	_ = b.db.Update(func(txn *badger.Txn) error {
-		// Drop existing data by iterating and deleting for simplicity.
+		// Collect keys first to avoid mutating while iterating.
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		var keysToDelete [][]byte
 		for it.Rewind(); it.Valid(); it.Next() {
-			_ = txn.Delete(it.Item().KeyCopy(nil))
+			k := it.Item().KeyCopy(nil)
+			keysToDelete = append(keysToDelete, k)
 		}
 		it.Close()
+		for _, k := range keysToDelete {
+			if err := txn.Delete(k); err != nil {
+				return err
+			}
+		}
 		for k, st := range all {
 			bytes, err := encodeState(st)
 			if err != nil {

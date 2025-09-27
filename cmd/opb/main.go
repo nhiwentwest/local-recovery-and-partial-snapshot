@@ -28,9 +28,10 @@ type Config struct {
 	SnapshotInterval int
 	ChangelogOn      bool
 	SnapshotDir      string
-	BadgerDir        string
-	StateBackend     string // memory|badger
+	StateDir         string
+	StateBackend     string // memory|pebble
 	CrashMode        string // ""|before|mid|after
+	InstanceID       string // for logging/visibility when running multiple replicas
 	// Kafka sinks
 	KafkaBootstrap  string
 	ChangelogSink   string // file|kafka|both
@@ -45,6 +46,10 @@ type Config struct {
 	// Output EOS (orders.output)
 	OutputTopic string
 	OutputTxID  string
+	// HTTP
+	HTTPAddr string
+	Once     bool // process exactly one message then exit (for EOS tests)
+	EOSTest  bool // test mode: simulate crash cases without process exit
 }
 
 func main() {
@@ -62,9 +67,10 @@ func readFlags() Config {
 	flag.IntVar(&cfg.SnapshotInterval, "snapshot-interval", 60, "snapshot interval seconds")
 	flag.BoolVar(&cfg.ChangelogOn, "changelog", true, "enable changelog emission")
 	flag.StringVar(&cfg.SnapshotDir, "snapshot-dir", "./snapshots", "snapshot directory")
-	flag.StringVar(&cfg.BadgerDir, "badger-dir", "./data/opb", "badger data directory")
-	flag.StringVar(&cfg.StateBackend, "state-backend", "badger", "state backend: memory|badger")
+	flag.StringVar(&cfg.StateDir, "state-dir", "./data/opb", "state data directory")
+	flag.StringVar(&cfg.StateBackend, "state-backend", "pebble", "state backend: memory|pebble")
 	flag.StringVar(&cfg.CrashMode, "crash", "", "simulate crash: before|mid|after")
+	flag.StringVar(&cfg.InstanceID, "instance-id", "", "instance id for logging (replicas)")
 	flag.StringVar(&cfg.KafkaBootstrap, "kafka-bootstrap", "", "kafka bootstrap servers, e.g. localhost:9092")
 	flag.StringVar(&cfg.ChangelogSink, "changelog-sink", "file", "changelog sink: file|kafka|both")
 	flag.StringVar(&cfg.ManifestSink, "manifest-sink", "file", "manifest sink: file|kafka|both")
@@ -76,6 +82,9 @@ func readFlags() Config {
 	flag.StringVar(&cfg.TopicEnriched, "topic-enriched", "p1.orders.enriched", "kafka topic for orders.enriched input")
 	flag.StringVar(&cfg.OutputTopic, "output-topic", "p2.orders.output", "kafka topic for orders.output")
 	flag.StringVar(&cfg.OutputTxID, "output-tx-id", "", "transactional id for orders.output (enable EOS when set)")
+	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "http listen address for metrics/health")
+	flag.BoolVar(&cfg.Once, "once", false, "process exactly one message then exit (testing)")
+	flag.BoolVar(&cfg.EOSTest, "eos-test-mode", false, "simulate crash cases without process exit (testing)")
 	flag.Parse()
 	return cfg
 }
@@ -85,15 +94,25 @@ func run(cfg Config) error {
 
 	// Init state store
 	var st state.Store
-	if cfg.StateBackend == "badger" {
-		bs, err := state.NewBadgerStore(cfg.BadgerDir)
+	switch cfg.StateBackend {
+	case "pebble":
+		ps, err := state.NewPebbleStore(cfg.StateDir)
+		if err != nil {
+			return fmt.Errorf("init pebble: %w", err)
+		}
+		defer ps.Close()
+		st = ps
+	case "memory":
+		st = state.NewInMemoryStore()
+	case "badger": // deprecated: kept only for backward-compat if someone explicitly opts in
+		bs, err := state.NewBadgerStore(cfg.StateDir)
 		if err != nil {
 			return fmt.Errorf("init badger: %w", err)
 		}
 		defer bs.Close()
 		st = bs
-	} else {
-		st = state.NewInMemoryStore()
+	default:
+		return fmt.Errorf("unknown state-backend: %s (use pebble|memory)", cfg.StateBackend)
 	}
 
 	// Init snapshotter and manifest (filesystem by default)
@@ -142,18 +161,23 @@ func run(cfg Config) error {
 		http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 		})
-		_ = http.ListenAndServe(":8080", nil)
+		_ = http.ListenAndServe(cfg.HTTPAddr, nil)
 	}()
 
 	if cfg.InputSource == "kafka" && cfg.KafkaBootstrap != "" {
 		// Consume orders.enriched from Kafka
-		c, err := ck.NewConsumer(&ck.ConfigMap{
-			"bootstrap.servers":  cfg.KafkaBootstrap,
-			"group.id":           cfg.GroupID,
-			"enable.auto.commit": false,
-			"isolation.level":    "read_committed",
-			"auto.offset.reset":  "earliest",
-		})
+        c, err := ck.NewConsumer(&ck.ConfigMap{
+            "bootstrap.servers":           cfg.KafkaBootstrap,
+            "group.id":                    cfg.GroupID,
+            "enable.auto.commit":          false,
+            "isolation.level":             "read_committed",
+            "auto.offset.reset":           "earliest",
+            // Throughput tuning
+            "fetch.min.bytes":             1048576,      // 1 MB
+            "fetch.wait.max.ms":           25,
+            "max.partition.fetch.bytes":   2097152,      // 2 MB
+            "queued.min.messages":         100000,
+        })
 		if err != nil {
 			return fmt.Errorf("consumer: %w", err)
 		}
@@ -161,15 +185,54 @@ func run(cfg Config) error {
 		if err := c.SubscribeTopics([]string{cfg.TopicEnriched}, nil); err != nil {
 			return fmt.Errorf("subscribe: %w", err)
 		}
+
+		// Periodically export per-partition lag metrics
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				ass, err := c.Assignment()
+				if err != nil || len(ass) == 0 {
+					continue
+				}
+				pos, err := c.Position(ass)
+				if err != nil {
+					continue
+				}
+				for _, tp := range pos {
+					if tp.Topic == nil {
+						continue
+					}
+					// Query high watermark (exclusive) for this partition
+					low, high, err := c.QueryWatermarkOffsets(*tp.Topic, tp.Partition, int((2 * time.Second).Milliseconds()))
+					_ = low
+					if err != nil {
+						continue
+					}
+					lag := high - int64(tp.Offset)
+					if lag < 0 {
+						lag = 0
+					}
+					mreg.PartitionLag.WithLabelValues(*tp.Topic, fmt.Sprintf("%d", tp.Partition), cfg.GroupID, cfg.InstanceID).Set(float64(lag))
+				}
+			}
+		}()
 		// If EOS output is enabled, create transactional producer
 		var p *ck.Producer
 		if cfg.OutputTxID != "" {
-			prod, err := ck.NewProducer(&ck.ConfigMap{
-				"bootstrap.servers":  cfg.KafkaBootstrap,
-				"enable.idempotence": true,
-				"acks":               "all",
-				"transactional.id":   cfg.OutputTxID,
-			})
+            prod, err := ck.NewProducer(&ck.ConfigMap{
+                "bootstrap.servers":                    cfg.KafkaBootstrap,
+                "enable.idempotence":                   true,
+                "acks":                                  "all",
+                "transactional.id":                      cfg.OutputTxID,
+                // Batching/latency tuning
+                "linger.ms":                             10,
+                "batch.num.messages":                    100000,    // cap by batch.bytes too
+                "batch.size":                            1048576,   // 1 MB
+                "compression.type":                      "lz4",
+                // Extra EOS safety (can raise to 2 if measured safe)
+                "max.in.flight.requests.per.connection": 1,
+            })
 			if err != nil {
 				return fmt.Errorf("producer: %w", err)
 			}
@@ -179,14 +242,15 @@ func run(cfg Config) error {
 			p = prod
 			defer p.Close()
 		}
-		// Read a small batch for demo. Production: loop.
-		for i := 0; i < 5; i++ {
+		// Continuous processing loop for scale-out demos.
+		for {
 			// Read first to avoid opening a transaction when there is no input.
 			msg, err := c.ReadMessage(5 * time.Second)
 			if err != nil {
 				// no message available within timeout; continue to next iteration without txn
 				continue
 			}
+			log.Printf("%s consume partition=%d offset=%d topic=%s", cfg.InstanceID, msg.TopicPartition.Partition, msg.TopicPartition.Offset, *msg.TopicPartition.Topic)
 			var ev opb.OrderEnriched
 			if err := json.Unmarshal(msg.Value, &ev); err != nil {
 				// bad input; skip without txn
@@ -204,14 +268,27 @@ func run(cfg Config) error {
 					if err := p.BeginTransaction(); err != nil {
 						return fmt.Errorf("begin tx: %w", err)
 					}
+					log.Printf("tx: begin (instance=%s)", cfg.InstanceID)
 					if cfg.CrashMode == "before" {
-						log.Fatalf("crash before SendOffsetsToTransaction")
+						if cfg.EOSTest {
+							// Simulate crash-before by aborting and returning without producing
+							_ = p.AbortTransaction(context.TODO())
+							log.Printf("tx: test-mode before (aborted before produce)")
+							if cfg.Once {
+								log.Printf("once: exiting after test-before")
+								return nil
+							}
+							continue
+						}
+						log.Fatalf("tx: crash before produce")
 					}
 					if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: b}, nil); err != nil {
 						_ = p.AbortTransaction(context.TODO())
 						mreg.TxAborted.Inc()
+						log.Printf("tx: produce error, aborted: %v", err)
 						continue
 					}
+					log.Printf("tx: produced key=%s", out.Key)
 				}
 				if cfg.ChangelogOn {
 					d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
@@ -227,26 +304,90 @@ func run(cfg Config) error {
 			}
 			if p != nil && applied {
 				t0 := time.Now()
-				offsets, _ := c.Commit()
+				// Build offsets for exactly the message we processed
+				tp := ck.TopicPartition{Topic: msg.TopicPartition.Topic, Partition: msg.TopicPartition.Partition, Offset: msg.TopicPartition.Offset + 1}
 				meta, _ := c.GetConsumerGroupMetadata()
-				if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
+				if err := p.SendOffsetsToTransaction(context.Background(), []ck.TopicPartition{tp}, meta); err != nil {
 					_ = p.AbortTransaction(context.TODO())
 					mreg.TxAborted.Inc()
+					log.Printf("tx: send offsets error, aborted: %v", err)
 					continue
 				}
+				log.Printf("tx: offsets sent topic=%s partition=%d offset=%d", *tp.Topic, tp.Partition, tp.Offset)
 				if cfg.CrashMode == "mid" {
-					log.Fatalf("crash mid (after SendOffsetsToTransaction, before CommitTransaction)")
+					if cfg.EOSTest {
+						// Abort and redo in the same run
+						_ = p.AbortTransaction(context.TODO())
+						mreg.TxAborted.Inc()
+						log.Printf("tx: test-mode mid (aborted after offsets), redoing now")
+						// Redo transactional flow with freshly marshaled payload
+						if err := p.BeginTransaction(); err != nil {
+							return fmt.Errorf("begin tx (redo): %w", err)
+						}
+						rb, _ := json.Marshal(out)
+						if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: rb}, nil); err != nil {
+							_ = p.AbortTransaction(context.TODO())
+							mreg.TxAborted.Inc()
+							log.Printf("tx: produce error (redo), aborted: %v", err)
+							if cfg.Once {
+								return nil
+							}
+							continue
+						}
+						if err := p.SendOffsetsToTransaction(context.Background(), []ck.TopicPartition{tp}, meta); err != nil {
+							_ = p.AbortTransaction(context.TODO())
+							mreg.TxAborted.Inc()
+							log.Printf("tx: send offsets error (redo), aborted: %v", err)
+							if cfg.Once {
+								return nil
+							}
+							continue
+						}
+						if err := p.CommitTransaction(context.TODO()); err != nil {
+							_ = p.AbortTransaction(context.TODO())
+							mreg.TxAborted.Inc()
+							log.Printf("tx: commit error (redo), aborted: %v", err)
+							if cfg.Once {
+								return nil
+							}
+							continue
+						}
+						log.Printf("tx: committed (redo)")
+						mreg.TxProduced.Inc()
+						mreg.TxLatencySec.Observe(time.Since(t0).Seconds())
+						if cfg.Once {
+							log.Printf("once: exiting after test-mid redo")
+							return nil
+						}
+						continue
+					}
+					log.Fatalf("tx: crash mid (after offsets, before commit)")
 				}
 				if err := p.CommitTransaction(context.TODO()); err != nil {
 					_ = p.AbortTransaction(context.TODO())
 					mreg.TxAborted.Inc()
+					log.Printf("tx: commit error, aborted: %v", err)
 					continue
 				}
+				log.Printf("tx: committed")
 				if cfg.CrashMode == "after" {
-					log.Fatalf("crash after CommitTransaction")
+					if cfg.EOSTest {
+						log.Printf("tx: test-mode after (committed)")
+						if cfg.Once {
+							log.Printf("once: exiting after test-after")
+							return nil
+						}
+					} else {
+						log.Fatalf("tx: crash after commit")
+					}
 				}
 				mreg.TxProduced.Inc()
 				mreg.TxLatencySec.Observe(time.Since(t0).Seconds())
+			}
+			if cfg.Once {
+				// Exit after attempting to process one message (regardless of applied)
+				log.Printf("once: exiting after one message")
+				return nil
 			}
 		}
 	} else {
