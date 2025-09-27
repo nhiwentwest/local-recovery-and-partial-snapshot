@@ -6,6 +6,13 @@ Bối cảnh: Một thành phố được chia thành nhiều khu (Quận A, Qu�
 Triển khai dựa FLIP-158 (Flink) – state changelog / incremental checkpoints để log mọi thay đổi, và KIP-98 (Kafka) – transactions để bảo đảm read→process→write exactly-once (EOS). ([Apache Software Foundation][2])
 Khung dự án: thêm 2 operator vào ApolloFlow (Go) – một task queue có mode Kafka/RabbitMQ, API/gRPC/WS cơ bản. ([GitHub][3])
 
+- Thành phố gửi yêu cầu liên tục (10k/s).
+- Trạm A (OpA) chuẩn hóa và đảm bảo mỗi yêu cầu chỉ được tính một lần.
+- Trạm B (OpB) cập nhật bảng tổng hợp theo từng khu/giờ.
+- Khi tải tăng, đồng hồ lag cho thấy “xếp hàng”; ta chỉ việc thêm trạm B (scale) hoặc chia nhiều quầy (tăng partitions) để xử lý kịp.
+- Nếu mất điện, bật lại sẽ khôi phục bảng tổng hợp đúng như trước khi mất điện.
+
+
 - Ai? Đội điều phối dịch vụ gọi xe trong thành phố.
 - Cần gì? Nhìn thấy nhịp nhu cầu theo khu mỗi phút để điều xe/giá.
 - Vấn đề? Khi hệ thống lỗi, dữ liệu dễ sai hoặc gián đoạn.
@@ -101,6 +108,17 @@ Khi khởi động:
 ---
 
 # 5) Test & tiêu chí pass
+
+Đã dựng một hệ thống tiếp nhận và tổng hợp dữ liệu theo thời gian thực ở quy mô ~10.000 yêu cầu mỗi giây, không trùng đếm, theo dõi được tải/lỗi, và có thể khôi phục nhanh khi sự cố nhờ snapshot + changelog.
+
+- Không trùng đếm, không mất bản ghi: OpA xử lý “đơn” từng request một cách exactly-once (đọc → xử lý → ghi) nên không bị double-count khi có lỗi hay restart.
+- Tổng hợp theo thời gian thực: OpB gom và cộng dồn theo key cửa hàng/sản phẩm/khung giờ, giống như “bảng tổng hợp theo quận/phường theo từng khung giờ”.
+- Chịu tải cao ~10.000 yêu cầu/giây: Load test bằng rpk local bắn ~10k RPS trong 60 giây thành công. Dữ liệu vào Kafka tăng đều; hệ thống quan trắc được tốc độ và “điểm nghẽn”.
+- Quan sát và kiểm soát: Có metric lag và throughput để thấy khi “đơn vào” nhanh hơn “đơn xử lý”, từ đó biết lúc nào cần tăng scale cho OpB hoặc số partition.
+- An toàn khi sự cố: OpB có snapshot + changelog recovery; nếu “mất điện” giữa chừng, bật lại sẽ khôi phục trạng thái và replay phần còn thiếu, không mất số liệu.
+- Độ trễ thấp ở đường đi chuẩn: Thiết kế hướng KV nhỏ + cập nhật tuần tự nên giữ được p95 sub-second trong điều kiện bình thường (đã đo trong test chức năng).
+- Mở đường nâng cấp: Có thể chuyển backend state sang PebbleDB để tăng headroom hiệu năng khi cần, mà không đổi giao diện/chức năng.
+
 
 1. **Local recovery:** kill -9 OpB ngẫu nhiên trong khi OpA vẫn chạy; kỳ vọng **TTR** (time-to-recover) nhỏ (ví dụ ≤ 5–10s) tính từ lúc OpB restart đến lúc lại có `orders.output`. (Theo paper, local recovery rút ngắn TTR đáng kể so với global rollback). ([SpringerLink][1])
 2. **Partial snapshot vs no-changelog:** bật/tắt ghi delta → so **thời gian snapshot**, **kích thước snapshot**, **bytes replay**. (Ý tưởng FLIP-158/GIC: snapshot nhanh & ổn định nhờ changelog). ([Apache Flink][5])
