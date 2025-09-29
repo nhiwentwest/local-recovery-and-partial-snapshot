@@ -37,7 +37,7 @@ Cấu trúc thư mục dưới đây, trong lúc làm mà thấy khác thì có 
 
 * Ngôn ngữ: Go 1.21+
 * Kafka client: confluent-kafka-go (hỗ trợ transactions và SendOffsetsToTransaction)
-* State store: BadgerDB cho OpB
+* State store: PebbleDB cho OpB
 * Metrics: prometheus/client\_golang
 ---
 
