@@ -1,5 +1,0 @@
-{"orderId":"o1","productId":"p1","price":3297,"qty":1,"storeId":"C","ts":1758296094,"validated":true,"normTs":1758296094}
-{"orderId":"o2","productId":"p5","price":1849,"qty":3,"storeId":"B","ts":1758296104,"validated":true,"normTs":1758296104}
-{"orderId":"o3","productId":"p3","price":8720,"qty":5,"storeId":"A","ts":1758296114,"validated":true,"normTs":1758296114}
-{"orderId":"o4","productId":"p4","price":9697,"qty":1,"storeId":"B","ts":1758296124,"validated":true,"normTs":1758296124}
-{"orderId":"o5","productId":"p1","price":1513,"qty":3,"storeId":"A","ts":1758296134,"validated":true,"normTs":1758296134}

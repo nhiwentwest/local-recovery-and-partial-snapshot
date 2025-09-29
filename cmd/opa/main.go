@@ -66,7 +66,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 		log.Fatalf("subscribe: %v", err)
 	}
 
-	if err := p.InitTransactions(nil); err != nil {
+	if err := p.InitTransactions(context.TODO()); err != nil {
 		log.Fatalf("init tx: %v", err)
 	}
 	log.Printf("OpA started bootstrap=%s in=%s out=%s", bootstrap, topicIn, topicOut)
@@ -78,20 +78,20 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 
 		msg, err := c.ReadMessage(10 * time.Second)
 		if err != nil {
-			_ = p.AbortTransaction(nil)
+			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 
 		var o model.Order
 		if err := json.Unmarshal(msg.Value, &o); err != nil {
-			_ = p.AbortTransaction(nil)
+			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 		eo := model.Normalize(o)
 		val, _ := json.Marshal(eo)
 
 		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topicOut, Partition: ck.PartitionAny}, Key: []byte(o.OrderID), Value: val}, nil); err != nil {
-			_ = p.AbortTransaction(nil)
+			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 
@@ -104,7 +104,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 		offsets, _ := c.Commit() // get current offsets synchronously (not committed to broker)
 		meta, _ := c.GetConsumerGroupMetadata()
 		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
-			_ = p.AbortTransaction(nil)
+			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 
@@ -115,8 +115,8 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 
 		// Optionally flush pending deliveries before commit
 		_ = p.Flush(5000)
-		if err := p.CommitTransaction(nil); err != nil {
-			_ = p.AbortTransaction(nil)
+		if err := p.CommitTransaction(context.TODO()); err != nil {
+			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 
@@ -127,6 +127,68 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 }
 
 func runWrapper(bootstrap, groupID, txID string) {
-	// Placeholder: consume p1.orders.enriched and transactional produce p1.orders.output
-	log.Printf("wrapper mode not yet implemented")
+	in := "p1.orders.enriched"
+	out := "p1.orders.output"
+
+	p, err := ck.NewProducer(&ck.ConfigMap{
+		"bootstrap.servers":  bootstrap,
+		"enable.idempotence": true,
+		"acks":               "all",
+		"transactional.id":   txID,
+	})
+	if err != nil {
+		log.Fatalf("producer: %v", err)
+	}
+	defer p.Close()
+
+	c, err := ck.NewConsumer(&ck.ConfigMap{
+		"bootstrap.servers":  bootstrap,
+		"group.id":           groupID,
+		"enable.auto.commit": false,
+		// Allow switching between committed/uncommitted by separate tools; wrapper uses committed path
+		"isolation.level":   "read_committed",
+		"auto.offset.reset": "earliest",
+	})
+	if err != nil {
+		log.Fatalf("consumer: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.SubscribeTopics([]string{in}, nil); err != nil {
+		log.Fatalf("subscribe: %v", err)
+	}
+
+	if err := p.InitTransactions(context.TODO()); err != nil {
+		log.Fatalf("init tx: %v", err)
+	}
+	log.Printf("OpA wrapper started bootstrap=%s in=%s out=%s", bootstrap, in, out)
+
+	for {
+		if err := p.BeginTransaction(); err != nil { // confluent lib uses internal context
+			log.Fatalf("begin tx: %v", err)
+		}
+		msg, err := c.ReadMessage(5 * time.Second)
+		if err != nil {
+			_ = p.AbortTransaction(context.TODO())
+			continue
+		}
+
+		// passthrough enriched -> output (key preserved)
+		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &out, Partition: ck.PartitionAny}, Key: msg.Key, Value: msg.Value}, nil); err != nil {
+			_ = p.AbortTransaction(context.TODO())
+			continue
+		}
+
+		// bind offsets atomically
+		offsets, _ := c.Commit()
+		meta, _ := c.GetConsumerGroupMetadata()
+		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
+			_ = p.AbortTransaction(context.TODO())
+			continue
+		}
+		if err := p.CommitTransaction(context.TODO()); err != nil {
+			_ = p.AbortTransaction(context.TODO())
+			continue
+		}
+	}
 }
