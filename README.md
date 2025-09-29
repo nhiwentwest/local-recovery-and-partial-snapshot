@@ -1,52 +1,34 @@
-# HPB - OpB (Aggregator, Changelog, Snapshot, Manifest)
+# HPB - Quickstart (Bounded Run)
 
-This repository scaffolds the OpB service (Người 2) for the local-recovery-and-partial-snapshot project.
+This repo includes scripts to run a reproducible, bounded 60s benchmark end-to-end on a local single-node Redpanda container.
 
-## Components
+## Prerequisites
+- Docker + Docker Compose
+- Go 1.21+
+- rpk (Redpanda CLI, via Homebrew: `brew install redpanda-data/tap/redpanda`)
 
-- cmd/opb: Main entry for OpB
-- internal/state: Key-value state store abstraction (Phase 1: in-memory placeholder)
-- internal/snapshot: Snapshot writer/reader (filesystem-based stub)
-- internal/manifest: Manifest publisher/reader (filesystem-based stub)
-- scripts/topics.sh: Helper script to create Kafka topics (placeholder)
-
-## Build & Run (local, Phase 1)
-
+## One-click 60s Benchmark
 ```bash
-make build
-./bin/opb --topic-prefix p2 --snapshot-dir ./snapshots --badger-dir ./data/opb
+# From repo root
+bash scripts/run-bench-60s.sh
 ```
+What it does:
+- Starts a single-node Redpanda container
+- Builds `opb`
+- Creates topics `p2.orders.enriched.60s` (60 partitions) and `orders.output.60s` (24 partitions)
+- Launches 6 `opb` replicas with EOS enabled
+- Runs a 60s load benchmark (~600k messages total)
+- Prints group/topic summary, then shuts everything down cleanly
 
-Notes:
-- Phase 1 uses in-memory state and filesystem snapshots to validate the control flow.
-- Kafka client and BadgerDB integration will be added next.
+Expected outcome:
+- Group total lag should be ~0 at the end for the configured load
 
-## Flags
-
-- --topic-prefix: topic prefix (e.g., p2)
-- --group-id: consumer group id (default: opb)
-- --window-size: aggregation window seconds (default: 300)
-- --snapshot-interval: seconds between snapshots (default: 60)
-- --changelog: on|off toggle for changelog emission (default: on)
-- --snapshot-dir: directory to store snapshots
-- --badger-dir: directory for state (reserved for Badger; not used in Phase 1)
-
-## Layout
-
+## Stop / Cleanup
+```bash
+bash scripts/stop-all.sh
 ```
-├─ README.md
-├─ docker-compose.yml
-├─ Makefile
-├─ cmd/
-│  └─ opb/
-│     └─ main.go
-├─ internal/
-│  ├─ manifest/
-│  │  └─ manifest.go
-│  ├─ snapshot/
-│  │  └─ snapshot.go
-│  └─ state/
-│     └─ state.go
-└─ scripts/
-   └─ topics.sh
-```
+Stops all `opb` processes and tears down the Redpanda container/network.
+
+## Notes
+- If you want to change load, edit variables in `scripts/run-bench-60s.sh` (DURATION, PROCS, RPS_PER_PROC).
+- For native (non-Docker) Redpanda, ensure the `redpanda` binary is installed and in PATH, then adapt the script broker address to `127.0.0.1:9092`.
