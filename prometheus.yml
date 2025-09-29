@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+scrape_configs:
+- job_name: opb
+  static_configs:
+  - targets: ['host.docker.internal:8082','host.docker.internal:8083']
+- job_name: recover
+  static_configs:
+  - targets: ['host.docker.internal:9090']

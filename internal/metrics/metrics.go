@@ -21,6 +21,9 @@ type Registry struct {
 	TxAborted         prometheus.Counter
 	TxLatencySec      prometheus.Histogram
 	ChangelogAppended prometheus.Counter
+
+	// Per-partition lag (labels: topic, partition, group, instance)
+	PartitionLag *prometheus.GaugeVec
 }
 
 func NewRegistry() *Registry {
@@ -40,7 +43,9 @@ func NewRegistry() *Registry {
 	})
 	changelogAppended := prometheus.NewCounter(prometheus.CounterOpts{Name: "opb_changelog_appended_total"})
 
-	r.MustRegister(applied, skipped, ttr, replayBytes, lag, lastAge, txProduced, txAborted, txLatency, changelogAppended)
+	partLag := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_partition_lag"}, []string{"topic", "partition", "group", "instance"})
+
+	r.MustRegister(applied, skipped, ttr, replayBytes, lag, lastAge, txProduced, txAborted, txLatency, changelogAppended, partLag)
 	return &Registry{
 		reg:                r,
 		Applied:            applied,
@@ -53,6 +58,7 @@ func NewRegistry() *Registry {
 		TxAborted:          txAborted,
 		TxLatencySec:       txLatency,
 		ChangelogAppended:  changelogAppended,
+		PartitionLag:       partLag,
 	}
 }
 

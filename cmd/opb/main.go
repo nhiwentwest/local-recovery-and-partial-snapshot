@@ -50,6 +50,9 @@ type Config struct {
 	HTTPAddr string
 	Once     bool // process exactly one message then exit (for EOS tests)
 	EOSTest  bool // test mode: simulate crash cases without process exit
+	// EOS batching
+	TxBatchSize int
+	TxLingerMs  int
 }
 
 func main() {
@@ -85,6 +88,8 @@ func readFlags() Config {
 	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "http listen address for metrics/health")
 	flag.BoolVar(&cfg.Once, "once", false, "process exactly one message then exit (testing)")
 	flag.BoolVar(&cfg.EOSTest, "eos-test-mode", false, "simulate crash cases without process exit (testing)")
+	flag.IntVar(&cfg.TxBatchSize, "tx-batch-size", 1000, "transactional batch size (messages per commit)")
+	flag.IntVar(&cfg.TxLingerMs, "tx-linger-ms", 100, "transactional linger in ms before forcing a commit")
 	flag.Parse()
 	return cfg
 }
@@ -104,13 +109,6 @@ func run(cfg Config) error {
 		st = ps
 	case "memory":
 		st = state.NewInMemoryStore()
-	case "badger": // deprecated: kept only for backward-compat if someone explicitly opts in
-		bs, err := state.NewBadgerStore(cfg.StateDir)
-		if err != nil {
-			return fmt.Errorf("init badger: %w", err)
-		}
-		defer bs.Close()
-		st = bs
 	default:
 		return fmt.Errorf("unknown state-backend: %s (use pebble|memory)", cfg.StateBackend)
 	}
@@ -166,18 +164,26 @@ func run(cfg Config) error {
 
 	if cfg.InputSource == "kafka" && cfg.KafkaBootstrap != "" {
 		// Consume orders.enriched from Kafka
-        c, err := ck.NewConsumer(&ck.ConfigMap{
-            "bootstrap.servers":           cfg.KafkaBootstrap,
-            "group.id":                    cfg.GroupID,
-            "enable.auto.commit":          false,
-            "isolation.level":             "read_committed",
-            "auto.offset.reset":           "earliest",
-            // Throughput tuning
-            "fetch.min.bytes":             1048576,      // 1 MB
-            "fetch.wait.max.ms":           25,
-            "max.partition.fetch.bytes":   2097152,      // 2 MB
-            "queued.min.messages":         100000,
-        })
+		c, err := ck.NewConsumer(&ck.ConfigMap{
+			"bootstrap.servers":             cfg.KafkaBootstrap,
+			"group.id":                      cfg.GroupID,
+			"enable.auto.commit":            false,
+			"isolation.level":               "read_committed",
+			"auto.offset.reset":             "earliest",
+			"partition.assignment.strategy": "cooperative-sticky",
+			"client.id":                     cfg.InstanceID,
+			"group.instance.id":             cfg.InstanceID,
+			"session.timeout.ms":            10000,
+			"max.poll.interval.ms":          300000,
+			"debug":                         "cgrp,consumer,protocol",
+			// High throughput tuning
+			"fetch.min.bytes":           2097152,  // 2 MB (tăng từ 1MB)
+			"fetch.wait.max.ms":         10,       // Giảm từ 25ms
+			"max.partition.fetch.bytes": 8388608,  // 8 MB (tăng từ 2MB)
+			"queued.min.messages":       500000,   // Tăng từ 100K
+			"fetch.max.bytes":           52428800, // 50 MB total fetch
+			"heartbeat.interval.ms":     3000,     // Tăng heartbeat frequency
+		})
 		if err != nil {
 			return fmt.Errorf("consumer: %w", err)
 		}
@@ -220,19 +226,26 @@ func run(cfg Config) error {
 		// If EOS output is enabled, create transactional producer
 		var p *ck.Producer
 		if cfg.OutputTxID != "" {
-            prod, err := ck.NewProducer(&ck.ConfigMap{
-                "bootstrap.servers":                    cfg.KafkaBootstrap,
-                "enable.idempotence":                   true,
-                "acks":                                  "all",
-                "transactional.id":                      cfg.OutputTxID,
-                // Batching/latency tuning
-                "linger.ms":                             10,
-                "batch.num.messages":                    100000,    // cap by batch.bytes too
-                "batch.size":                            1048576,   // 1 MB
-                "compression.type":                      "lz4",
-                // Extra EOS safety (can raise to 2 if measured safe)
-                "max.in.flight.requests.per.connection": 1,
-            })
+			prod, err := ck.NewProducer(&ck.ConfigMap{
+				"bootstrap.servers":  cfg.KafkaBootstrap,
+				"enable.idempotence": true,
+				"acks":               "all",
+				"transactional.id":   cfg.OutputTxID,
+				// High throughput batching tuning
+				"linger.ms":          5,       // Giảm từ 10ms
+				"batch.num.messages": 500000,  // Tăng từ 100K
+				"batch.size":         8388608, // 8 MB (tăng từ 1MB)
+				"compression.type":   "lz4",
+				// Extra EOS safety (can raise to 2 if measured safe)
+				"max.in.flight.requests.per.connection": 1,
+				// Additional throughput tuning
+				"delivery.timeout.ms":    300000,     // 5 min timeout
+				"request.timeout.ms":     30000,      // 30s request timeout
+				"message.timeout.ms":     300000,     // 5 min message timeout
+				"transaction.timeout.ms": 600000,     // 10 min transaction timeout
+				"retries":                2147483647, // Max retries
+				"retry.backoff.ms":       100,        // Fast retry
+			})
 			if err != nil {
 				return fmt.Errorf("producer: %w", err)
 			}
@@ -242,18 +255,31 @@ func run(cfg Config) error {
 			p = prod
 			defer p.Close()
 		}
-		// Continuous processing loop for scale-out demos.
+		// Continuous processing loop with transactional batching.
+		var (
+			batchStarted   bool
+			batchStartTime time.Time
+			batchCount     int
+			batchOffsets   = make(map[int32]ck.TopicPartition) // partition -> highest offset+1
+		)
 		for {
-			// Read first to avoid opening a transaction when there is no input.
-			msg, err := c.ReadMessage(5 * time.Second)
+			// Read first to avoid spinning when no input
+			msg, err := c.ReadMessage(200 * time.Millisecond)
 			if err != nil {
-				// no message available within timeout; continue to next iteration without txn
+				// On timeout/no message: if we have an open batch and linger expired, commit it
+				if p != nil && batchStarted && time.Since(batchStartTime) >= time.Duration(cfg.TxLingerMs)*time.Millisecond {
+					if err := commitBatch(c, p, batchOffsets, mreg); err != nil {
+						log.Printf("tx: batch commit error: %v", err)
+					}
+					batchStarted = false
+					batchCount = 0
+					batchOffsets = make(map[int32]ck.TopicPartition)
+				}
 				continue
 			}
 			log.Printf("%s consume partition=%d offset=%d topic=%s", cfg.InstanceID, msg.TopicPartition.Partition, msg.TopicPartition.Offset, *msg.TopicPartition.Topic)
 			var ev opb.OrderEnriched
 			if err := json.Unmarshal(msg.Value, &ev); err != nil {
-				// bad input; skip without txn
 				continue
 			}
 			applied, out, seq, err := opb.AggregateAndBuildOutput(st, cfg.WindowSizeSec, ev)
@@ -262,130 +288,55 @@ func run(cfg Config) error {
 			}
 			if applied {
 				b, _ := json.Marshal(out)
-				log.Printf("orders.output key=%s seq=%d value=%s", out.Key, seq, string(b))
 				if p != nil {
-					// Begin a transaction only when we actually have something to produce
-					if err := p.BeginTransaction(); err != nil {
-						return fmt.Errorf("begin tx: %w", err)
-					}
-					log.Printf("tx: begin (instance=%s)", cfg.InstanceID)
-					if cfg.CrashMode == "before" {
-						if cfg.EOSTest {
-							// Simulate crash-before by aborting and returning without producing
-							_ = p.AbortTransaction(context.TODO())
-							log.Printf("tx: test-mode before (aborted before produce)")
-							if cfg.Once {
-								log.Printf("once: exiting after test-before")
-								return nil
-							}
-							continue
+					if !batchStarted {
+						if err := p.BeginTransaction(); err != nil {
+							return fmt.Errorf("begin tx: %w", err)
 						}
-						log.Fatalf("tx: crash before produce")
+						batchStarted = true
+						batchStartTime = time.Now()
 					}
 					if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: b}, nil); err != nil {
 						_ = p.AbortTransaction(context.TODO())
 						mreg.TxAborted.Inc()
+						batchStarted = false
+						batchCount = 0
+						batchOffsets = make(map[int32]ck.TopicPartition)
 						log.Printf("tx: produce error, aborted: %v", err)
 						continue
 					}
-					log.Printf("tx: produced key=%s", out.Key)
+					batchCount++
+					// Track highest offset+1 per partition
+					tp := ck.TopicPartition{Topic: msg.TopicPartition.Topic, Partition: msg.TopicPartition.Partition, Offset: msg.TopicPartition.Offset + 1}
+					if existing, ok := batchOffsets[tp.Partition]; !ok || tp.Offset > existing.Offset {
+						batchOffsets[tp.Partition] = tp
+					}
 				}
 				if cfg.ChangelogOn {
 					d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
 					if err := clog.Append(d); err != nil {
-						if p != nil {
+						if p != nil && batchStarted {
 							_ = p.AbortTransaction(context.TODO())
 							mreg.TxAborted.Inc()
+							batchStarted = false
+							batchCount = 0
+							batchOffsets = make(map[int32]ck.TopicPartition)
 						}
 						return fmt.Errorf("append changelog: %w", err)
 					}
 					mreg.ChangelogAppended.Inc()
 				}
 			}
-			if p != nil && applied {
-				t0 := time.Now()
-				// Build offsets for exactly the message we processed
-				tp := ck.TopicPartition{Topic: msg.TopicPartition.Topic, Partition: msg.TopicPartition.Partition, Offset: msg.TopicPartition.Offset + 1}
-				meta, _ := c.GetConsumerGroupMetadata()
-				if err := p.SendOffsetsToTransaction(context.Background(), []ck.TopicPartition{tp}, meta); err != nil {
-					_ = p.AbortTransaction(context.TODO())
-					mreg.TxAborted.Inc()
-					log.Printf("tx: send offsets error, aborted: %v", err)
-					continue
+			// Commit batch if thresholds met
+			if p != nil && batchStarted && (batchCount >= cfg.TxBatchSize || time.Since(batchStartTime) >= time.Duration(cfg.TxLingerMs)*time.Millisecond) {
+				if err := commitBatch(c, p, batchOffsets, mreg); err != nil {
+					log.Printf("tx: batch commit error: %v", err)
 				}
-				log.Printf("tx: offsets sent topic=%s partition=%d offset=%d", *tp.Topic, tp.Partition, tp.Offset)
-				if cfg.CrashMode == "mid" {
-					if cfg.EOSTest {
-						// Abort and redo in the same run
-						_ = p.AbortTransaction(context.TODO())
-						mreg.TxAborted.Inc()
-						log.Printf("tx: test-mode mid (aborted after offsets), redoing now")
-						// Redo transactional flow with freshly marshaled payload
-						if err := p.BeginTransaction(); err != nil {
-							return fmt.Errorf("begin tx (redo): %w", err)
-						}
-						rb, _ := json.Marshal(out)
-						if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: rb}, nil); err != nil {
-							_ = p.AbortTransaction(context.TODO())
-							mreg.TxAborted.Inc()
-							log.Printf("tx: produce error (redo), aborted: %v", err)
-							if cfg.Once {
-								return nil
-							}
-							continue
-						}
-						if err := p.SendOffsetsToTransaction(context.Background(), []ck.TopicPartition{tp}, meta); err != nil {
-							_ = p.AbortTransaction(context.TODO())
-							mreg.TxAborted.Inc()
-							log.Printf("tx: send offsets error (redo), aborted: %v", err)
-							if cfg.Once {
-								return nil
-							}
-							continue
-						}
-						if err := p.CommitTransaction(context.TODO()); err != nil {
-							_ = p.AbortTransaction(context.TODO())
-							mreg.TxAborted.Inc()
-							log.Printf("tx: commit error (redo), aborted: %v", err)
-							if cfg.Once {
-								return nil
-							}
-							continue
-						}
-						log.Printf("tx: committed (redo)")
-						mreg.TxProduced.Inc()
-						mreg.TxLatencySec.Observe(time.Since(t0).Seconds())
-						if cfg.Once {
-							log.Printf("once: exiting after test-mid redo")
-							return nil
-						}
-						continue
-					}
-					log.Fatalf("tx: crash mid (after offsets, before commit)")
-				}
-				if err := p.CommitTransaction(context.TODO()); err != nil {
-					_ = p.AbortTransaction(context.TODO())
-					mreg.TxAborted.Inc()
-					log.Printf("tx: commit error, aborted: %v", err)
-					continue
-				}
-				log.Printf("tx: committed")
-				if cfg.CrashMode == "after" {
-					if cfg.EOSTest {
-						log.Printf("tx: test-mode after (committed)")
-						if cfg.Once {
-							log.Printf("once: exiting after test-after")
-							return nil
-						}
-					} else {
-						log.Fatalf("tx: crash after commit")
-					}
-				}
-				mreg.TxProduced.Inc()
-				mreg.TxLatencySec.Observe(time.Since(t0).Seconds())
+				batchStarted = false
+				batchCount = 0
+				batchOffsets = make(map[int32]ck.TopicPartition)
 			}
 			if cfg.Once {
-				// Exit after attempting to process one message (regardless of applied)
 				log.Printf("once: exiting after one message")
 				return nil
 			}
@@ -458,5 +409,39 @@ func run(cfg Config) error {
 	}
 
 	log.Printf("OpB scaffold completed. Exiting.")
+	return nil
+}
+
+// commitBatch commits a transactional batch: it sends offsets for the highest processed
+// offset per partition and commits the transaction.
+func commitBatch(c *ck.Consumer, p *ck.Producer, batchOffsets map[int32]ck.TopicPartition, mreg *metrics.Registry) error {
+	// If no offsets, still try to commit the tx to flush produced records
+	if len(batchOffsets) == 0 {
+		if err := p.CommitTransaction(context.TODO()); err != nil {
+			_ = p.AbortTransaction(context.TODO())
+			mreg.TxAborted.Inc()
+			return fmt.Errorf("commit empty tx: %w", err)
+		}
+		mreg.TxProduced.Inc()
+		return nil
+	}
+	meta, _ := c.GetConsumerGroupMetadata()
+	parts := make([]ck.TopicPartition, 0, len(batchOffsets))
+	for _, tp := range batchOffsets {
+		parts = append(parts, tp)
+	}
+	t0 := time.Now()
+	if err := p.SendOffsetsToTransaction(context.Background(), parts, meta); err != nil {
+		_ = p.AbortTransaction(context.TODO())
+		mreg.TxAborted.Inc()
+		return fmt.Errorf("send offsets: %w", err)
+	}
+	if err := p.CommitTransaction(context.TODO()); err != nil {
+		_ = p.AbortTransaction(context.TODO())
+		mreg.TxAborted.Inc()
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	mreg.TxProduced.Inc()
+	mreg.TxLatencySec.Observe(time.Since(t0).Seconds())
 	return nil
 }

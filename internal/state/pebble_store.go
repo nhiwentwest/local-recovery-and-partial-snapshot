@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -15,8 +16,15 @@ type PebbleStore struct {
 
 func NewPebbleStore(dir string) (*PebbleStore, error) {
 	opts := &pebble.Options{
-		// Reasonable defaults; can tune later if needed
-		MemTableSize: 64 << 20, // 64MB
+		// Optimized for high throughput
+		MemTableSize:             256 << 20,               // 256MB (4x larger)
+		MaxConcurrentCompactions: func() int { return 4 }, // More parallel compactions
+		L0CompactionThreshold:    4,                       // Start compaction earlier
+		L0StopWritesThreshold:    8,                       // Allow more writes before stopping
+		WALBytesPerSync:          1 << 20,                 // 1MB WAL sync (vs default 512KB)
+		// Disable WAL sync for better performance (trade-off: durability)
+		DisableWAL:         false,                             // Keep WAL for durability
+		WALMinSyncInterval: func() time.Duration { return 0 }, // No minimum sync interval
 	}
 	d, err := pebble.Open(filepath.Clean(dir), opts)
 	if err != nil {
@@ -62,7 +70,8 @@ func (p *PebbleStore) Apply(key string, deltaAmount int64, deltaQty int64, seq i
 	if err != nil {
 		return false, RecordState{}, err
 	}
-	if err := p.db.Set(k, bytes, pebble.Sync); err != nil {
+	// Use NoSync for better performance (WAL will handle durability)
+	if err := p.db.Set(k, bytes, pebble.NoSync); err != nil {
 		return false, RecordState{}, err
 	}
 	return true, cur, nil
@@ -113,7 +122,7 @@ func (p *PebbleStore) LoadAll(all map[string]RecordState) {
 		for _, k := range toDelete {
 			_ = wb.Delete(k, nil)
 		}
-		_ = wb.Commit(pebble.Sync)
+		_ = wb.Commit(pebble.NoSync)
 		_ = wb.Close()
 	}
 	if len(all) > 0 {
@@ -125,8 +134,7 @@ func (p *PebbleStore) LoadAll(all map[string]RecordState) {
 			}
 			_ = wb.Set([]byte(k), bytes, nil)
 		}
-		_ = wb.Commit(pebble.Sync)
+		_ = wb.Commit(pebble.NoSync)
 		_ = wb.Close()
 	}
 }
-

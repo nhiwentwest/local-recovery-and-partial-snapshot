@@ -1,42 +1,70 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bounded 60s end-to-end benchmark using Docker Redpanda and local rpk
-# Requirements: Docker, docker-compose, rpk (brew), Go toolchain
+# Bounded 60s end-to-end benchmark using native Redpanda and local rpk
+# Requirements: redpanda (brew), rpk (brew), Go toolchain
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-BROKER_HOST="localhost:19092"
+BROKER_HOST="127.0.0.1:9092"
 GROUP_ID="opb-g-60s"
 TOPIC_IN="p2.orders.enriched.60s"
 TOPIC_OUT="orders.output.60s"
-PARTS_IN=60
-PARTS_OUT=24
-DURATION=60
-PROCS=50
-RPS_PER_PROC=200
+PARTS_IN=${PARTS_IN:-60}
+PARTS_OUT=${PARTS_OUT:-24}
+DURATION=${DURATION:-60}
+PROCS=${PROCS:-50}
+RPS_PER_PROC=${RPS_PER_PROC:-200}
 
 cleanup() {
   set +e
   pkill -f "bin/opb" >/dev/null 2>&1 || true
-  docker-compose down >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-# 1) Start broker container
-echo "== Starting Redpanda container =="
-docker-compose up -d redpanda
-sleep 6
+ensure_redpanda() {
+  # Start native Redpanda if not listening on 127.0.0.1:9092
+  if ! nc -z 127.0.0.1 9092 >/dev/null 2>&1; then
+    echo "== Starting Redpanda (native) =="
+    # Try with redpanda if available; fallback to rpk redpanda start
+    if command -v redpanda >/dev/null 2>&1; then
+      redpanda start --overprovisioned --smp 6 --memory 6G \
+        --reserve-memory 0M --check=false \
+        --kafka-addr 0.0.0.0:9092 \
+        --advertise-kafka-addr 127.0.0.1:9092 \
+        --data-directory ./data/redpanda \
+        --default-log-level=warn --wait-for-leader >/dev/null 2>&1 &
+    else
+      rpk redpanda start --smp=6 --memory=6144M \
+        --advertise-kafka-addr=PLAINTEXT://127.0.0.1:9092 \
+        --default-log-level=warn >/dev/null 2>&1 &
+    fi
+    # wait for broker
+    for i in $(seq 1 30); do
+      sleep 1
+      if nc -z 127.0.0.1 9092 >/dev/null 2>&1; then break; fi
+    done
+    if ! nc -z 127.0.0.1 9092 >/dev/null 2>&1; then
+      echo "Redpanda failed to start on 127.0.0.1:9092" >&2
+      exit 1
+    fi
+  else
+    echo "== Redpanda already running on 127.0.0.1:9092 =="
+  fi
+}
+
+# 1) Ensure native broker is running
+ensure_redpanda
 
 # 2) Build opb
 echo "== Building opb =="
 go build -o ./bin/opb ./cmd/opb
 
-# 3) Create topics
+# 3) Create topics (native)
 echo "== Creating topics ${TOPIC_IN}(${PARTS_IN}) and ${TOPIC_OUT}(${PARTS_OUT}) =="
-rpk topic create "${TOPIC_IN}" --partitions=${PARTS_IN} --replicas=1 >/dev/null 2>&1 || true
-rpk topic create "${TOPIC_OUT}" --partitions=${PARTS_OUT} --replicas=1 >/dev/null 2>&1 || true
+rpk --brokers ${BROKER_HOST} topic create "${TOPIC_IN}" --partitions=${PARTS_IN} --replicas=1 >/dev/null 2>&1 || true
+rpk --brokers ${BROKER_HOST} topic create "${TOPIC_OUT}" --partitions=${PARTS_OUT} --replicas=1 >/dev/null 2>&1 || true
 
 # 4) Clear previous local pebble data
 rm -rf ./data/opb-pebble-* || true
@@ -59,10 +87,7 @@ pkill -f "bin/opb" || true
 
 # 8) Print summary
 echo "== Summary =="
-rpk group describe ${GROUP_ID} || true
-rpk topic describe ${TOPIC_IN} || true
+rpk --brokers ${BROKER_HOST} group describe ${GROUP_ID} || true
+rpk --brokers ${BROKER_HOST} topic describe ${TOPIC_IN} || true
 
-# 9) Tear down container
-docker-compose down
-
-echo "== Done (bounded run with full cleanup) =="
+echo "== Done (bounded run native) =="
