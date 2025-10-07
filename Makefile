@@ -21,10 +21,10 @@ clean:
 
 # Observability: start Prometheus (Grafana can point to it)
 obs-start:
-	@echo "Starting Prometheus with ./prometheus.yml on :9091";
+	@echo "Starting Prometheus with ./prometheus.yml on :9095";
 	@pkill -f "prometheus --config.file=./prometheus.yml" || true;
-	@nohup prometheus --config.file=./prometheus.yml --web.listen-address=":9091" >/tmp/prometheus.out 2>&1 &
-	@echo "Prometheus started at http://localhost:9091"
+	@nohup prometheus --config.file=./prometheus.yml --web.listen-address=":9095" >/tmp/prometheus.out 2>&1 &
+	@echo "Prometheus started at http://localhost:9095"
 
 obs-stop:
 	@echo "Stopping Prometheus";

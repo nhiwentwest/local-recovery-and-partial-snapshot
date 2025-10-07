@@ -4,12 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")"/.. && pwd)"
 cd "$ROOT_DIR"
 
-echo "[obs] Starting Prometheus on :9091 using prometheus.yml"
+PORT=${PORT:-9095}
+echo "[obs] Starting Prometheus on :${PORT} using prometheus.yml"
 pkill -f "prometheus --config.file=./prometheus.yml" >/dev/null 2>&1 || true
-nohup prometheus --config.file=./prometheus.yml --web.listen-address=":9091" \
+if ! command -v prometheus >/dev/null 2>&1; then
+  echo "[obs] Prometheus binary not found. On macOS, install via: brew install prometheus"
+  exit 1
+fi
+nohup prometheus --config.file=./prometheus.yml --web.listen-address=":${PORT}" \
   > /tmp/prometheus.out 2>&1 &
 sleep 0.5
-echo "[obs] Prometheus at http://localhost:9091"
+echo "[obs] Prometheus at http://localhost:${PORT}"
 
-echo "[obs] Reminder: point Grafana to Prometheus URL http://host.docker.internal:9091 or http://localhost:9091 depending on your Grafana runtime"
+echo "[obs] Reminder: point Grafana to Prometheus URL http://host.docker.internal:${PORT} or http://localhost:${PORT} depending on your Grafana runtime"
 
