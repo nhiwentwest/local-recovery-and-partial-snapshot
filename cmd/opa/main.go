@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"hpb/internal/model"
 
 	ck "github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -21,6 +25,7 @@ func main() {
 		txID      string
 		mode      string // normal|wrapper
 		crashMode string // before|mid|after|none
+		httpAddr  string
 	)
 	flag.StringVar(&bootstrap, "bootstrap", "localhost:19092", "kafka bootstrap servers")
 	flag.StringVar(&groupID, "group-id", "opa", "consumer group id")
@@ -29,16 +34,31 @@ func main() {
 	flag.StringVar(&txID, "tx-id", "opa-local-1", "transactional id")
 	flag.StringVar(&mode, "mode", "normal", "normal|wrapper")
 	flag.StringVar(&crashMode, "crash-mode", "none", "before|mid|after|none")
+	flag.StringVar(&httpAddr, "http", ":8081", "http listen address for metrics/health")
 	flag.Parse()
 
+	// metrics registry for OpA
+	opaTxProduced := prometheus.NewCounter(prometheus.CounterOpts{Name: "opa_tx_produced_total"})
+	opaTxAborted := prometheus.NewCounter(prometheus.CounterOpts{Name: "opa_tx_aborted_total"})
+	opaTxLatency := prometheus.NewHistogram(prometheus.HistogramOpts{Name: "opa_tx_latency_seconds", Buckets: prometheus.DefBuckets})
+	opaReg := prometheus.NewRegistry()
+	opaReg.MustRegister(opaTxProduced, opaTxAborted, opaTxLatency)
+
+	// start metrics HTTP
+	go func() {
+		http.Handle("/metrics", promhttp.HandlerFor(opaReg, promhttp.HandlerOpts{}))
+		http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = fmt.Fprint(w, "ok") })
+		_ = http.ListenAndServe(httpAddr, nil)
+	}()
+
 	if mode == "wrapper" {
-		runWrapper(bootstrap, groupID, txID)
+		runWrapper(bootstrap, groupID, txID, opaTxProduced, opaTxAborted, opaTxLatency)
 		return
 	}
-	runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode)
+	runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode, opaTxProduced, opaTxAborted, opaTxLatency)
 }
 
-func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
+func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txProduced prometheus.Counter, txAborted prometheus.Counter, txLatency prometheus.Histogram) {
 	p, err := ck.NewProducer(&ck.ConfigMap{
 		"bootstrap.servers":  bootstrap,
 		"enable.idempotence": true,
@@ -103,6 +123,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 		// SendOffsetsToTransaction binds consumer offsets atomically
 		offsets, _ := c.Commit() // get current offsets synchronously (not committed to broker)
 		meta, _ := c.GetConsumerGroupMetadata()
+		t0 := time.Now()
 		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
@@ -119,6 +140,8 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
+		txProduced.Inc()
+		txLatency.Observe(time.Since(t0).Seconds())
 
 		if crashMode == "after" {
 			log.Fatal("crash after commit")
@@ -126,7 +149,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 	}
 }
 
-func runWrapper(bootstrap, groupID, txID string) {
+func runWrapper(bootstrap, groupID, txID string, txProduced prometheus.Counter, txAborted prometheus.Counter, txLatency prometheus.Histogram) {
 	in := "p1.orders.enriched"
 	out := "p1.orders.output"
 
@@ -182,6 +205,7 @@ func runWrapper(bootstrap, groupID, txID string) {
 		// bind offsets atomically
 		offsets, _ := c.Commit()
 		meta, _ := c.GetConsumerGroupMetadata()
+		t0 := time.Now()
 		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
@@ -190,5 +214,7 @@ func runWrapper(bootstrap, groupID, txID string) {
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
+		txProduced.Inc()
+		txLatency.Observe(time.Since(t0).Seconds())
 	}
 }
