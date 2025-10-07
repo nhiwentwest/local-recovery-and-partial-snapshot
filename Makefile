@@ -3,7 +3,7 @@ GENERATOR=bin/genorders
 PKG_OPB=./cmd/opb
 PKG_GEN=./cmd/genorders
 
-.PHONY: build run clean gen
+.PHONY: build run clean gen obs-start obs-stop
 
 build:
 	mkdir -p bin
@@ -18,3 +18,15 @@ gen: build
 
 clean:
 	rm -rf bin
+
+# Observability: start Prometheus (Grafana can point to it)
+obs-start:
+	@echo "Starting Prometheus with ./prometheus.yml on :9091";
+	@pkill -f "prometheus --config.file=./prometheus.yml" || true;
+	@nohup prometheus --config.file=./prometheus.yml --web.listen-address=":9091" >/tmp/prometheus.out 2>&1 &
+	@echo "Prometheus started at http://localhost:9091"
+
+obs-stop:
+	@echo "Stopping Prometheus";
+	@pkill -f "prometheus --config.file=./prometheus.yml" || true;
+	@echo "Stopped"
