@@ -1,0 +1,148 @@
+{
+  "__inputs": [],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.x" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "9.x" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "2.x" }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "OpB: Partition Lag (by partition)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "opb_partition_lag",
+          "legendFormat": "{{topic}} p={{partition}} g={{group}} i={{instance}}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "OpB: Tx Produced vs Aborted",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(opb_tx_produced_total[1m])",
+          "legendFormat": "produced/s",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "rate(opb_tx_aborted_total[1m])",
+          "legendFormat": "aborted/s",
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "OpB: Tx Latency p50/p95/p99 (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(opb_tx_latency_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(opb_tx_latency_seconds_bucket[1m])))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(opb_tx_latency_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Recovery: TTR (s) & Manifest Age (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "opb_recovery_ttr_seconds",
+          "legendFormat": "TTR",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "opb_last_manifest_age_seconds",
+          "legendFormat": "manifest age",
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "OpA: Tx Produced vs Aborted",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "rate(opa_tx_produced_total[1m])",
+          "legendFormat": "produced/s",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "rate(opa_tx_aborted_total[1m])",
+          "legendFormat": "aborted/s",
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "OpA: Tx Latency p50/p95/p99 (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(opa_tx_latency_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(opa_tx_latency_seconds_bucket[1m])))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(opa_tx_latency_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 37,
+  "style": "dark",
+  "tags": ["hpb", "opa", "opb"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "HPB: OpA/OpB Observability",
+  "version": 1
+}
+
+
