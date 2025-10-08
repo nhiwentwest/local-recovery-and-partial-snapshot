@@ -134,8 +134,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 			log.Fatal("crash mid commit")
 		}
 
-		// Optionally flush pending deliveries before commit
-		_ = p.Flush(5000)
+        // Commit without explicit flush to avoid adding fixed 5s latency
 		if err := p.CommitTransaction(context.TODO()); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue

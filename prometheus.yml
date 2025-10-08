@@ -3,7 +3,7 @@ global:
 scrape_configs:
 - job_name: opb
   static_configs:
-  - targets: ['localhost:8080','localhost:8082','localhost:8083']
+  - targets: ['localhost:8089']
 - job_name: opa
   static_configs:
   - targets: ['localhost:8081']

@@ -64,7 +64,7 @@ func main() {
 
 func readFlags() Config {
 	var cfg Config
-	flag.StringVar(&cfg.TopicPrefix, "topic-prefix", "p2", "topic prefix")
+	flag.StringVar(&cfg.TopicPrefix, "topic-prefix", "p1", "topic prefix")
 	flag.StringVar(&cfg.GroupID, "group-id", "opb", "consumer group id")
 	flag.IntVar(&cfg.WindowSizeSec, "window-size", 300, "aggregation window seconds")
 	flag.IntVar(&cfg.SnapshotInterval, "snapshot-interval", 60, "snapshot interval seconds")
@@ -78,12 +78,12 @@ func readFlags() Config {
 	flag.StringVar(&cfg.ChangelogSink, "changelog-sink", "file", "changelog sink: file|kafka|both")
 	flag.StringVar(&cfg.ManifestSink, "manifest-sink", "file", "manifest sink: file|kafka|both")
 	flag.StringVar(&cfg.ChangelogSource, "changelog-source", "file", "changelog source for restore: file|kafka")
-	flag.StringVar(&cfg.TopicChangelog, "topic-changelog", "p2.opb-changelog", "kafka topic for changelog (compacted)")
-	flag.StringVar(&cfg.TopicSnapshots, "topic-snapshots", "p2.opb-snapshots", "kafka topic for manifest (compacted)")
+	flag.StringVar(&cfg.TopicChangelog, "topic-changelog", "p1.opb-changelog", "kafka topic for changelog (compacted)")
+	flag.StringVar(&cfg.TopicSnapshots, "topic-snapshots", "p1.opb-snapshots", "kafka topic for manifest (compacted)")
 	flag.StringVar(&cfg.ManifestSource, "manifest-source", "file", "manifest source for restore: file|kafka")
 	flag.StringVar(&cfg.InputSource, "input-source", "sample", "orders.enriched source: sample|kafka")
 	flag.StringVar(&cfg.TopicEnriched, "topic-enriched", "p1.orders.enriched", "kafka topic for orders.enriched input")
-	flag.StringVar(&cfg.OutputTopic, "output-topic", "p2.orders.output", "kafka topic for orders.output")
+	flag.StringVar(&cfg.OutputTopic, "output-topic", "p1.orders.output", "kafka topic for orders.output")
 	flag.StringVar(&cfg.OutputTxID, "output-tx-id", "", "transactional id for orders.output (enable EOS when set)")
 	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "http listen address for metrics/health")
 	flag.BoolVar(&cfg.Once, "once", false, "process exactly one message then exit (testing)")
@@ -153,14 +153,15 @@ func run(cfg Config) error {
 
 	// Prometheus metrics registry
 	mreg := metrics.NewRegistry()
-	// HTTP for health/metrics
-	go func() {
-		http.Handle("/metrics", mreg.Handler())
-		http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	// HTTP for health/metrics on dedicated mux to avoid handler conflicts
+	go func(addr string) {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", mreg.Handler())
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 		})
-		_ = http.ListenAndServe(cfg.HTTPAddr, nil)
-	}()
+		_ = http.ListenAndServe(addr, mux)
+	}(cfg.HTTPAddr)
 
 	if cfg.InputSource == "kafka" && cfg.KafkaBootstrap != "" {
 		// Consume orders.enriched from Kafka

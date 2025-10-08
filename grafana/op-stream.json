@@ -73,6 +73,20 @@
       "type": "timeseries",
       "title": "Recovery: TTR (s) & Manifest Age (s)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "TTR" },
+            "properties": [
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "unit", "value": "s" }
+            ]
+          }
+        ]
+      },
       "targets": [
         {
           "expr": "opb_recovery_ttr_seconds",

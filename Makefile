@@ -11,7 +11,9 @@ build:
 	GO111MODULE=on go build -o $(GENERATOR) $(PKG_GEN)
 
 run: build
-	./$(BINARY) --topic-prefix p2 --snapshot-dir ./snapshots --badger-dir ./data/opb
+	./$(BINARY) --state-backend pebble --state-dir ./data/opb --snapshot-dir ./snapshots \
+		--kafka-bootstrap 127.0.0.1:9092 --group-id opb-g --topic-enriched p1.orders.enriched \
+		--output-topic p1.orders.output --http :8089
 
 gen: build
 	./$(GENERATOR) -count 50 -output p2.orders.enriched.jsonl

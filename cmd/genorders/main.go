@@ -16,7 +16,7 @@ func main() {
 	var count int
 	var outputFile string
 	flag.IntVar(&count, "count", 100, "number of orders to generate")
-	flag.StringVar(&outputFile, "output", "p2.orders.enriched.jsonl", "output file")
+	flag.StringVar(&outputFile, "output", "p1.orders.enriched.jsonl", "output file")
 	flag.Parse()
 
 	if err := generateOrders(count, outputFile); err != nil {

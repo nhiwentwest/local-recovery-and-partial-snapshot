@@ -17,26 +17,30 @@ This repository scaffolds the OpB service (Người 2) for the local-recovery-an
 - Giải pháp? Lưu lần chụp gần nhất và ghi nhật ký thay đổi; khi hồi phục, cộng bù để tiếp tục đúng & kịp thời.
 - Lợi ích? Không đếm trùng, không dừng toàn hệ thống, phục hồi trong vài giây.
 
-## Build & Run (local, Phase 1)
+## Build & Run (local)
 
 ```bash
 make build
-./bin/opb --topic-prefix p2 --snapshot-dir ./snapshots --badger-dir ./data/opb
+./bin/opb --state-backend pebble --state-dir ./data/opb --snapshot-dir ./snapshots \
+  --kafka-bootstrap 127.0.0.1:9092 --group-id opb-g --topic-enriched p1.orders.enriched \
+  --output-topic p1.orders.output --http :8089
 ```
 
 Notes:
-- Phase 1 uses in-memory state and filesystem snapshots to validate the control flow.
-- Kafka client and BadgerDB integration will be added next.
+- Backend state dùng PebbleDB; snapshot/manifest lưu filesystem (và có thể publish lên Kafka nếu bật).
 
 ## Flags
 
-- --topic-prefix: topic prefix (e.g., p2)
+- --state-backend: memory|pebble (mặc định pebble)
+- --state-dir: thư mục dữ liệu state (vd: ./data/opb)
 - --group-id: consumer group id (default: opb)
 - --window-size: aggregation window seconds (default: 300)
 - --snapshot-interval: seconds between snapshots (default: 60)
 - --changelog: on|off toggle for changelog emission (default: on)
 - --snapshot-dir: directory to store snapshots
-- --badger-dir: directory for state (reserved for Badger; not used in Phase 1)
+- --kafka-bootstrap: bootstrap servers (vd: 127.0.0.1:9092)
+- --topic-enriched: input (mặc định p1.orders.enriched)
+- --output-topic: output (mặc định p1.orders.output)
 
 ## Layout
 
@@ -54,7 +58,7 @@ Notes:
     "createdAt": 1694499600 }
   ```
 
-  manifest lưu trên `opb-snapshots` (compacted) để lấy **bản mới nhất** nhanh chóng.
+  manifest lưu trên `p1.opb-snapshots` (compacted) để lấy **bản mới nhất** nhanh chóng.
 * **Output EOS:** tương tự OpA, nhưng với `transactional.id=opB-...` và `SendOffsetsToTransaction()` cho `orders.enriched`. (Chuẩn **KIP-98**.) ([Apache Software Foundation][4])
 
 ## 3.5. Recovery OpB (local)
