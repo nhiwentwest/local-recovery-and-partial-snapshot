@@ -29,13 +29,13 @@ func main() {
 		pollIntervalSec int
 		advanceManifest bool
 	)
-	flag.StringVar(&bootstrap, "bootstrap", "localhost:19092", "kafka bootstrap")
+    flag.StringVar(&bootstrap, "bootstrap", "127.0.0.1:9092", "kafka bootstrap")
 	flag.StringVar(&groupID, "group-id", "recover", "metrics label: group id")
 	flag.StringVar(&instanceID, "instance-id", "R", "metrics label: instance id")
 	flag.StringVar(&manifestSource, "manifest-source", "kafka", "file|kafka")
 	flag.StringVar(&changelogSource, "changelog-source", "kafka", "file|kafka")
-	flag.StringVar(&topicSnapshots, "topic-snapshots", "p2.opb-snapshots", "manifest topic")
-	flag.StringVar(&topicChangelog, "topic-changelog", "p2.opb-changelog", "changelog topic")
+    flag.StringVar(&topicSnapshots, "topic-snapshots", "p1.opb-snapshots", "manifest topic")
+    flag.StringVar(&topicChangelog, "topic-changelog", "p1.opb-changelog", "changelog topic")
 	flag.StringVar(&snapshotDir, "snapshot-dir", "./snapshots", "snapshot dir for file mode")
 	flag.StringVar(&httpAddr, "http", ":9090", "http listen for /metrics")
 	flag.IntVar(&pollIntervalSec, "poll", 10, "poll interval seconds for manifest")
