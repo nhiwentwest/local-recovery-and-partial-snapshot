@@ -1,0 +1,95 @@
+3 file code main.go sẽ nằm ở trong thư mục cmd với lần lượt là cmd\p3-failure-injector, cmd\p3-datagen và cmd\recovery-standalone.
+khi sử dụng make thì gõ make p3-help thì nó sẽ hiện ra các chỉ dẫn để chạy.
+check mấy file code về vụ xung đột win/linux hộ tui nữa.
+và lần cuối cùng tui chạy code có kết quả như sau:
++ Đây là set-up:
+if (!(Test-Path bin)) { New-Item -ItemType Directory -Path bin }
+$env:GOOS="windows"; $env:GOARCH="amd64"; $env:GO111MODULE="on"; go build -o bin/p3-datagen.exe ./cmd/p3-datagen
+$env:GOOS="windows"; $env:GOARCH="amd64"; $env:GO111MODULE="on"; go build -o bin/p3-recovery.exe ./cmd/recovery-standalone
+$env:GOOS="windows"; $env:GOARCH="amd64"; $env:GO111MODULE="on"; go build -o bin/p3-failure-injector.exe ./cmd/p3-failure-injector
+.\bin/p3-datagen.exe
+2025/10/25 12:37:05   - Integrated: snapshots-integrated/state.json (2 original + 2 P3 = 4 total keys)
+2025/10/25 12:37:05 Test data generated for Person 3:
+2025/10/25 12:37:05   - Snapshot: p3-snapshot-1761370625
+2025/10/25 12:37:05   - Manifest: manifest-p3.json (P3-specific)
+2025/10/25 12:37:05   - Changelog: changelog/opb.jsonl (6 records, offset 2)
+
++ Còn đây là test all với các chức năng clean-data, set-up và failure-injector (có chạy recovery rồi, chạy file mode):
+PS D:\project_distributed_system\local-recovery-and-partial-snapshot-main_backup> make p3-test-all
+Remove-Item -Path "p3-snapshot-*" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "manifest.latest.json" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "manifest-p3.json" -Force -ErrorAction SilentlyContinue
+make: [Makefile:61: p3-clean-data] Error 1 (ignored)
+Remove-Item -Path "snapshots-integrated" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "changelog" -Recurse -Force -ErrorAction SilentlyContinue
+if (!(Test-Path bin)) { New-Item -ItemType Directory -Path bin }
+$env:GOOS="windows"; $env:GOARCH="amd64"; $env:GO111MODULE="on"; go build -o bin/p3-datagen.exe ./cmd/p3-datagen
+$env:GOOS="windows"; $env:GOARCH="amd64"; $env:GO111MODULE="on"; go build -o bin/p3-recovery.exe ./cmd/recovery-standalone
+$env:GOOS="windows"; $env:GOARCH="amd64"; $env:GO111MODULE="on"; go build -o bin/p3-failure-injector.exe ./cmd/p3-failure-injector
+.\bin/p3-datagen.exe
+2025/10/25 12:37:25   - Integrated: snapshots-integrated/state.json (2 original + 2 P3 = 4 total keys)
+2025/10/25 12:37:25 Test data generated for Person 3:
+2025/10/25 12:37:25   - Snapshot: p3-snapshot-1761370645
+2025/10/25 12:37:25   - Manifest: manifest-p3.json (P3-specific)
+2025/10/25 12:37:25   - Changelog: changelog/opb.jsonl (6 records, offset 2)
+.\bin/p3-failure-injector.exe
+2025/10/25 12:37:52 Person 3 Failure Injector - Safe Mode
+2025/10/25 12:37:53 === Recovery Cycle 1 ===
+2025/10/25 12:38:20 Will kill process in 13s
+2025/10/25 12:38:20 Using file mode: snapshot-dir=.
+2025/10/25 12:38:20 Starting recovery service...
+2025/10/25 12:38:20 Metrics server listening on :2112
+2025/10/25 12:38:20 Found original snapshots, using: 2025-09-22T14_51_49Z
+2025/10/25 12:38:20 restore: loaded 2 keys from snapshot original-temp (size: 175 bytes, time: 0s)
+2025/10/25 12:38:20 restore: loaded 2 keys from ORIGINAL snapshot 2025-09-22T14_51_49Z
+2025/10/25 12:38:20 restore: loaded 2 keys from snapshot p3-temp (size: 121 bytes, time: 0s)
+2025/10/25 12:38:20 restore: loaded P3 snapshot p3-snapshot-1761370645 (2 applied)
+2025/10/25 12:38:20 restore: snapshot not found at 2025-09-22T14_51_49Z\state.json, skipping
+2025/10/25 12:38:20 Recovery metrics updated: TTR=0.001s, Applied=2, Skipped=2, Bytes=0, Rate=7444.63 records/s
+2025/10/25 12:38:20 Recovery completed: TTR=0.006s, Applied=6, Skipped=2, Bytes=296
+2025/10/25 12:38:33 Killing recovery process (PID: 1664)
+2025/10/25 12:38:33 Process exited with error: exit status 1
+2025/10/25 12:38:35 === Recovery Cycle 2 ===
+2025/10/25 12:38:35 Will kill process in 9s
+2025/10/25 12:38:35 Using file mode: snapshot-dir=.
+2025/10/25 12:38:35 Starting recovery service...
+2025/10/25 12:38:35 Found original snapshots, using: 2025-09-22T14_51_49Z
+2025/10/25 12:38:35 restore: loaded 2 keys from snapshot original-temp (size: 175 bytes, time: 0s)
+2025/10/25 12:38:35 Metrics server listening on :2112
+2025/10/25 12:38:35 restore: loaded 2 keys from ORIGINAL snapshot 2025-09-22T14_51_49Z
+2025/10/25 12:38:35 restore: loaded 2 keys from snapshot p3-temp (size: 121 bytes, time: 583.2µs)
+2025/10/25 12:38:35 restore: loaded P3 snapshot p3-snapshot-1761370645 (2 applied)
+2025/10/25 12:38:35 restore: snapshot not found at 2025-09-22T14_51_49Z\state.json, skipping
+2025/10/25 12:38:35 Recovery metrics updated: TTR=0.000s, Applied=2, Skipped=2, Bytes=0, Rate=+Inf records/s
+2025/10/25 12:38:35 Recovery completed: TTR=0.009s, Applied=6, Skipped=2, Bytes=296
+2025/10/25 12:38:44 Killing recovery process (PID: 4592)
+2025/10/25 12:38:44 Process exited with error: exit status 1
+2025/10/25 12:38:46 === Recovery Cycle 3 ===
+2025/10/25 12:38:46 Will kill process in 6s
+2025/10/25 12:38:46 Using file mode: snapshot-dir=.
+2025/10/25 12:38:46 Starting recovery service...
+2025/10/25 12:38:46 Metrics server listening on :2112
+2025/10/25 12:38:46 Found original snapshots, using: 2025-09-22T14_51_49Z
+2025/10/25 12:38:46 restore: loaded 2 keys from snapshot original-temp (size: 175 bytes, time: 0s)
+2025/10/25 12:38:46 restore: loaded 2 keys from ORIGINAL snapshot 2025-09-22T14_51_49Z
+2025/10/25 12:38:46 restore: loaded 2 keys from snapshot p3-temp (size: 121 bytes, time: 0s)
+2025/10/25 12:38:46 restore: loaded P3 snapshot p3-snapshot-1761370645 (2 applied)
+2025/10/25 12:38:46 restore: snapshot not found at 2025-09-22T14_51_49Z\state.json, skipping
+2025/10/25 12:38:46 Recovery metrics updated: TTR=0.000s, Applied=2, Skipped=2, Bytes=0, Rate=+Inf records/s
+2025/10/25 12:38:46 Recovery completed: TTR=0.005s, Applied=6, Skipped=2, Bytes=296
+2025/10/25 12:38:52 Killing recovery process (PID: 16172)
+2025/10/25 12:38:52 Process exited with error: exit status 1
+2025/10/25 12:38:54 === Final Recovery Verification ===
+2025/10/25 12:38:54 Using file mode: snapshot-dir=.
+2025/10/25 12:38:54 Starting recovery service...
+2025/10/25 12:38:54 Metrics server listening on :2112
+2025/10/25 12:38:54 Found original snapshots, using: 2025-09-22T14_51_49Z
+2025/10/25 12:38:54 restore: loaded 2 keys from snapshot original-temp (size: 175 bytes, time: 567.3µs)
+2025/10/25 12:38:54 restore: loaded 2 keys from ORIGINAL snapshot 2025-09-22T14_51_49Z
+2025/10/25 12:38:54 restore: loaded 2 keys from snapshot p3-temp (size: 121 bytes, time: 0s)
+2025/10/25 12:38:54 restore: loaded P3 snapshot p3-snapshot-1761370645 (2 applied)
+2025/10/25 12:38:54 restore: snapshot not found at 2025-09-22T14_51_49Z\state.json, skipping
+2025/10/25 12:38:54 Recovery metrics updated: TTR=0.001s, Applied=2, Skipped=2, Bytes=0, Rate=7670.18 records/s
+2025/10/25 12:38:54 Recovery completed: TTR=0.005s, Applied=6, Skipped=2, Bytes=296
+2025/10/25 12:39:02 Final recovery test completed
+2025/10/25 12:39:02 Failure injection test completed successfully
