@@ -4,16 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
-	"net/http"
 	"time"
 
 	"hpb/internal/model"
 
 	ck "github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -25,40 +21,24 @@ func main() {
 		txID      string
 		mode      string // normal|wrapper
 		crashMode string // before|mid|after|none
-		httpAddr  string
 	)
-	flag.StringVar(&bootstrap, "bootstrap", "localhost:19092", "kafka bootstrap servers")
+	flag.StringVar(&bootstrap, "bootstrap", "localhost:9092", "kafka bootstrap servers")
 	flag.StringVar(&groupID, "group-id", "opa", "consumer group id")
 	flag.StringVar(&topicIn, "topic-in", "p1.orders", "input topic")
 	flag.StringVar(&topicOut, "topic-out", "p1.orders.enriched", "output topic")
 	flag.StringVar(&txID, "tx-id", "opa-local-1", "transactional id")
 	flag.StringVar(&mode, "mode", "normal", "normal|wrapper")
 	flag.StringVar(&crashMode, "crash-mode", "none", "before|mid|after|none")
-	flag.StringVar(&httpAddr, "http", ":8081", "http listen address for metrics/health")
 	flag.Parse()
 
-	// metrics registry for OpA
-	opaTxProduced := prometheus.NewCounter(prometheus.CounterOpts{Name: "opa_tx_produced_total"})
-	opaTxAborted := prometheus.NewCounter(prometheus.CounterOpts{Name: "opa_tx_aborted_total"})
-	opaTxLatency := prometheus.NewHistogram(prometheus.HistogramOpts{Name: "opa_tx_latency_seconds", Buckets: prometheus.DefBuckets})
-	opaReg := prometheus.NewRegistry()
-	opaReg.MustRegister(opaTxProduced, opaTxAborted, opaTxLatency)
-
-	// start metrics HTTP
-	go func() {
-		http.Handle("/metrics", promhttp.HandlerFor(opaReg, promhttp.HandlerOpts{}))
-		http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = fmt.Fprint(w, "ok") })
-		_ = http.ListenAndServe(httpAddr, nil)
-	}()
-
 	if mode == "wrapper" {
-		runWrapper(bootstrap, groupID, txID, opaTxProduced, opaTxAborted, opaTxLatency)
+		runWrapper(bootstrap, groupID, txID)
 		return
 	}
-	runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode, opaTxProduced, opaTxAborted, opaTxLatency)
+	runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode)
 }
 
-func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txProduced prometheus.Counter, txAborted prometheus.Counter, txLatency prometheus.Histogram) {
+func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string) {
 	p, err := ck.NewProducer(&ck.ConfigMap{
 		"bootstrap.servers":  bootstrap,
 		"enable.idempotence": true,
@@ -110,10 +90,19 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 		eo := model.Normalize(o)
 		val, _ := json.Marshal(eo)
 
-		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topicOut, Partition: ck.PartitionAny}, Key: []byte(o.OrderID), Value: val}, nil); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
-		}
+		if err := p.Produce(&ck.Message{
+    TopicPartition: ck.TopicPartition{
+        Topic:     &topicOut,
+        Partition: int32(ck.PartitionAny), 
+    },
+    Key:   []byte(o.OrderID),
+    Value: val,
+}, nil); err != nil {
+    log.Printf("produce failed: %v — aborting transaction", err)
+    _ = p.AbortTransaction(context.TODO())
+    continue
+}
+
 
 		// crash matrix simulation
 		if crashMode == "before" {
@@ -123,7 +112,6 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 		// SendOffsetsToTransaction binds consumer offsets atomically
 		offsets, _ := c.Commit() // get current offsets synchronously (not committed to broker)
 		meta, _ := c.GetConsumerGroupMetadata()
-		t0 := time.Now()
 		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
@@ -134,13 +122,14 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 			log.Fatal("crash mid commit")
 		}
 
-        // Commit without explicit flush to avoid adding fixed 5s latency
+		// Optionally flush pending deliveries before commit
+		_ = p.Flush(5000)
 		if err := p.CommitTransaction(context.TODO()); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
-		txProduced.Inc()
-		txLatency.Observe(time.Since(t0).Seconds())
+
+		log.Printf("Committed transaction for orderId=%s", string(msg.Key))
 
 		if crashMode == "after" {
 			log.Fatal("crash after commit")
@@ -148,7 +137,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 	}
 }
 
-func runWrapper(bootstrap, groupID, txID string, txProduced prometheus.Counter, txAborted prometheus.Counter, txLatency prometheus.Histogram) {
+func runWrapper(bootstrap, groupID, txID string) {
 	in := "p1.orders.enriched"
 	out := "p1.orders.output"
 
@@ -196,15 +185,20 @@ func runWrapper(bootstrap, groupID, txID string, txProduced prometheus.Counter, 
 		}
 
 		// passthrough enriched -> output (key preserved)
-		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &out, Partition: ck.PartitionAny}, Key: msg.Key, Value: msg.Value}, nil); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
+		if err := p.Produce(&ck.Message{
+    TopicPartition: ck.TopicPartition{
+        Topic:     &out,
+        Partition: int32(ck.PartitionAny), // ✅ same cast
+    },
+    Key:   msg.Key,
+    Value: msg.Value,
+}, nil); err != nil {
+
 		}
 
 		// bind offsets atomically
 		offsets, _ := c.Commit()
 		meta, _ := c.GetConsumerGroupMetadata()
-		t0 := time.Now()
 		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
@@ -213,7 +207,5 @@ func runWrapper(bootstrap, groupID, txID string, txProduced prometheus.Counter, 
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
-		txProduced.Inc()
-		txLatency.Observe(time.Since(t0).Seconds())
 	}
 }
