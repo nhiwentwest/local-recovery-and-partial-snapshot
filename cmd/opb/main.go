@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"hpb/internal/changelog"
@@ -135,6 +136,8 @@ func run(cfg Config) error {
 
 	// Init changelog writer (file by default; kafka optional)
 	var clog changelog.Writer
+	// Track how many changelog records have been appended so far (for manifest offset)
+	var changelogAppendedCount int64
 	if cfg.ChangelogSink == "file" || cfg.ChangelogSink == "both" || cfg.ChangelogSink == "" {
 		fw, err := changelog.NewFileWriter("./changelog", "opb.jsonl")
 		if err != nil {
@@ -154,23 +157,48 @@ func run(cfg Config) error {
 	// Prometheus metrics registry
 	mreg := metrics.NewRegistry()
 	// HTTP for health/metrics on dedicated mux to avoid handler conflicts
+	var isReady atomic.Bool
 	go func(addr string) {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", mreg.Handler())
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			if !isReady.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "starting"})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 		})
 		_ = http.ListenAndServe(addr, mux)
 	}(cfg.HTTPAddr)
 
 	if cfg.InputSource == "kafka" && cfg.KafkaBootstrap != "" {
+		// Start periodic snapshot + manifest publisher in background (Kafka mode)
+		if cfg.SnapshotInterval > 0 {
+			go func() {
+				ticker := time.NewTicker(time.Duration(cfg.SnapshotInterval) * time.Second)
+				defer ticker.Stop()
+				for range ticker.C {
+					id := time.Now().UTC().Format(time.RFC3339)
+					if err := snap.WriteSnapshot(id, st); err != nil {
+						log.Printf("snapshot error: %v", err)
+						continue
+					}
+					if err := mani.PublishLatest(id, changelogAppendedCount); err != nil {
+						log.Printf("manifest publish error: %v", err)
+						continue
+					}
+					log.Printf("snapshot and manifest published: %s (offset=%d)", id, changelogAppendedCount)
+				}
+			}()
+		}
 		// Consume orders.enriched from Kafka
 		c, err := ck.NewConsumer(&ck.ConfigMap{
 			"bootstrap.servers":             cfg.KafkaBootstrap,
 			"group.id":                      cfg.GroupID,
 			"enable.auto.commit":            false,
 			"isolation.level":               "read_committed",
-			"auto.offset.reset":             "earliest",
+			"auto.offset.reset":             "latest",
 			"partition.assignment.strategy": "cooperative-sticky",
 			"client.id":                     cfg.InstanceID,
 			"group.instance.id":             cfg.InstanceID,
@@ -233,9 +261,9 @@ func run(cfg Config) error {
 				"acks":               "all",
 				"transactional.id":   cfg.OutputTxID,
 				// High throughput batching tuning
-				"linger.ms":          5,       // Giảm từ 10ms
-				"batch.num.messages": 500000,  // Tăng từ 100K
-				"batch.size":         8388608, // 8 MB (tăng từ 1MB)
+				"linger.ms":          cfg.TxLingerMs, // Use config value instead of hardcoded 5ms
+				"batch.num.messages": 500000,         // Tăng từ 100K
+				"batch.size":         16777216,       // 16 MB
 				"compression.type":   "lz4",
 				// Extra EOS safety (can raise to 2 if measured safe)
 				"max.in.flight.requests.per.connection": 1,
@@ -246,6 +274,7 @@ func run(cfg Config) error {
 				"transaction.timeout.ms": 600000,     // 10 min transaction timeout
 				"retries":                2147483647, // Max retries
 				"retry.backoff.ms":       100,        // Fast retry
+				"debug":                  "eos,broker,protocol",
 			})
 			if err != nil {
 				return fmt.Errorf("producer: %w", err)
@@ -256,12 +285,25 @@ func run(cfg Config) error {
 			p = prod
 			defer p.Close()
 		}
+		// Mark ready once consumer has partition assignment (and producer, if any, is initialized)
+		go func() {
+			for {
+				ass, err := c.Assignment()
+				if err == nil && len(ass) > 0 {
+					isReady.Store(true)
+					log.Printf("opb: ready (assigned %d partitions)", len(ass))
+					return
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}()
 		// Continuous processing loop with transactional batching.
 		var (
-			batchStarted   bool
-			batchStartTime time.Time
-			batchCount     int
-			batchOffsets   = make(map[int32]ck.TopicPartition) // partition -> highest offset+1
+			batchStarted      bool
+			batchStartTime    time.Time
+			batchCount        int
+			batchOffsets      = make(map[int32]ck.TopicPartition) // partition -> highest offset+1
+			opbCrashTriggered bool
 		)
 		for {
 			// Read first to avoid spinning when no input
@@ -281,23 +323,46 @@ func run(cfg Config) error {
 			log.Printf("%s consume partition=%d offset=%d topic=%s", cfg.InstanceID, msg.TopicPartition.Partition, msg.TopicPartition.Offset, *msg.TopicPartition.Topic)
 			var ev opb.OrderEnriched
 			if err := json.Unmarshal(msg.Value, &ev); err != nil {
+				log.Printf("unmarshal error: %v", err)
 				continue
 			}
+			// extract t0 header if present
+			var hdrT0 []byte
+			if len(msg.Headers) > 0 {
+				for _, h := range msg.Headers {
+					if h.Key == "t0" {
+						hdrT0 = h.Value
+						break
+					}
+				}
+			}
+			// Pre-compute key for diagnostics
+			ws := opb.WindowStart(ev.NormTS, cfg.WindowSizeSec)
+			k := opb.OutputKey(ev.StoreID, ev.ProductID, ws)
+			prevSt, _ := st.Get(k)
 			applied, out, seq, err := opb.AggregateAndBuildOutput(st, cfg.WindowSizeSec, ev)
 			if err != nil {
 				return fmt.Errorf("aggregate: %w", err)
 			}
 			if applied {
+				log.Printf("aggregate: applied key=%s seq=%d prevLast=%d", out.Key, seq, prevSt.LastSeq)
 				b, _ := json.Marshal(out)
 				if p != nil {
 					if !batchStarted {
+						log.Printf("tx: begin transaction")
 						if err := p.BeginTransaction(); err != nil {
 							return fmt.Errorf("begin tx: %w", err)
 						}
 						batchStarted = true
 						batchStartTime = time.Now()
 					}
-					if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: b}, nil); err != nil {
+					// set t1 header and propagate t0 if any
+					t1 := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+					headers := []ck.Header{{Key: "t1", Value: t1}}
+					if len(hdrT0) > 0 {
+						headers = append(headers, ck.Header{Key: "t0", Value: hdrT0})
+					}
+					if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: b, Headers: headers}, nil); err != nil {
 						_ = p.AbortTransaction(context.TODO())
 						mreg.TxAborted.Inc()
 						batchStarted = false
@@ -315,27 +380,63 @@ func run(cfg Config) error {
 				}
 				if cfg.ChangelogOn {
 					d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
-					if err := clog.Append(d); err != nil {
-						if p != nil && batchStarted {
+					// If we have a transactional producer, write changelog to Kafka in the same transaction for immediate visibility
+					if p != nil && (cfg.ChangelogSink == "kafka" || cfg.ChangelogSink == "both") {
+						bchg, _ := json.Marshal(d)
+						t1 := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+						headers := []ck.Header{{Key: "t1", Value: t1}}
+						if len(hdrT0) > 0 {
+							headers = append(headers, ck.Header{Key: "t0", Value: hdrT0})
+						}
+						if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicChangelog, Partition: ck.PartitionAny}, Key: []byte(d.Key), Value: bchg, Headers: headers}, nil); err != nil {
 							_ = p.AbortTransaction(context.TODO())
 							mreg.TxAborted.Inc()
 							batchStarted = false
 							batchCount = 0
 							batchOffsets = make(map[int32]ck.TopicPartition)
+							log.Printf("tx: produce changelog error, aborted: %v", err)
+							return nil
 						}
-						return fmt.Errorf("append changelog: %w", err)
+					} else if clog != nil {
+						if err := clog.Append(d); err != nil {
+							if p != nil && batchStarted {
+								_ = p.AbortTransaction(context.TODO())
+								mreg.TxAborted.Inc()
+								batchStarted = false
+								batchCount = 0
+								batchOffsets = make(map[int32]ck.TopicPartition)
+							}
+							return fmt.Errorf("append changelog: %w", err)
+						}
 					}
+					log.Printf("changelog: appended key=%s seq=%d", out.Key, seq)
 					mreg.ChangelogAppended.Inc()
+					changelogAppendedCount++
 				}
+			} else {
+				log.Printf("aggregate: skipped key=%s prevLast=%d nextSeq=%d", k, prevSt.LastSeq, prevSt.LastSeq+1)
 			}
 			// Commit batch if thresholds met
 			if p != nil && batchStarted && (batchCount >= cfg.TxBatchSize || time.Since(batchStartTime) >= time.Duration(cfg.TxLingerMs)*time.Millisecond) {
+				// Crash injection points for OpB EOS (before/mid/after one-shot per process)
+				if cfg.CrashMode == "before" && !opbCrashTriggered {
+					log.Fatalf("opb crash: before commit (simulated)")
+				}
 				if err := commitBatch(c, p, batchOffsets, mreg); err != nil {
 					log.Printf("tx: batch commit error: %v", err)
+				}
+				if cfg.CrashMode == "mid" && !opbCrashTriggered {
+					log.Fatalf("opb crash: mid commit (simulated)")
 				}
 				batchStarted = false
 				batchCount = 0
 				batchOffsets = make(map[int32]ck.TopicPartition)
+				if cfg.CrashMode == "after" && !opbCrashTriggered {
+					log.Fatalf("opb crash: after commit (simulated)")
+				}
+				if cfg.CrashMode != "" {
+					opbCrashTriggered = true
+				}
 			}
 			if cfg.Once {
 				log.Printf("once: exiting after one message")
@@ -377,7 +478,8 @@ func run(cfg Config) error {
 			if err := snap.WriteSnapshot(id, st); err != nil {
 				return fmt.Errorf("write snapshot: %w", err)
 			}
-			if err := mani.PublishLatest(id, 0); err != nil { // lastChangelogOffset=0 placeholder
+			// Use number of appended changelog records as the file-based replay offset
+			if err := mani.PublishLatest(id, changelogAppendedCount); err != nil {
 				return fmt.Errorf("publish manifest: %w", err)
 			}
 			log.Printf("snapshot and manifest published: %s", id)

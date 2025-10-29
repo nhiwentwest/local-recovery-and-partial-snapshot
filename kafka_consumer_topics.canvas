@@ -1,0 +1,39 @@
+{
+  "nodes": [
+    {"id":"topic","type":"text","x":-1200,"y":0,"width":300,"height":110,
+     "text":"Topic: orders.enriched\n(hash by key=orderId)","color":"4"},
+
+    {"id":"p0","type":"text","x":-800,"y":-160,"width":180,"height":70,
+     "text":"Partition P0","color":"2"},
+    {"id":"p1","type":"text","x":-800,"y":0,"width":180,"height":70,
+     "text":"Partition P1","color":"2"},
+    {"id":"p2","type":"text","x":-800,"y":160,"width":180,"height":70,
+     "text":"Partition P2","color":"2"},
+
+    {"id":"group","type":"text","x":-320,"y":-200,"width":280,"height":90,
+     "text":"Consumer Group\n(group.id=opb-g)","color":"5"},
+
+    {"id":"opb1","type":"text","x":0,"y":-80,"width":220,"height":90,
+     "text":"Consumer Instance\nopb-1 (reads P0,P2)","color":"1"},
+    {"id":"opb2","type":"text","x":0,"y":80,"width":220,"height":90,
+     "text":"Consumer Instance\nopb-2 (reads P1)","color":"1"},
+
+    {"id":"legend","type":"text","x":360,"y":0,"width":460,"height":150,
+     "text":"Legend:\n1) Topic → Partitions: hash(key) phân bổ bản ghi\n2) Group → Topic: subscribe (đăng ký đọc topic)\n3) Group → Instances: assign (chia partitions)\n4) Instances → Partitions: reads (đọc partition được phân)","color":"3"}
+  ],
+  "edges": [
+    {"id":"e-topic-p0","fromNode":"topic","fromSide":"right","toNode":"p0","toSide":"left","label":"hash(key)"},
+    {"id":"e-topic-p1","fromNode":"topic","fromSide":"right","toNode":"p1","toSide":"left","label":"hash(key)"},
+    {"id":"e-topic-p2","fromNode":"topic","fromSide":"right","toNode":"p2","toSide":"left","label":"hash(key)"},
+
+    {"id":"e-group-topic","fromNode":"group","fromSide":"right","toNode":"topic","toSide":"left","label":"subscribe"},
+
+    {"id":"e-group-opb1","fromNode":"group","fromSide":"right","toNode":"opb1","toSide":"left","label":"assign"},
+    {"id":"e-group-opb2","fromNode":"group","fromSide":"right","toNode":"opb2","toSide":"left","label":"assign"},
+
+    {"id":"e-opb1-p0","fromNode":"opb1","fromSide":"left","toNode":"p0","toSide":"right","label":"reads P0"},
+    {"id":"e-opb1-p2","fromNode":"opb1","fromSide":"left","toNode":"p2","toSide":"right","label":"reads P2"},
+    {"id":"e-opb2-p1","fromNode":"opb2","fromSide":"left","toNode":"p1","toSide":"right","label":"reads P1"}
+  ],
+  "version": 1
+}

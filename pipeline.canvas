@@ -1,0 +1,205 @@
+{
+  "nodes": [
+    {
+      "id": "n-orders",
+      "type": "text",
+      "x": -1000,
+      "y": 0,
+      "width": 220,
+      "height": 90,
+      "text": "Topic: orders\n(raw events)",
+      "color": "4"
+    },
+    {
+      "id": "n-opA",
+      "type": "text",
+      "x": -700,
+      "y": 0,
+      "width": 260,
+      "height": 120,
+      "text": "OpA (Normalize + EOS)\n- Input: orders\n- Output: orders.enriched\n- KIP-98 transactions",
+      "color": "1"
+    },
+    {
+      "id": "n-enriched",
+      "type": "text",
+      "x": -350,
+      "y": 0,
+      "width": 280,
+      "height": 110,
+      "text": "Topic: orders.enriched\nkey = orderId\n(read_committed)",
+      "color": "4"
+    },
+    {
+      "id": "n-opB",
+      "type": "text",
+      "x": 50,
+      "y": 0,
+      "width": 320,
+      "height": 150,
+      "text": "OpB (Aggregator)\n- Window tumbling (--window-size)\n- Key: storeId#productId#windowStart\n- State: sum, count, lastSeq",
+      "color": "1"
+    },
+    {
+      "id": "n-output",
+      "type": "text",
+      "x": 500,
+      "y": 0,
+      "width": 300,
+      "height": 110,
+      "text": "Topic: orders.output\n(key = storeId#productId#windowStart)\n(optional EOS via --output-tx-id)",
+      "color": "4"
+    },
+    {
+      "id": "n-state",
+      "type": "text",
+      "x": 500,
+      "y": -180,
+      "width": 280,
+      "height": 120,
+      "text": "State Store\nPebble (default) / Memory\n(sum, count, lastSeq)",
+      "color": "2"
+    },
+    {
+      "id": "n-metrics",
+      "type": "text",
+      "x": 50,
+      "y": -250,
+      "width": 320,
+      "height": 120,
+      "text": "Metrics & Health\n- /metrics (Prometheus)\n- /healthz\n- Lag, Tx, Changelog counters",
+      "color": "3"
+    },
+    {
+      "id": "n-changelog",
+      "type": "text",
+      "x": 50,
+      "y": 180,
+      "width": 340,
+      "height": 130,
+      "text": "Changelog (delta)\n- Topic: opb-changelog (compacted) or file\n- Record: {key, seq, delta, ts}\n- Idempotent via seq",
+      "color": "5"
+    },
+    {
+      "id": "n-snapshot",
+      "type": "text",
+      "x": 500,
+      "y": 180,
+      "width": 320,
+      "height": 130,
+      "text": "Snapshots (filesystem)\n- Directory: --snapshot-dir\n- Periodic: --snapshot-interval",
+      "color": "2"
+    },
+    {
+      "id": "n-manifest",
+      "type": "text",
+      "x": 900,
+      "y": 180,
+      "width": 340,
+      "height": 130,
+      "text": "Manifest (latest)\n- Topic: opb-snapshots (compacted) or file\n- {snapshotId, lastChangelogOffset}",
+      "color": "5"
+    },
+    {
+      "id": "n-restore",
+      "type": "text",
+      "x": 900,
+      "y": -20,
+      "width": 340,
+      "height": 150,
+      "text": "Restore flow\n1) Read manifest.latest\n2) Load snapshot\n3) Replay changelog from offset+1\n4) Continue processing",
+      "color": "3"
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-orders-opA",
+      "fromNode": "n-orders",
+      "fromSide": "right",
+      "toNode": "n-opA",
+      "toSide": "left",
+      "label": "raw events"
+    },
+    {
+      "id": "e-opA-enriched",
+      "fromNode": "n-opA",
+      "fromSide": "right",
+      "toNode": "n-enriched",
+      "toSide": "left",
+      "label": "normalize + EOS"
+    },
+    {
+      "id": "e-enriched-opB",
+      "fromNode": "n-enriched",
+      "fromSide": "right",
+      "toNode": "n-opB",
+      "toSide": "left",
+      "label": "read_committed"
+    },
+    {
+      "id": "e-opB-output",
+      "fromNode": "n-opB",
+      "fromSide": "right",
+      "toNode": "n-output",
+      "toSide": "left",
+      "label": "orders.output"
+    },
+    {
+      "id": "e-opB-state",
+      "fromNode": "n-opB",
+      "fromSide": "top",
+      "toNode": "n-state",
+      "toSide": "bottom",
+      "label": "update sum/count/seq"
+    },
+    {
+      "id": "e-opB-changelog",
+      "fromNode": "n-opB",
+      "fromSide": "bottom",
+      "toNode": "n-changelog",
+      "toSide": "top",
+      "label": "delta (key,seq,delta,ts)"
+    },
+    {
+      "id": "e-state-snapshot",
+      "fromNode": "n-state",
+      "fromSide": "bottom",
+      "toNode": "n-snapshot",
+      "toSide": "top",
+      "label": "periodic snapshot"
+    },
+    {
+      "id": "e-snapshot-manifest",
+      "fromNode": "n-snapshot",
+      "fromSide": "right",
+      "toNode": "n-manifest",
+      "toSide": "left",
+      "label": "publish latest"
+    },
+    {
+      "id": "e-manifest-restore",
+      "fromNode": "n-manifest",
+      "fromSide": "top",
+      "toNode": "n-restore",
+      "toSide": "bottom",
+      "label": "read manifest"
+    },
+    {
+      "id": "e-restore-state",
+      "fromNode": "n-restore",
+      "fromSide": "left",
+      "toNode": "n-state",
+      "toSide": "right",
+      "label": "load + replay"
+    },
+    {
+      "id": "e-opB-metrics",
+      "fromNode": "n-opB",
+      "fromSide": "top",
+      "toNode": "n-metrics",
+      "toSide": "bottom",
+      "label": "/metrics"
+    }
+  ],
+  "version": 1
+}

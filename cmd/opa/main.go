@@ -74,7 +74,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 		"bootstrap.servers":  bootstrap,
 		"group.id":           groupID,
 		"enable.auto.commit": false,
-		"isolation.level":    "read_committed",
+		"isolation.level":    "read_uncommitted",
 		"auto.offset.reset":  "earliest",
 	})
 	if err != nil {
@@ -134,7 +134,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 			log.Fatal("crash mid commit")
 		}
 
-        // Commit without explicit flush to avoid adding fixed 5s latency
+		// Commit without explicit flush to avoid adding fixed 5s latency
 		if err := p.CommitTransaction(context.TODO()); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
