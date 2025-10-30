@@ -33,3 +33,6 @@ changelog/*.jsonl
 coverage.html
 coverage.out
 verify_eos
+
+# Ignore .canvas files
+*.canvas
