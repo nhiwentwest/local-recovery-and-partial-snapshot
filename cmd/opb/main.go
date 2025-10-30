@@ -56,6 +56,13 @@ type Config struct {
 	TxLingerMs  int
 }
 
+// metricsAdapter implements the opb.TxMetrics interface using a metrics.Registry.
+type metricsAdapter struct{ *metrics.Registry }
+
+func (a metricsAdapter) TxAborted()             { a.Registry.TxAborted.Inc() }
+func (a metricsAdapter) TxProduced()            { a.Registry.TxProduced.Inc() }
+func (a metricsAdapter) TxLatencySec(v float64) { a.Registry.TxLatencySec.Observe(v) }
+
 func main() {
 	cfg := readFlags()
 	if err := run(cfg); err != nil {
@@ -253,7 +260,7 @@ func run(cfg Config) error {
 			}
 		}()
 		// If EOS output is enabled, create transactional producer
-		var p *ck.Producer
+		var p opb.TxProducer
 		if cfg.OutputTxID != "" {
 			prod, err := ck.NewProducer(&ck.ConfigMap{
 				"bootstrap.servers":  cfg.KafkaBootstrap,
@@ -282,7 +289,7 @@ func run(cfg Config) error {
 			if err := prod.InitTransactions(context.TODO()); err != nil {
 				return fmt.Errorf("init tx: %w", err)
 			}
-			p = prod
+			p = prod // as interface
 			defer p.Close()
 		}
 		// Mark ready once consumer has partition assignment (and producer, if any, is initialized)
@@ -311,7 +318,7 @@ func run(cfg Config) error {
 			if err != nil {
 				// On timeout/no message: if we have an open batch and linger expired, commit it
 				if p != nil && batchStarted && time.Since(batchStartTime) >= time.Duration(cfg.TxLingerMs)*time.Millisecond {
-					if err := commitBatch(c, p, batchOffsets, mreg); err != nil {
+					if err := opb.CommitBatch(c, p, batchOffsets, metricsAdapter{mreg}); err != nil {
 						log.Printf("tx: batch commit error: %v", err)
 					}
 					batchStarted = false
@@ -356,12 +363,8 @@ func run(cfg Config) error {
 						batchStarted = true
 						batchStartTime = time.Now()
 					}
-					// set t1 header and propagate t0 if any
-					t1 := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
-					headers := []ck.Header{{Key: "t1", Value: t1}}
-					if len(hdrT0) > 0 {
-						headers = append(headers, ck.Header{Key: "t0", Value: hdrT0})
-					}
+					// set t1 header và propagate t0 nếu có, dùng BuildHeaders interface
+					headers := opb.BuildHeaders(opb.RealClock{}, hdrT0)
 					if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: b, Headers: headers}, nil); err != nil {
 						_ = p.AbortTransaction(context.TODO())
 						mreg.TxAborted.Inc()
@@ -383,11 +386,7 @@ func run(cfg Config) error {
 					// If we have a transactional producer, write changelog to Kafka in the same transaction for immediate visibility
 					if p != nil && (cfg.ChangelogSink == "kafka" || cfg.ChangelogSink == "both") {
 						bchg, _ := json.Marshal(d)
-						t1 := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
-						headers := []ck.Header{{Key: "t1", Value: t1}}
-						if len(hdrT0) > 0 {
-							headers = append(headers, ck.Header{Key: "t0", Value: hdrT0})
-						}
+						headers := opb.BuildHeaders(opb.RealClock{}, hdrT0)
 						if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicChangelog, Partition: ck.PartitionAny}, Key: []byte(d.Key), Value: bchg, Headers: headers}, nil); err != nil {
 							_ = p.AbortTransaction(context.TODO())
 							mreg.TxAborted.Inc()
@@ -422,7 +421,7 @@ func run(cfg Config) error {
 				if cfg.CrashMode == "before" && !opbCrashTriggered {
 					log.Fatalf("opb crash: before commit (simulated)")
 				}
-				if err := commitBatch(c, p, batchOffsets, mreg); err != nil {
+				if err := opb.CommitBatch(c, p, batchOffsets, metricsAdapter{mreg}); err != nil {
 					log.Printf("tx: batch commit error: %v", err)
 				}
 				if cfg.CrashMode == "mid" && !opbCrashTriggered {
@@ -512,39 +511,5 @@ func run(cfg Config) error {
 	}
 
 	log.Printf("OpB scaffold completed. Exiting.")
-	return nil
-}
-
-// commitBatch commits a transactional batch: it sends offsets for the highest processed
-// offset per partition and commits the transaction.
-func commitBatch(c *ck.Consumer, p *ck.Producer, batchOffsets map[int32]ck.TopicPartition, mreg *metrics.Registry) error {
-	// If no offsets, still try to commit the tx to flush produced records
-	if len(batchOffsets) == 0 {
-		if err := p.CommitTransaction(context.TODO()); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			mreg.TxAborted.Inc()
-			return fmt.Errorf("commit empty tx: %w", err)
-		}
-		mreg.TxProduced.Inc()
-		return nil
-	}
-	meta, _ := c.GetConsumerGroupMetadata()
-	parts := make([]ck.TopicPartition, 0, len(batchOffsets))
-	for _, tp := range batchOffsets {
-		parts = append(parts, tp)
-	}
-	t0 := time.Now()
-	if err := p.SendOffsetsToTransaction(context.Background(), parts, meta); err != nil {
-		_ = p.AbortTransaction(context.TODO())
-		mreg.TxAborted.Inc()
-		return fmt.Errorf("send offsets: %w", err)
-	}
-	if err := p.CommitTransaction(context.TODO()); err != nil {
-		_ = p.AbortTransaction(context.TODO())
-		mreg.TxAborted.Inc()
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	mreg.TxProduced.Inc()
-	mreg.TxLatencySec.Observe(time.Since(t0).Seconds())
 	return nil
 }

@@ -80,6 +80,61 @@ Khi khởi động:
 * **State OpB**: `(storeId#productId#windowStart) -> {sum, count}` (tumbling window 1 phút)
 * `orders.output`: `{storeId, productId, windowStart, sum, count}`
 
+## 4.1) Kịch bản demo (ưu tiên chạy được trên 1 máy local)
+
+- Kịch bản 3 — Exactly-once correctness (OpA & OpB)
+  - Mục tiêu: không double-count, downstream không thấy bản ghi “bẩn”.
+  - Chạy:
+    ```bash
+    # Window 1: OpA (EOS + crash matrix tự động)
+    ./scripts/run_opa.sh
+    # Window 2: OpB (EOS, Kafka-mode)
+    ./scripts/run_opb.sh
+    # Window 3: Đo latency ổn định trên changelog bằng headers t0/t1
+    bin/bench_latency -bootstrap 127.0.0.1:9092 \
+      -topic-in p2.orders.enriched -topic-out p2.orders.output \
+      -store A -window 10 -n 5 -pid-prefix pL -measure-topic p2.opb-changelog
+    ```
+  - Pass: crash matrix OpA pass; latency HIT (không MISS), p95 < 1s; consumer `read_committed` không thấy record nửa vời.
+
+- Kịch bản 4 — Local recovery & partial snapshot (OpB)
+  - Mục tiêu: TTR nhỏ, replay đúng (applied/skipped), không mất/lặp.
+  - Chạy:
+    ```bash
+    # Window 3: bơm tải đều vào enriched
+    TOPIC=p2.orders.enriched MODE=enriched PARALLEL=2 N=10000 CHUNK=1000 SLEEP=0.02 ./scripts/pump_test.sh
+    # Kill OpB rồi start lại (dùng cửa sổ OpB)
+    pkill opb || true && ./scripts/run_opb.sh
+    # Đo TTR (từ log/metrics) và đếm throughput thực trong lúc phục hồi
+    bin/count_changelog -bootstrap 127.0.0.1:9092 -topic p2.opb-changelog -seconds 60
+    ```
+  - Pass: TTR ~5–10s; log restore `applied>0, skipped>=0`; manifest offset khớp.
+
+- Kịch bản 5 — Network partition (local)
+  - Mục tiêu: chịu lỗi mạng tạm thời, không mất dữ liệu, tự hồi phục.
+  - Chạy (Linux/macOS tương đương bằng tc/pfctl):
+    ```bash
+    # Window 4: áp dụng delay/drop tạm thời tới cổng Kafka
+    sudo tc qdisc add dev lo root netem delay 200ms 50ms 25%
+    # (sau 30–60s)
+    sudo tc qdisc del dev lo root netem
+    # Theo dõi metrics tiap 2s
+    HTTP=http://127.0.0.1:8089/metrics DURATION=60 ./scripts/monitor_metrics.sh
+    ```
+  - Pass: batch duration/tx latency tăng có kiểm soát, tx_aborted không tăng đột biến; bỏ chặn → throughput/lag trở lại bình thường.
+
+## 4.2) Kịch bản lớn (3 VM/3 broker)
+
+- Leader election & scale-out thực
+  - Mục tiêu: thể hiện rõ tính phân tán: leader failover, ISR catch-up, rebalance khi scale.
+  - Bước:
+    1) VM-1..3: Kafka 3 broker (RF=3), tạo topics P=6; Prom+Grafana (VM-1).
+    2) VM-2: chạy OpA; VM-3: chạy 2 instance OpB (group chung).
+    3) Bơm enriched song song (PARALLEL≈partitions), đo throughput thực: `bin/count_changelog -target N`.
+    4) Stop broker-2 → leader failover; Start lại → ISR catch-up.
+    5) Scale OpB: 1→2 instance → throughput tăng, lag giảm (Grafana).
+  - Pass: không gián đoạn dữ liệu khi failover; throughput/lag cải thiện khi scale-out.
+
 ---
 
 # 5) Test & tiêu chí pass

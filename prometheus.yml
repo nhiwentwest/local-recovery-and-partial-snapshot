@@ -6,7 +6,7 @@ scrape_configs:
   - targets: ['localhost:8089']
 - job_name: opa
   static_configs:
-  - targets: ['localhost:8081']
+  - targets: ['localhost:8088']
 - job_name: recover
   static_configs:
   - targets: ['localhost:9090']

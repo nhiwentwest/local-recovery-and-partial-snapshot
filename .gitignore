@@ -27,3 +27,9 @@ logs/**
 changelog/*.jsonl
 *.out
 /tmp/**
+
+# Ignore local artifacts
+.cursor/
+coverage.html
+coverage.out
+verify_eos

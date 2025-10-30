@@ -100,7 +100,70 @@ wait_key_in_file() { local key=$1 outfile=$2 secs=${3:-8}; for i in $(seq 1 $sec
 
 # --- Main Test Functions ---
 measure_ttr_3x() { say "Measuring TTR x3..."; TTRS=(); for i in 1 2 3; do stop_all; T0=$(date +%s); start_opb; produce_raw_one "ttr$i"; ${KAFKA_CONSUMER} --bootstrap-server "$BOOTSTRAP" --topic "$TOPIC_OUT" --group ttr-$$-$RANDOM --from-beginning --timeout-ms 15000 --max-messages 1 >/dev/null 2>&1 || true; T1=$(date +%s); D=$((T1-T0)); say "TTR$i=${D}s"; TTRS+=("$D"); done; MIN=${TTRS[0]}; MAX=${TTRS[0]}; SUM=0; for v in "${TTRS[@]}"; do (( v < MIN )) && MIN=$v; (( v > MAX )) && MAX=$v; SUM=$((SUM+v)); done; AVG=$(awk -v s="$SUM" -v n="${#TTRS[@]}" 'BEGIN{printf "%.3f", s/n}'); say "TTR Result: min=${MIN}s avg=${AVG}s max=${MAX}s"; }
-measure_latency_throughput() { say "Measuring Latency (5 samples)..."; local N_SAMPLES=5; local LAT_TIMEOUT_MS=15000; LATS=(); base=$(date +%s); local WIN=${WINDOW_SIZE}; next_win=$(( (base / WIN + 1) * WIN )); for i in $(seq 1 ${N_SAMPLES}); do pid="pL${i}"; oid=lt${i}_$RANDOM; ts=$((next_win + 3)); key="A#${pid}#${next_win}"; T0=$(date +%s); out_file="/tmp/lat_${i}.txt"; rm -f "$out_file"; part=$(partition_for_key "$key" "$TOPIC_OUT"); cpid=$(start_consumer_partition "$TOPIC_OUT" "$part" "$out_file" ${LAT_TIMEOUT_MS}); sleep 1.0; produce_enriched_one "$oid" "$pid" 9000 1 A "$ts"; say "Latency sample ${i}/${N_SAMPLES}: waiting for key=${key} (partition=${part})"; if wait_key_in_file "$key" "$out_file" $((LAT_TIMEOUT_MS/1000)); then T1=$(date +%s); LATS+=( $((T1-T0)) ); say "Latency sample ${i}: HIT in $((T1-T0))s"; else LATS+=( $((LAT_TIMEOUT_MS/1000)) ); say "Latency sample ${i}: MISS"; fi; kill "$cpid" >/dev/null 2>&1 || true; done; printf "%s\n" "${LATS[@]}" | sort -n > /tmp/lats.txt; COUNT=$(wc -l < /tmp/lats.txt | awk '{print $1}'); P50=$(awk -v n=$COUNT 'NR==int((n+1)*0.50){print; exit}' /tmp/lats.txt); P95=$(awk -v n=$COUNT 'NR==int((n+1)*0.95){print; exit}' /tmp/lats.txt); P99=$(awk -v n=$COUNT 'NR==int((n+1)*0.99){print; exit}' /tmp/lats.txt); say "Latency Result: p50=${P50}s p95=${P95}s p99=${P99}s (n=${COUNT})"; say "Measuring Throughput..."; if [[ ${HEAVY_N:-0} -ge 10000 && ${THR_WINDOW_SEC:-0} -lt 70 ]]; then THR_WINDOW_SEC=70; fi; local gid=tp-$$-$RANDOM; rm -f /tmp/tp_out.txt; say "[THROUGHPUT] START window ~${THR_WINDOW_SEC}s (counting on changelog)"; (${KAFKA_CONSUMER} --bootstrap-server "$BOOTSTRAP" --topic "$TOPIC_CHANGELOG" --group "$gid" --timeout-ms $((THR_WINDOW_SEC*1000)) --max-messages 2000000 2>/dev/null | grep -v "Processed a total" > /tmp/tp_out.txt) & cpid=$!; sleep 1; pump_via_script "${HEAVY_N}" 500 0.05; for i in $(seq 1 $((THR_WINDOW_SEC+5))); do if ! kill -0 "$cpid" >/dev/null 2>&1; then break; fi; sleep 1; done; if kill -0 "$cpid" >/dev/null 2>&1; then kill "$cpid" >/dev/null 2>&1 || true; fi; lines=$(wc -l < /tmp/tp_out.txt | awk '{print $1}'); say "[THROUGHPUT] END count=${lines} (~$((lines/THR_WINDOW_SEC)) msgs/s)"; }
+measure_latency_throughput() {
+  # Stabilize before measuring
+  local STABILIZE_SLEEP=${STABILIZE_SLEEP:-5}
+  say "Stabilizing ${STABILIZE_SLEEP}s before latency measurement..."; sleep "$STABILIZE_SLEEP"
+
+  say "Measuring Latency..."
+  local N_SAMPLES=${N_SAMPLES:-8}
+  local LAT_TIMEOUT_MS=${LAT_TIMEOUT_MS:-30000}
+  LATS=()
+
+  local WIN=${WINDOW_SIZE}
+
+  for i in $(seq 1 ${N_SAMPLES}); do
+    # Recompute next window each sample to tránh lệch mốc
+    base=$(date +%s)
+    next_win=$(( (base / WIN + 1) * WIN ))
+    pid="pL${i}"
+    oid=lt${i}_$RANDOM
+    ts=$((next_win + 3))
+    key="A#${pid}#${next_win}"
+
+    # Align close to next window if còn xa
+    now=$(date +%s)
+    if (( ts - now > 1 )); then sleep $((ts - now - 1)); fi
+
+    T0=$(date +%s)
+    out_file="/tmp/lat_${i}.txt"; rm -f "$out_file"
+    # Đo trên changelog (1 partition, visibility tức thời trong cùng transaction)
+    cpid=$(start_consumer_bg_topic "$TOPIC_CHANGELOG" "$out_file" ${LAT_TIMEOUT_MS})
+    sleep 0.5
+    # Warm pipeline: burst 3 events for the same key
+    produce_enriched_one "$oid"   "$pid" 9000 1 A "$ts"
+    sleep 0.05
+    produce_enriched_one "${oid}b" "$pid" 9000 1 A "$ts"
+    sleep 0.05
+    produce_enriched_one "${oid}c" "$pid" 9000 1 A "$ts"
+
+    say "Latency sample ${i}/${N_SAMPLES}: waiting for key=${key} (topic=${TOPIC_CHANGELOG}, timeout=${LAT_TIMEOUT_MS}ms)"
+    if wait_key_in_file "$key" "$out_file" $((LAT_TIMEOUT_MS/1000)); then
+      T1=$(date +%s); LATS+=( $((T1-T0)) ); say "Latency sample ${i}: HIT in $((T1-T0))s"
+    else
+      LATS+=( $((LAT_TIMEOUT_MS/1000)) ); say "Latency sample ${i}: MISS"
+    fi
+    kill "$cpid" >/dev/null 2>&1 || true
+  done
+
+  printf "%s\n" "${LATS[@]}" | sort -n > /tmp/lats.txt
+  COUNT=$(wc -l < /tmp/lats.txt | awk '{print $1}')
+  P50=$(awk -v n=$COUNT 'NR==int((n+1)*0.50){print; exit}' /tmp/lats.txt)
+  P95=$(awk -v n=$COUNT 'NR==int((n+1)*0.95){print; exit}' /tmp/lats.txt)
+  P99=$(awk -v n=$COUNT 'NR==int((n+1)*0.99){print; exit}' /tmp/lats.txt)
+  say "Latency Result: p50=${P50}s p95=${P95}s p99=${P99}s (n=${COUNT})"
+
+  say "Measuring Throughput..."
+  if [[ ${HEAVY_N:-0} -ge 10000 && ${THR_WINDOW_SEC:-0} -lt 70 ]]; then THR_WINDOW_SEC=70; fi
+  local gid=tp-$$-$RANDOM; rm -f /tmp/tp_out.txt
+  say "[THROUGHPUT] START window ~${THR_WINDOW_SEC}s (counting on changelog)"
+  (${KAFKA_CONSUMER} --bootstrap-server "$BOOTSTRAP" --topic "$TOPIC_CHANGELOG" --group "$gid" --timeout-ms $((THR_WINDOW_SEC*1000)) --max-messages 2000000 2>/dev/null | grep -v "Processed a total" > /tmp/tp_out.txt) & cpid=$!
+  sleep 1; pump_via_script "${HEAVY_N}" 500 0.05
+  for i in $(seq 1 $((THR_WINDOW_SEC+5))); do if ! kill -0 "$cpid" >/dev/null 2>&1; then break; fi; sleep 1; done
+  if kill -0 "$cpid" >/dev/null 2>&1; then kill "$cpid" >/dev/null 2>&1 || true; fi
+  lines=$(wc -l < /tmp/tp_out.txt | awk '{print $1}')
+  say "[THROUGHPUT] END count=${lines} (~$((lines/THR_WINDOW_SEC)) msgs/s)"
+}
 experiment_changelog_ab() { say "[A/B TEST] BEGIN"; say "[A/B][WITH] Setting up..."; clean_state; start_opb_with both; local s0=$(newest_snapshot_id || true); pump_via_script 10000 500 0.03; local idA=$(wait_new_snapshot "$s0" 20); if [[ "$idA" == "$s0" ]]; then produce_raw_one "ab-tick1"; idA=$(wait_new_snapshot "$s0" 10); fi; sleep 5; local idA2=$(newest_snapshot_id || true); [[ -n "$idA2" ]] && idA="$idA2"; local szA=$(snapshot_size_kb "$idA"); say "[A/B][WITH] Counting changelog..."; stop_all; local clogA=$(${KAFKA_CONSUMER} --bootstrap-server "$BOOTSTRAP" --topic "$TOPIC_CHANGELOG" --from-beginning --timeout-ms 20000 --max-messages 200000 2>/dev/null | grep -v "Processed a total" | wc -l | awk '{print $1}'); say "[A/B][WITH] Result: snapshot=${idA} size_kb=${szA} changelog_records~=${clogA}"; say "[A/B][NO] Setting up..."; clean_state; start_opb_with none; local s1=$(newest_snapshot_id || true); pump_via_script 10000 500 0.03; local idB=$(wait_new_snapshot "$s1" 20); if [[ "$idB" == "$s1" ]]; then produce_raw_one "ab-tick2"; idB=$(wait_new_snapshot "$s1" 10); fi; sleep 5; local idB2=$(newest_snapshot_id || true); [[ -n "$idB2" ]] && idB="$idB2"; local szB=$(snapshot_size_kb "$idB"); say "[A/B][NO] Result: snapshot=${idB} size_kb=${szB} changelog_records~=0"; say "[A/B] SUMMARY => with: ${szA}KB vs no: ${szB}KB; records with: ~${clogA} vs no: 0"; say "[A/B TEST] END"; }
 
 main() {

@@ -16,6 +16,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// maybeAttachT0 ensures a t0 header is present for latency tracking.
+func maybeAttachT0(headers []ck.Header) []ck.Header {
+	for _, h := range headers {
+		if h.Key == "t0" {
+			return headers // t0 already exists
+		}
+	}
+	t0 := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+	return append(headers, ck.Header{Key: "t0", Value: t0})
+}
+
 func main() {
 	var (
 		bootstrap string
@@ -110,7 +121,8 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 		eo := model.Normalize(o)
 		val, _ := json.Marshal(eo)
 
-		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topicOut, Partition: ck.PartitionAny}, Key: []byte(o.OrderID), Value: val}, nil); err != nil {
+		headers := maybeAttachT0(msg.Headers)
+		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topicOut, Partition: ck.PartitionAny}, Key: []byte(o.OrderID), Value: val, Headers: headers}, nil); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
@@ -196,7 +208,8 @@ func runWrapper(bootstrap, groupID, txID string, txProduced prometheus.Counter, 
 		}
 
 		// passthrough enriched -> output (key preserved)
-		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &out, Partition: ck.PartitionAny}, Key: msg.Key, Value: msg.Value}, nil); err != nil {
+		headers := maybeAttachT0(msg.Headers)
+		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &out, Partition: ck.PartitionAny}, Key: msg.Key, Value: msg.Value, Headers: headers}, nil); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}

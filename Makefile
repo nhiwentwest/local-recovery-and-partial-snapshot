@@ -1,34 +1,12 @@
-BINARY=bin/opb
-GENERATOR=bin/genorders
-PKG_OPB=./cmd/opb
-PKG_GEN=./cmd/genorders
+.PHONY: test test-race coverage
 
-.PHONY: build run clean gen obs-start obs-stop
+test:
+	go test ./...
 
-build:
-	mkdir -p bin
-	GO111MODULE=on go build -o $(BINARY) $(PKG_OPB)
-	GO111MODULE=on go build -o $(GENERATOR) $(PKG_GEN)
+test-race:
+	go test -race ./...
 
-run: build
-	./$(BINARY) --state-backend pebble --state-dir ./data/opb --snapshot-dir ./snapshots \
-		--kafka-bootstrap 127.0.0.1:9092 --group-id opb-g --topic-enriched p1.orders.enriched \
-		--output-topic p1.orders.output --http :8089
-
-gen: build
-	./$(GENERATOR) -count 50 -output p2.orders.enriched.jsonl
-
-clean:
-	rm -rf bin
-
-# Observability: start Prometheus (Grafana can point to it)
-obs-start:
-	@echo "Starting Prometheus with ./prometheus.yml on :9095";
-	@pkill -f "prometheus --config.file=./prometheus.yml" || true;
-	@nohup prometheus --config.file=./prometheus.yml --web.listen-address=":9095" >/tmp/prometheus.out 2>&1 &
-	@echo "Prometheus started at http://localhost:9095"
-
-obs-stop:
-	@echo "Stopping Prometheus";
-	@pkill -f "prometheus --config.file=./prometheus.yml" || true;
-	@echo "Stopped"
+coverage:
+	go test -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report written to coverage.html"
