@@ -29,6 +29,31 @@ make build
 Notes:
 - Backend state dùng PebbleDB; snapshot/manifest lưu filesystem (và có thể publish lên Kafka nếu bật).
 
+## Testing (unit vs integration)
+
+Tách rõ 2 lớp khôi phục trạng thái để tăng chất lượng code và độ tin cậy test:
+
+- `internal/restorefs` (unit): FS‑only (snapshot JSON + changelog JSONL). Đã có test table‑driven phủ các nhánh lỗi/offset/idempotency. Coverage mục tiêu 60–70%+ (hiện ~74%).
+- `internal/restorekafka` (integration): Kafka replay/reader, build bằng tag `integration`. Build thường dùng stub `!integration` để không kéo mẫu số unit.
+
+Lệnh tiện dụng:
+
+```bash
+# Unit tests (mặc định)
+make test
+
+# Race detector
+make test-race
+
+# Coverage (tạo coverage.html, không tự mở trình duyệt)
+make coverage
+
+# Integration tests (Kafka path, cần môi trường Kafka)
+make test-integration   # tương đương: go test -tags=integration ./...
+```
+
+Lưu ý: Integration có thể yêu cầu broker, topics… Unit không cần Kafka.
+
 ## Flags
 
 - --state-backend: memory|pebble (mặc định pebble)

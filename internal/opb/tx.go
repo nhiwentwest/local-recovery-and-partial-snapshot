@@ -49,12 +49,22 @@ func BuildHeaders(clock Clock, hdrT0 []byte) []ck.Header {
 	return headers
 }
 
+// BuildHeadersWithEpoch builds standard headers and attaches an epoch fencing token.
+func BuildHeadersWithEpoch(clock Clock, hdrT0 []byte, epoch []byte) []ck.Header {
+	hs := BuildHeaders(clock, hdrT0)
+	if len(epoch) > 0 {
+		hs = append(hs, ck.Header{Key: "epoch", Value: epoch})
+	}
+	return hs
+}
+
 // TxMetrics provides an interface for metrics related to transactions, allowing for
 // mock implementations in tests.
 type TxMetrics interface {
 	TxAborted()
 	TxProduced()
 	TxLatencySec(float64)
+	OffsetsBoundLag(float64)
 }
 
 // CommitBatch commits a transactional batch. It sends the provided offsets and
@@ -86,6 +96,8 @@ func CommitBatch(c ConsumerOffsets, p TxProducer, batchOffsets map[int32]ck.Topi
 		mreg.TxAborted()
 		return fmt.Errorf("send offsets: %w", err)
 	}
+	// Observe a proxy for offsets bound: number of partitions in this batch
+	mreg.OffsetsBoundLag(float64(len(parts)))
 	if err := p.CommitTransaction(context.Background()); err != nil {
 		_ = p.AbortTransaction(context.Background())
 		mreg.TxAborted()

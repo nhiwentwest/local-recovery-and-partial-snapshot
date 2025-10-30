@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -14,7 +15,8 @@ import (
 	"hpb/internal/manifest"
 	"hpb/internal/metrics"
 	"hpb/internal/opb"
-	"hpb/internal/restore"
+	rf "hpb/internal/restorefs"
+	rk "hpb/internal/restorekafka"
 	"hpb/internal/snapshot"
 	"hpb/internal/state"
 
@@ -47,6 +49,7 @@ type Config struct {
 	// Output EOS (orders.output)
 	OutputTopic string
 	OutputTxID  string
+	TopicAudit  string
 	// HTTP
 	HTTPAddr string
 	Once     bool // process exactly one message then exit (for EOS tests)
@@ -59,9 +62,10 @@ type Config struct {
 // metricsAdapter implements the opb.TxMetrics interface using a metrics.Registry.
 type metricsAdapter struct{ *metrics.Registry }
 
-func (a metricsAdapter) TxAborted()             { a.Registry.TxAborted.Inc() }
-func (a metricsAdapter) TxProduced()            { a.Registry.TxProduced.Inc() }
-func (a metricsAdapter) TxLatencySec(v float64) { a.Registry.TxLatencySec.Observe(v) }
+func (a metricsAdapter) TxAborted()                { a.Registry.TxAborted.Inc() }
+func (a metricsAdapter) TxProduced()               { a.Registry.TxProduced.Inc() }
+func (a metricsAdapter) TxLatencySec(v float64)    { a.Registry.TxLatencySec.Observe(v) }
+func (a metricsAdapter) OffsetsBoundLag(v float64) { a.Registry.OffsetsBoundLag.Set(v) }
 
 func main() {
 	cfg := readFlags()
@@ -93,6 +97,7 @@ func readFlags() Config {
 	flag.StringVar(&cfg.TopicEnriched, "topic-enriched", "p1.orders.enriched", "kafka topic for orders.enriched input")
 	flag.StringVar(&cfg.OutputTopic, "output-topic", "p1.orders.output", "kafka topic for orders.output")
 	flag.StringVar(&cfg.OutputTxID, "output-tx-id", "", "transactional id for orders.output (enable EOS when set)")
+	flag.StringVar(&cfg.TopicAudit, "topic-audit", "p1.opb-audit", "audit topic for tx BEGIN/COMMIT/ABORT")
 	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "http listen address for metrics/health")
 	flag.BoolVar(&cfg.Once, "once", false, "process exactly one message then exit (testing)")
 	flag.BoolVar(&cfg.EOSTest, "eos-test-mode", false, "simulate crash cases without process exit (testing)")
@@ -125,7 +130,7 @@ func run(cfg Config) error {
 	snap := snapshot.NewFilesystemSnapshotter(cfg.SnapshotDir)
 	maniFS := manifest.NewFilesystemManifest(cfg.SnapshotDir)
 	var mani manifest.Publisher = maniFS
-	var maniReader restore.Reader = restore.NewFilesystemReader(cfg.SnapshotDir)
+	var maniReader rf.Reader = rf.NewFilesystemReader(cfg.SnapshotDir)
 	if cfg.ManifestSink == "kafka" || cfg.ManifestSink == "both" {
 		if cfg.KafkaBootstrap != "" {
 			maniK := manifest.NewKafkaManifest(cfg.KafkaBootstrap, cfg.TopicSnapshots, "opb-manifest-latest")
@@ -136,7 +141,7 @@ func run(cfg Config) error {
 				mani = manifest.MultiPublisher(maniFS, maniK)
 			}
 			if cfg.ManifestSource == "kafka" && cfg.KafkaBootstrap != "" {
-				maniReader = restore.NewKafkaReader([]string{cfg.KafkaBootstrap}, cfg.TopicSnapshots, "opb-manifest-latest")
+				maniReader = rk.NewKafkaReader([]string{cfg.KafkaBootstrap}, cfg.TopicSnapshots, "opb-manifest-latest")
 			}
 		}
 	}
@@ -187,9 +192,17 @@ func run(cfg Config) error {
 				defer ticker.Stop()
 				for range ticker.C {
 					id := time.Now().UTC().Format(time.RFC3339)
+					t0 := time.Now()
 					if err := snap.WriteSnapshot(id, st); err != nil {
 						log.Printf("snapshot error: %v", err)
 						continue
+					}
+					durMs := float64(time.Since(t0).Milliseconds())
+					mreg.SnapshotTimeMs.Observe(durMs)
+					// read snapshot bytes
+					fp := fmt.Sprintf("%s/%s/state.json", cfg.SnapshotDir, id)
+					if fi, err := os.Stat(fp); err == nil {
+						mreg.SnapshotBytes.Set(float64(fi.Size()))
 					}
 					if err := mani.PublishLatest(id, changelogAppendedCount); err != nil {
 						log.Printf("manifest publish error: %v", err)
@@ -261,6 +274,9 @@ func run(cfg Config) error {
 		}()
 		// If EOS output is enabled, create transactional producer
 		var p opb.TxProducer
+		var auditP *ck.Producer
+		// fencing epoch token per-process
+		epoch := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
 		if cfg.OutputTxID != "" {
 			prod, err := ck.NewProducer(&ck.ConfigMap{
 				"bootstrap.servers":  cfg.KafkaBootstrap,
@@ -291,6 +307,12 @@ func run(cfg Config) error {
 			}
 			p = prod // as interface
 			defer p.Close()
+			// audit producer (non-transactional)
+			ap, err := ck.NewProducer(&ck.ConfigMap{"bootstrap.servers": cfg.KafkaBootstrap})
+			if err == nil {
+				auditP = ap
+				defer auditP.Close()
+			}
 		}
 		// Mark ready once consumer has partition assignment (and producer, if any, is initialized)
 		go func() {
@@ -312,6 +334,7 @@ func run(cfg Config) error {
 			batchOffsets      = make(map[int32]ck.TopicPartition) // partition -> highest offset+1
 			opbCrashTriggered bool
 		)
+		var latestEpochSeen int64
 		for {
 			// Read first to avoid spinning when no input
 			msg, err := c.ReadMessage(200 * time.Millisecond)
@@ -333,7 +356,7 @@ func run(cfg Config) error {
 				log.Printf("unmarshal error: %v", err)
 				continue
 			}
-			// extract t0 header if present
+			// extract t0 header and apply epoch fencing
 			var hdrT0 []byte
 			if len(msg.Headers) > 0 {
 				for _, h := range msg.Headers {
@@ -342,6 +365,9 @@ func run(cfg Config) error {
 						break
 					}
 				}
+			}
+			if !opb.AcceptMessageByEpoch(&latestEpochSeen, msg.Headers) {
+				continue
 			}
 			// Pre-compute key for diagnostics
 			ws := opb.WindowStart(ev.NormTS, cfg.WindowSizeSec)
@@ -362,9 +388,14 @@ func run(cfg Config) error {
 						}
 						batchStarted = true
 						batchStartTime = time.Now()
+						if auditP != nil {
+							ev := map[string]any{"evt": "BEGIN", "txId": cfg.OutputTxID, "ts": time.Now().UnixNano()}
+							b, _ := json.Marshal(ev)
+							_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: b}, nil)
+						}
 					}
-					// set t1 header và propagate t0 nếu có, dùng BuildHeaders interface
-					headers := opb.BuildHeaders(opb.RealClock{}, hdrT0)
+					// set t1 header, propagate t0 nếu có, kèm fencing epoch
+					headers := opb.BuildHeadersWithEpoch(opb.RealClock{}, hdrT0, epoch)
 					if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: b, Headers: headers}, nil); err != nil {
 						_ = p.AbortTransaction(context.TODO())
 						mreg.TxAborted.Inc()
@@ -372,6 +403,11 @@ func run(cfg Config) error {
 						batchCount = 0
 						batchOffsets = make(map[int32]ck.TopicPartition)
 						log.Printf("tx: produce error, aborted: %v", err)
+						if auditP != nil {
+							ev := map[string]any{"evt": "ABORT", "txId": cfg.OutputTxID, "ts": time.Now().UnixNano(), "reason": "produce_error"}
+							ab, _ := json.Marshal(ev)
+							_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: ab}, nil)
+						}
 						continue
 					}
 					batchCount++
@@ -386,7 +422,7 @@ func run(cfg Config) error {
 					// If we have a transactional producer, write changelog to Kafka in the same transaction for immediate visibility
 					if p != nil && (cfg.ChangelogSink == "kafka" || cfg.ChangelogSink == "both") {
 						bchg, _ := json.Marshal(d)
-						headers := opb.BuildHeaders(opb.RealClock{}, hdrT0)
+						headers := opb.BuildHeadersWithEpoch(opb.RealClock{}, hdrT0, epoch)
 						if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicChangelog, Partition: ck.PartitionAny}, Key: []byte(d.Key), Value: bchg, Headers: headers}, nil); err != nil {
 							_ = p.AbortTransaction(context.TODO())
 							mreg.TxAborted.Inc()
@@ -394,6 +430,11 @@ func run(cfg Config) error {
 							batchCount = 0
 							batchOffsets = make(map[int32]ck.TopicPartition)
 							log.Printf("tx: produce changelog error, aborted: %v", err)
+							if auditP != nil {
+								ev := map[string]any{"evt": "ABORT", "txId": cfg.OutputTxID, "ts": time.Now().UnixNano(), "reason": "changelog_error"}
+								ab, _ := json.Marshal(ev)
+								_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: ab}, nil)
+							}
 							return nil
 						}
 					} else if clog != nil {
@@ -423,6 +464,13 @@ func run(cfg Config) error {
 				}
 				if err := opb.CommitBatch(c, p, batchOffsets, metricsAdapter{mreg}); err != nil {
 					log.Printf("tx: batch commit error: %v", err)
+				} else {
+					if auditP != nil {
+						// build offsets summary (count only to avoid heavy msg)
+						ev := map[string]any{"evt": "COMMIT", "txId": cfg.OutputTxID, "ts": time.Now().UnixNano(), "parts": len(batchOffsets)}
+						b, _ := json.Marshal(ev)
+						_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: b}, nil)
+					}
 				}
 				if cfg.CrashMode == "mid" && !opbCrashTriggered {
 					log.Fatalf("opb crash: mid commit (simulated)")
@@ -487,8 +535,8 @@ func run(cfg Config) error {
 
 	// Test restore and replay
 	log.Printf("testing restore and replay...")
-	restorer := restore.NewRestorer(st, snap, maniReader, cfg.SnapshotDir)
-	var result restore.RestoreResult
+	restorer := rf.NewRestorer(st, snap, maniReader, cfg.SnapshotDir)
+	var result rf.RestoreResult
 	var err error
 	if cfg.ChangelogSource == "kafka" && cfg.KafkaBootstrap != "" {
 		// Read manifest (already via maniReader), then replay from Kafka topic
@@ -496,7 +544,7 @@ func run(cfg Config) error {
 		if e != nil {
 			err = e
 		} else {
-			result = restorer.ReplayChangelogKafka([]string{cfg.KafkaBootstrap}, cfg.TopicChangelog, m.LastChangelogOffset)
+			result = rk.ReplayChangelogKafka(st, []string{cfg.KafkaBootstrap}, cfg.TopicChangelog, m.LastChangelogOffset)
 			if result.Error != nil {
 				err = result.Error
 			}

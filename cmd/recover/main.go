@@ -9,7 +9,8 @@ import (
 
 	"hpb/internal/manifest"
 	"hpb/internal/metrics"
-	"hpb/internal/restore"
+	rf "hpb/internal/restorefs"
+	rk "hpb/internal/restorekafka"
 	"hpb/internal/state"
 
 	"github.com/segmentio/kafka-go"
@@ -29,13 +30,13 @@ func main() {
 		pollIntervalSec int
 		advanceManifest bool
 	)
-    flag.StringVar(&bootstrap, "bootstrap", "127.0.0.1:9092", "kafka bootstrap")
+	flag.StringVar(&bootstrap, "bootstrap", "127.0.0.1:9092", "kafka bootstrap")
 	flag.StringVar(&groupID, "group-id", "recover", "metrics label: group id")
 	flag.StringVar(&instanceID, "instance-id", "R", "metrics label: instance id")
 	flag.StringVar(&manifestSource, "manifest-source", "kafka", "file|kafka")
 	flag.StringVar(&changelogSource, "changelog-source", "kafka", "file|kafka")
-    flag.StringVar(&topicSnapshots, "topic-snapshots", "p1.opb-snapshots", "manifest topic")
-    flag.StringVar(&topicChangelog, "topic-changelog", "p1.opb-changelog", "changelog topic")
+	flag.StringVar(&topicSnapshots, "topic-snapshots", "p1.opb-snapshots", "manifest topic")
+	flag.StringVar(&topicChangelog, "topic-changelog", "p1.opb-changelog", "changelog topic")
 	flag.StringVar(&snapshotDir, "snapshot-dir", "./snapshots", "snapshot dir for file mode")
 	flag.StringVar(&httpAddr, "http", ":9090", "http listen for /metrics")
 	flag.IntVar(&pollIntervalSec, "poll", 10, "poll interval seconds for manifest")
@@ -49,11 +50,11 @@ func main() {
 	}()
 
 	// Build readers
-	var mReader restore.Reader
+	var mReader rf.Reader
 	if manifestSource == "file" {
-		mReader = restore.NewFilesystemReader(snapshotDir)
+		mReader = rf.NewFilesystemReader(snapshotDir)
 	} else {
-		mReader = restore.NewKafkaReader([]string{bootstrap}, topicSnapshots, "opb-manifest-latest")
+		mReader = rk.NewKafkaReader([]string{bootstrap}, topicSnapshots, "opb-manifest-latest")
 	}
 
 	// Build publisher for advancing manifest
@@ -66,15 +67,15 @@ func main() {
 		}
 	}
 
-	st := restore.NewFilesystemReader("") // only to satisfy types when constructing Restorer; state passed inside Restorer
-	_ = st
+	// no-op
 
 	ticker := time.NewTicker(time.Duration(pollIntervalSec) * time.Second)
 	defer ticker.Stop()
 	for {
 		t1 := time.Now()
 		// Use Restorer with a fresh in-memory state each cycle (demo simplicity)
-		r := restore.NewRestorer(state.NewInMemoryStore(), nil, mReader, snapshotDir)
+		st := state.NewInMemoryStore()
+		r := rf.NewRestorer(st, nil, mReader, snapshotDir)
 		m, err := mReader.ReadLatest()
 		if err != nil {
 			log.Printf("read manifest: %v", err)
@@ -87,11 +88,11 @@ func main() {
 			continue
 		}
 
-		var res restore.RestoreResult
+		var res rf.RestoreResult
 		if changelogSource == "file" {
 			res = r.ReplayChangelog("./changelog/opb.jsonl", m.LastChangelogOffset)
 		} else {
-			res = r.ReplayChangelogKafka([]string{bootstrap}, topicChangelog, m.LastChangelogOffset)
+			res = rk.ReplayChangelogKafka(st, []string{bootstrap}, topicChangelog, m.LastChangelogOffset)
 		}
 		if res.Error != nil {
 			log.Printf("replay: %v", res.Error)
@@ -102,6 +103,12 @@ func main() {
 		// Update metrics
 		mreg.Applied.Add(float64(res.Applied))
 		mreg.Skipped.Add(float64(res.Skipped))
+		if res.Bytes > 0 {
+			mreg.ReplayBytes.Add(float64(res.Bytes))
+		}
+		if (res.Applied + res.Skipped) > 0 {
+			mreg.ReplayRecords.Add(float64(res.Applied + res.Skipped))
+		}
 		mreg.TTRSec.Set(time.Since(t1).Seconds())
 		// Compute lag: headOffset - lastAppliedOffset
 		if changelogSource == "kafka" {

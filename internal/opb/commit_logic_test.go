@@ -44,6 +44,7 @@ func TestCommitBatch_SuccessSequence(t *testing.T) {
 
 	mockConsumer.EXPECT().GetConsumerGroupMetadata().Return(meta, nil)
 	mockProducer.EXPECT().SendOffsetsToTransaction(ctx, gomock.Any(), meta).Return(nil)
+	mockMetrics.EXPECT().OffsetsBoundLag(gomock.Any())
 	mockProducer.EXPECT().CommitTransaction(ctx).Return(nil)
 	mockMetrics.EXPECT().TxProduced()
 	mockMetrics.EXPECT().TxLatencySec(gomock.Any())
@@ -90,6 +91,7 @@ func TestCommitBatch_CommitError(t *testing.T) {
 	mockConsumer.EXPECT().GetConsumerGroupMetadata().Return(meta, nil)
 	mockProducer.EXPECT().SendOffsetsToTransaction(ctx, gomock.Any(), meta).Return(nil)
 	mockProducer.EXPECT().CommitTransaction(ctx).Return(commitErr)
+	mockMetrics.EXPECT().OffsetsBoundLag(gomock.Any())
 	mockProducer.EXPECT().AbortTransaction(ctx).Return(nil)
 	mockMetrics.EXPECT().TxAborted()
 

@@ -1,4 +1,4 @@
-package restore
+package restorefs
 
 import (
 	"bufio"
@@ -26,9 +26,7 @@ type Reader interface {
 	ReadLatest() (manifest.Manifest, error)
 }
 
-type FilesystemReader struct {
-	baseDir string
-}
+type FilesystemReader struct{ baseDir string }
 
 func NewFilesystemReader(baseDir string) *FilesystemReader {
 	return &FilesystemReader{baseDir: baseDir}
@@ -47,29 +45,19 @@ func (r *FilesystemReader) ReadLatest() (manifest.Manifest, error) {
 	return m, nil
 }
 
-// Kafka manifest reader moved to integration build (see restore_kafka.go).
-
 func NewRestorer(st state.Store, snap snapshot.Snapshotter, mr manifest.Reader, snapshotBaseDir string) *Restorer {
-	return &Restorer{
-		stateStore:      st,
-		snapshotter:     snap,
-		manifestReader:  mr,
-		snapshotBaseDir: snapshotBaseDir,
-	}
+	return &Restorer{stateStore: st, snapshotter: snap, manifestReader: mr, snapshotBaseDir: snapshotBaseDir}
 }
 
 type RestoreResult struct {
-	Applied int
-	Skipped int
-	// Bytes is the total bytes of replayed deltas (Kafka/file)
-	Bytes int64
-	// LastAppliedOffset is the Kafka offset of the last applied delta (Kafka only)
+	Applied           int
+	Skipped           int
+	Bytes             int64
 	LastAppliedOffset int64
 	Error             error
 }
 
 func (r *Restorer) RestoreFromSnapshot(snapshotID string) error {
-	// Phase 1: simple restore from JSON snapshot
 	if snapshotID == "" {
 		return nil
 	}
@@ -92,37 +80,26 @@ func (r *Restorer) RestoreFromSnapshot(snapshotID string) error {
 }
 
 func (r *Restorer) ReplayChangelog(changelogPath string, fromOffset int64) RestoreResult {
-	file, err := os.Open(changelogPath)
+	f, err := os.Open(changelogPath)
 	if err != nil {
 		return RestoreResult{Error: fmt.Errorf("open changelog: %w", err)}
 	}
-	defer file.Close()
-	return r.replayLines(file, fromOffset)
+	defer f.Close()
+	return r.replayLines(f, fromOffset)
 }
 
-// ReplayChangelogKafka consumes deltas from Kafka topic (partition 0) and applies them.
-// fromOffset here is interpreted as message index (dev simplification).
-// Kafka replay moved to integration build (see restore_kafka.go).
-
 func (r *Restorer) RestoreAndReplay() (RestoreResult, error) {
-	// Read latest manifest
 	m, err := r.manifestReader.ReadLatest()
 	if err != nil {
 		return RestoreResult{}, fmt.Errorf("read manifest: %w", err)
 	}
-
-	// Restore from snapshot
 	if err := r.RestoreFromSnapshot(m.SnapshotID); err != nil {
 		return RestoreResult{}, fmt.Errorf("restore snapshot: %w", err)
 	}
-
-	// By default use file-based replay (callers can invoke Kafka variant directly if needed)
-	result := r.ReplayChangelog("./changelog/opb.jsonl", m.LastChangelogOffset)
-	return result, result.Error
+	res := r.ReplayChangelog("./changelog/opb.jsonl", m.LastChangelogOffset)
+	return res, res.Error
 }
 
-// parseAndApplyLine parses a JSON delta line and applies it to the store.
-// Returns (applied, skipped, err).
 func (r *Restorer) parseAndApplyLine(line []byte) (bool, bool, error) {
 	var d changelog.Delta
 	if err := json.Unmarshal(line, &d); err != nil {
@@ -138,28 +115,32 @@ func (r *Restorer) parseAndApplyLine(line []byte) (bool, bool, error) {
 	return false, true, nil
 }
 
-// replayLines replays deltas from an io.Reader with optional fromOffset (line index).
 func (r *Restorer) replayLines(reader io.Reader, fromOffset int64) RestoreResult {
-	scanner := bufio.NewScanner(reader)
+	sc := bufio.NewScanner(reader)
 	applied, skipped := 0, 0
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		if int64(lineNum) <= fromOffset {
+	line := 0
+	var bytes int64
+	var last int64 = -1
+	for sc.Scan() {
+		line++
+		if int64(line) <= fromOffset {
 			continue
 		}
-		appliedNow, skippedNow, err := r.parseAndApplyLine(scanner.Bytes())
+		b := sc.Bytes()
+		a, s, err := r.parseAndApplyLine(b)
 		if err != nil {
-			return RestoreResult{Error: fmt.Errorf("line %d: %w", lineNum, err)}
+			return RestoreResult{Error: fmt.Errorf("line %d: %w", line, err)}
 		}
-		if appliedNow {
+		if a {
 			applied++
-		} else if skippedNow {
+		} else if s {
 			skipped++
 		}
+		bytes += int64(len(b))
+		last = int64(line)
 	}
-	if err := scanner.Err(); err != nil {
+	if err := sc.Err(); err != nil {
 		return RestoreResult{Error: fmt.Errorf("scan changelog: %w", err)}
 	}
-	return RestoreResult{Applied: applied, Skipped: skipped}
+	return RestoreResult{Applied: applied, Skipped: skipped, Bytes: bytes, LastAppliedOffset: last}
 }

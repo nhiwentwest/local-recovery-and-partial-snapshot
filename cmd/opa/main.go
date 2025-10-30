@@ -100,6 +100,8 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 	if err := p.InitTransactions(context.TODO()); err != nil {
 		log.Fatalf("init tx: %v", err)
 	}
+	// fencing epoch per-process
+	epoch := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
 	log.Printf("OpA started bootstrap=%s in=%s out=%s", bootstrap, topicIn, topicOut)
 
 	for {
@@ -122,6 +124,7 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 		val, _ := json.Marshal(eo)
 
 		headers := maybeAttachT0(msg.Headers)
+		headers = append(headers, ck.Header{Key: "epoch", Value: epoch})
 		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topicOut, Partition: ck.PartitionAny}, Key: []byte(o.OrderID), Value: val, Headers: headers}, nil); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue
@@ -209,6 +212,7 @@ func runWrapper(bootstrap, groupID, txID string, txProduced prometheus.Counter, 
 
 		// passthrough enriched -> output (key preserved)
 		headers := maybeAttachT0(msg.Headers)
+		headers = append(headers, ck.Header{Key: "epoch", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))})
 		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &out, Partition: ck.PartitionAny}, Key: msg.Key, Value: msg.Value, Headers: headers}, nil); err != nil {
 			_ = p.AbortTransaction(context.TODO())
 			continue

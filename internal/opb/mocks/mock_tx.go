@@ -265,3 +265,15 @@ func (mr *MockTxMetricsMockRecorder) TxProduced() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TxProduced", reflect.TypeOf((*MockTxMetrics)(nil).TxProduced))
 }
+
+// OffsetsBoundLag mocks base method.
+func (m *MockTxMetrics) OffsetsBoundLag(arg0 float64) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "OffsetsBoundLag", arg0)
+}
+
+// OffsetsBoundLag indicates an expected call of OffsetsBoundLag.
+func (mr *MockTxMetricsMockRecorder) OffsetsBoundLag(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OffsetsBoundLag", reflect.TypeOf((*MockTxMetrics)(nil).OffsetsBoundLag), arg0)
+}
