@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>Zone Details</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 20px; }
+    .row { margin: 8px 0; }
+    label { display: inline-block; width: 110px; color: #444; }
+    input { padding: 6px 8px; }
+    #status { margin-top: 16px; padding: 12px; border: 1px solid #ddd; background: #fafafa; white-space: pre-wrap; }
+    .ok { color: #0a7f2e; }
+    .err { color: #b00020; }
+    .muted { color: #666; }
+    .grid { display: grid; grid-template-columns: 160px 1fr; gap: 8px 12px; align-items: center; }
+    .btn { padding: 6px 10px; border: 1px solid #bbb; background: #fff; cursor: pointer; }
+    .small { font-size: 12px; color: #555; }
+  </style>
+</head>
+<body>
+  <h2>Zone Details</h2>
+  <div class="grid">
+    <label>storeId</label>
+    <input id="storeId" placeholder="A-" />
+    <label>productId</label>
+    <input id="productId" placeholder="p1 (optional)" />
+    <label>windowStart</label>
+    <input id="ws" placeholder="epoch seconds (optional)" />
+  </div>
+  <div class="row">
+    <button class="btn" id="load">Load</button>
+    <label style="width:auto;margin-left:12px;">Auto refresh</label>
+    <input type="checkbox" id="auto" checked />
+  </div>
+  <div class="row">
+    <button class="btn" id="injectNew">Inject New</button>
+    <button class="btn" id="injectDup" style="margin-left:8px;">Inject Duplicates</button>
+    <span class="muted" style="margin-left:12px;">uses /api/inject-test-data</span>
+  </div>
+  <div class="small" id="info"></div>
+  <pre id="status" class="muted">Waiting...</pre>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function getParams() {
+      const url = new URL(window.location.href);
+      const storeId = url.searchParams.get('id') || '';
+      const productId = url.searchParams.get('productId') || '';
+      const ws = url.searchParams.get('ws') || '';
+      if (storeId) $('#storeId').value = storeId;
+      if (productId) $('#productId').value = productId;
+      if (ws) $('#ws').value = ws;
+    }
+
+    function buildEndpoint() {
+      const origin = window.location.origin;
+      const storeId = $('#storeId').value.trim();
+      const productId = $('#productId').value.trim();
+      const ws = $('#ws').value.trim();
+      const p = new URLSearchParams();
+      if (storeId) p.set('id', storeId);
+      if (productId && ws) { p.set('productId', productId); p.set('ws', ws); }
+      return `${origin}/api/zone-details?${p.toString()}`;
+    }
+
+    async function load() {
+      const storeId = $('#storeId').value.trim();
+      const productId = $('#productId').value.trim();
+      const ws = $('#ws').value.trim();
+      if (!storeId) {
+        $('#status').textContent = 'Please enter storeId';
+        $('#status').className = 'err';
+        return;
+      }
+      const url = buildEndpoint();
+      $('#info').textContent = `GET ${url}`;
+      $('#status').textContent = 'Loading...';
+      $('#status').className = 'muted';
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        const txt = await res.text();
+        try {
+          const obj = JSON.parse(txt);
+          $('#status').textContent = JSON.stringify(obj, null, 2);
+          $('#status').className = res.ok ? 'ok' : 'err';
+        } catch (e) {
+          $('#status').textContent = `Non-JSON response (status=${res.status}):\n` + txt;
+          $('#status').className = 'err';
+        }
+      } catch (e) {
+        $('#status').textContent = 'Fetch error: ' + e.message;
+        $('#status').className = 'err';
+      }
+    }
+
+    async function inject(mode) {
+      const origin = window.location.origin;
+      const storeId = $('#storeId').value.trim() || 'A-';
+      const productId = $('#productId').value.trim();
+      const ws = $('#ws').value.trim();
+      const body = { storeId, productId, mode, n: 50 };
+      if (ws) { body.ws = parseInt(ws, 10) || 0; }
+      const injUrl = `${origin}/api/inject-test-data`;
+      $('#info').textContent = `POST ${injUrl} body=${JSON.stringify(body)}`;
+      try {
+        const res = await fetch(injUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const txt = await res.text();
+        try {
+          const obj = JSON.parse(txt);
+          $('#status').textContent = 'Inject response:\n' + JSON.stringify(obj, null, 2);
+          $('#status').className = res.ok ? 'ok' : 'err';
+        } catch(e) {
+          $('#status').textContent = 'Inject response (raw):\n' + txt;
+          $('#status').className = 'err';
+        }
+      } catch(e) {
+        $('#status').textContent = 'Inject error: ' + e.message;
+        $('#status').className = 'err';
+    }
+    }
+
+    let timer = null;
+    function tick() {
+      if ($('#auto').checked) load();
+    }
+
+    $('#load').onclick = load;
+    $('#auto').onchange = () => { if ($('#auto').checked) { load(); } };
+    $('#injectNew').onclick = () => inject('new');
+    $('#injectDup').onclick = () => inject('duplicate');
+
+    getParams();
+    load();
+    timer = setInterval(tick, 2000);
+  </script>
+</body>
+</html>

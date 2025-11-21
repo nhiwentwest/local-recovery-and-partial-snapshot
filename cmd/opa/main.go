@@ -34,18 +34,16 @@ func main() {
 		topicIn   string
 		topicOut  string
 		txID      string
-		mode      string // normal|wrapper
 		crashMode string // before|mid|after|none
 		httpAddr  string
 	)
-	flag.StringVar(&bootstrap, "bootstrap", "localhost:19092", "kafka bootstrap servers")
-	flag.StringVar(&groupID, "group-id", "opa", "consumer group id")
+	flag.StringVar(&bootstrap, "bootstrap", "localhost:9092", "kafka bootstrap servers")
+	flag.StringVar(&groupID, "group-id", "opa-pipeline", "consumer group id")
 	flag.StringVar(&topicIn, "topic-in", "p1.orders", "input topic")
 	flag.StringVar(&topicOut, "topic-out", "p1.orders.enriched", "output topic")
 	flag.StringVar(&txID, "tx-id", "opa-local-1", "transactional id")
-	flag.StringVar(&mode, "mode", "normal", "normal|wrapper")
 	flag.StringVar(&crashMode, "crash-mode", "none", "before|mid|after|none")
-	flag.StringVar(&httpAddr, "http", ":8081", "http listen address for metrics/health")
+	flag.StringVar(&httpAddr, "http", ":8088", "http listen address for metrics/health")
 	flag.Parse()
 
 	// metrics registry for OpA
@@ -62,10 +60,6 @@ func main() {
 		_ = http.ListenAndServe(httpAddr, nil)
 	}()
 
-	if mode == "wrapper" {
-		runWrapper(bootstrap, groupID, txID, opaTxProduced, opaTxAborted, opaTxLatency)
-		return
-	}
 	runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode, opaTxProduced, opaTxAborted, opaTxLatency)
 }
 
@@ -100,137 +94,105 @@ func runOpA(bootstrap, groupID, topicIn, topicOut, txID, crashMode string, txPro
 	if err := p.InitTransactions(context.TODO()); err != nil {
 		log.Fatalf("init tx: %v", err)
 	}
-	// fencing epoch per-process
-	epoch := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
 	log.Printf("OpA started bootstrap=%s in=%s out=%s", bootstrap, topicIn, topicOut)
 
+	const batchSize = 100
+	const batchTimeout = 5 * time.Second
+
 	for {
+		// Bắt đầu một transaction mới cho mỗi batch
 		if err := p.BeginTransaction(); err != nil {
-			log.Fatalf("begin tx: %v", err)
+			log.Printf("begin tx error: %v", err)
+			time.Sleep(1 * time.Second)
+			continue
 		}
 
-		msg, err := c.ReadMessage(10 * time.Second)
+		batch := make([]*ck.Message, 0, batchSize)
+		batchStartTime := time.Now()
+		// Theo dõi offset cao nhất +1 cho mỗi partition của topic input
+		batchOffsets := make(map[int32]ck.TopicPartition)
+
+		// Đọc message cho đến khi đủ batch hoặc timeout
+		for len(batch) < batchSize && time.Since(batchStartTime) < batchTimeout {
+			readTimeout := batchTimeout - time.Since(batchStartTime)
+			if readTimeout < 0 {
+				readTimeout = 0
+			}
+			msg, err := c.ReadMessage(readTimeout)
+			if err != nil {
+				if e, ok := err.(ck.Error); ok && e.Code() == ck.ErrTimedOut {
+					break // Hết thời gian chờ, xử lý batch hiện tại
+				}
+				log.Printf("ReadMessage error: %v", err)
+				break
+			}
+			batch = append(batch, msg)
+		}
+
+		// Nếu không có message nào, bỏ qua và bắt đầu transaction mới
+		if len(batch) == 0 {
+			_ = p.AbortTransaction(context.TODO()) // Hủy transaction rỗng
+			continue
+		}
+
+		log.Printf("Processing batch of %d messages...", len(batch))
+		var produceErr error
+		for _, msg := range batch {
+			var o model.Order
+			if err := json.Unmarshal(msg.Value, &o); err != nil {
+				log.Printf("json.Unmarshal error: %v for message: %s", err, string(msg.Value))
+				continue // Bỏ qua message lỗi, không tính vào offsets
+			}
+			eo := model.Normalize(o)
+			val, _ := json.Marshal(eo)
+
+
+			headers := maybeAttachT0(msg.Headers)
+			if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topicOut, Partition: ck.PartitionAny}, Key: []byte(o.OrderID), Value: val, Headers: headers}, nil); err != nil {
+				log.Printf("produce error: %v", err)
+				produceErr = err
+				break
+			}
+			// Track highest offset+1 per partition cho offsets giao dịch
+			tp := ck.TopicPartition{Topic: msg.TopicPartition.Topic, Partition: msg.TopicPartition.Partition, Offset: msg.TopicPartition.Offset + 1}
+			if existing, ok := batchOffsets[tp.Partition]; !ok || tp.Offset > existing.Offset {
+				batchOffsets[tp.Partition] = tp
+			}
+		}
+
+		if produceErr != nil {
+			_ = p.AbortTransaction(context.TODO())
+			continue
+		}
+
+		// Chuẩn bị offsets để gửi trong transaction
+		offsets := make([]ck.TopicPartition, 0, len(batchOffsets))
+		for _, tp := range batchOffsets {
+			offsets = append(offsets, tp)
+		}
+		meta, err := c.GetConsumerGroupMetadata()
 		if err != nil {
+			log.Printf("get metadata error: %v", err)
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 
-		var o model.Order
-		if err := json.Unmarshal(msg.Value, &o); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
-		}
-		eo := model.Normalize(o)
-		val, _ := json.Marshal(eo)
-
-		headers := maybeAttachT0(msg.Headers)
-		headers = append(headers, ck.Header{Key: "epoch", Value: epoch})
-		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topicOut, Partition: ck.PartitionAny}, Key: []byte(o.OrderID), Value: val, Headers: headers}, nil); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
-		}
-
-		// crash matrix simulation
-		if crashMode == "before" {
-			log.Fatal("crash before commit")
-		}
-
-		// SendOffsetsToTransaction binds consumer offsets atomically
-		offsets, _ := c.Commit() // get current offsets synchronously (not committed to broker)
-		meta, _ := c.GetConsumerGroupMetadata()
 		t0 := time.Now()
 		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
+			log.Printf("send offsets error: %v", err)
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 
-		if crashMode == "mid" {
-			time.Sleep(2 * time.Second)
-			log.Fatal("crash mid commit")
-		}
-
-		// Commit without explicit flush to avoid adding fixed 5s latency
+		// Commit transaction
 		if err := p.CommitTransaction(context.TODO()); err != nil {
+			log.Printf("CommitTransaction error: %v", err)
+			txAborted.Inc()
 			_ = p.AbortTransaction(context.TODO())
 			continue
 		}
 		txProduced.Inc()
 		txLatency.Observe(time.Since(t0).Seconds())
-
-		if crashMode == "after" {
-			log.Fatal("crash after commit")
-		}
-	}
-}
-
-func runWrapper(bootstrap, groupID, txID string, txProduced prometheus.Counter, txAborted prometheus.Counter, txLatency prometheus.Histogram) {
-	in := "p1.orders.enriched"
-	out := "p1.orders.output"
-
-	p, err := ck.NewProducer(&ck.ConfigMap{
-		"bootstrap.servers":  bootstrap,
-		"enable.idempotence": true,
-		"acks":               "all",
-		"transactional.id":   txID,
-	})
-	if err != nil {
-		log.Fatalf("producer: %v", err)
-	}
-	defer p.Close()
-
-	c, err := ck.NewConsumer(&ck.ConfigMap{
-		"bootstrap.servers":  bootstrap,
-		"group.id":           groupID,
-		"enable.auto.commit": false,
-		// Allow switching between committed/uncommitted by separate tools; wrapper uses committed path
-		"isolation.level":   "read_committed",
-		"auto.offset.reset": "earliest",
-	})
-	if err != nil {
-		log.Fatalf("consumer: %v", err)
-	}
-	defer c.Close()
-
-	if err := c.SubscribeTopics([]string{in}, nil); err != nil {
-		log.Fatalf("subscribe: %v", err)
-	}
-
-	if err := p.InitTransactions(context.TODO()); err != nil {
-		log.Fatalf("init tx: %v", err)
-	}
-	log.Printf("OpA wrapper started bootstrap=%s in=%s out=%s", bootstrap, in, out)
-
-	for {
-		if err := p.BeginTransaction(); err != nil { // confluent lib uses internal context
-			log.Fatalf("begin tx: %v", err)
-		}
-		msg, err := c.ReadMessage(5 * time.Second)
-		if err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
-		}
-
-		// passthrough enriched -> output (key preserved)
-		headers := maybeAttachT0(msg.Headers)
-		headers = append(headers, ck.Header{Key: "epoch", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))})
-		if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &out, Partition: ck.PartitionAny}, Key: msg.Key, Value: msg.Value, Headers: headers}, nil); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
-		}
-
-		// bind offsets atomically
-		offsets, _ := c.Commit()
-		meta, _ := c.GetConsumerGroupMetadata()
-		t0 := time.Now()
-		if err := p.SendOffsetsToTransaction(context.Background(), offsets, meta); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
-		}
-		if err := p.CommitTransaction(context.TODO()); err != nil {
-			_ = p.AbortTransaction(context.TODO())
-			continue
-		}
-		txProduced.Inc()
-		txLatency.Observe(time.Since(t0).Seconds())
+		log.Printf("Committed batch of %d messages successfully.", len(batch))
 	}
 }

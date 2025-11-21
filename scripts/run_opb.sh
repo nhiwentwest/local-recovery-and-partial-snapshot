@@ -7,13 +7,13 @@ set -euo pipefail
 # Config
 # ==========================
 BOOTSTRAP=${BOOTSTRAP:-127.0.0.1:9092}
-PREFIX=${PREFIX:-p2}
+PREFIX=${PREFIX:-p1}
 GROUP=${GROUP:-opb-g-$$-$RANDOM}
 HTTP=${HTTP:-:8089}
 HTTP_OPA=${HTTP_OPA:-:8088}
 STATE_DIR=${STATE_DIR:-./data/opb-demo}
 SNAPSHOT_DIR=${SNAPSHOT_DIR:-./snapshots}
-TX_ID=${TX_ID:-opb-tx-1}
+# TX_ID removed; EOS always on by default
 SNAPSHOT_INTERVAL=${SNAPSHOT_INTERVAL:-5}
 WINDOW_SIZE=${WINDOW_SIZE:-10}
 HEAVY_N=${HEAVY_N:-5000}
@@ -49,7 +49,7 @@ partition_for_key() {
   local key=$1
   local topic=$2
   local parts=$(partition_count "$topic")
-  go run ./scripts/hash_murmur2.go "$key" "$parts"
+  go run ./cmd/hash_murmur2 "$key" "$parts"
 }
 
 # Start a consumer pinned to a specific partition from its latest offset
@@ -86,7 +86,7 @@ wait_for_dependencies() {
 wait_http() { for i in {1..30}; do if ${CURL} -sf "http://127.0.0.1${HTTP}/healthz" >/dev/null 2>&1; then return 0; fi; sleep 0.3; done; return 1; }
 clean_state() { say "Cleaning state and snapshots"; rm -rf "${STATE_DIR}" "${SNAPSHOT_DIR}"; mkdir -p "${STATE_DIR}" "${SNAPSHOT_DIR}"; }
 stop_all() { pkill opb >/dev/null 2>&1 || true; }
-start_opb() { stop_all; say "Starting OpB..."; local GID="opb-g-$$-$RANDOM"; ${BIN_OPB} --state-backend pebble --state-dir "${STATE_DIR}" --snapshot-dir "${SNAPSHOT_DIR}" --kafka-bootstrap "${BOOTSTRAP}" --group-id "${GID}" --input-source kafka --topic-enriched "${TOPIC_IN}" --output-topic "${TOPIC_OUT}" --changelog-sink both --manifest-sink both --topic-changelog "${TOPIC_CHANGELOG}" --topic-snapshots "${TOPIC_SNAPSHOTS}" --window-size "${WINDOW_SIZE}" --snapshot-interval "${SNAPSHOT_INTERVAL}" --output-tx-id "${TX_ID}" --tx-batch-size "${TX_BATCH_SIZE}" --tx-linger-ms "${TX_LINGER_MS}" --http "${HTTP}" > ./logs/opb_kafka.out 2>&1 & sleep 0.8; if wait_http; then say "OpB ready"; else say "ERROR: OpB not ready"; exit 1; fi; }
+start_opb() { stop_all; say "Starting OpB..."; local GID="opb-g-$-$RANDOM"; ${BIN_OPB} --state-backend pebble --state-dir "${STATE_DIR}" --snapshot-dir "${SNAPSHOT_DIR}" --kafka-bootstrap "${BOOTSTRAP}" --group-id "${GID}" --input-source kafka --topic-enriched "${TOPIC_IN}" --output-topic "${TOPIC_OUT}" --changelog-sink both --manifest-sink both --topic-changelog "${TOPIC_CHANGELOG}" --topic-snapshots "${TOPIC_SNAPSHOTS}" --window-size "${WINDOW_SIZE}" --snapshot-interval "${SNAPSHOT_INTERVAL}" --tx-batch-size "${TX_BATCH_SIZE}" --tx-linger-ms "${TX_LINGER_MS}" --http "${HTTP}" > ./logs/opb_kafka.out 2>&1 & sleep 0.8; if wait_http; then say "OpB ready"; else say "ERROR: OpB not ready"; exit 1; fi; }
 start_opb_with() { local sink=$1; stop_all; say "Starting OpB with changelog-sink=${sink}"; ${BIN_OPB} --state-backend pebble --state-dir "${STATE_DIR}" --snapshot-dir "${SNAPSHOT_DIR}" --kafka-bootstrap "${BOOTSTRAP}" --group-id "${GROUP}" --input-source kafka --topic-enriched "${TOPIC_IN}" --output-topic "${TOPIC_OUT}" --changelog-sink "${sink}" --manifest-sink both --topic-changelog "${TOPIC_CHANGELOG}" --topic-snapshots "${TOPIC_SNAPSHOTS}" --window-size "${WINDOW_SIZE}" --snapshot-interval "${SNAPSHOT_INTERVAL}" --output-tx-id "${TX_ID}" --tx-batch-size "${TX_BATCH_SIZE}" --tx-linger-ms "${TX_LINGER_MS}" --http "${HTTP}" > ./logs/opb_kafka.out 2>&1 & sleep 0.8; wait_http || say "WARN: OpB not ready"; }
 pump_via_script() { local n=${1} chunk=${2:-500} gap=${3:-0.05}; local script_dir; script_dir=$(cd "$(dirname "$0")" && pwd); say "Pumping N=${n} to topic=${TOPIC_RAW} (via pump_test.sh)"; TOPIC="$TOPIC_RAW" N="$n" CHUNK="$chunk" SLEEP="$gap" BOOTSTRAP="$BOOTSTRAP" "$script_dir/pump_test.sh"; }
 produce_raw_one() { printf '{"orderId":"%s","productId":"%s","price":%s,"qty":%s,"storeId":"%s","ts":%s}\n' "$1" "${2:-p1}" "${3:-10000}" "${4:-1}" "${5:-A}" "${6:-1694505000}" | ${KAFKA_PRODUCER} --bootstrap-server "$BOOTSTRAP" --topic "$TOPIC_RAW" >/dev/null 2>&1 || true; }

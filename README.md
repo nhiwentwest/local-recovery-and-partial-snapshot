@@ -1,190 +1,217 @@
-# HPB - OpB (Aggregator, Changelog, Snapshot, Manifest)
+# Local Recovery & Partial Snapshot — Tổng quan hệ thống (OpA + OpB + hạ tầng)
 
-This repository scaffolds the OpB service (Người 2) for the local-recovery-and-partial-snapshot project.
+Dự án mô phỏng một hệ thống giám sát/tổng hợp dữ liệu đơn hàng theo thời gian thực, chứng minh:
+- Exactly‑Once (không đếm trùng) ở đường đi chuẩn.
+- Scale‑out tuyến OpB khi tải tăng.
+- Khả dụng khi bản sao lỗi (rebalance, tiếp quản partitions).
+- Phục hồi nhanh nhờ snapshot + changelog (local recovery, partial snapshot).
 
-## Components
+Thành phần chính
+- OpA (Normalizer/EOS): tiêu thụ p1.orders → chuẩn hoá → xuất p1.orders.enriched (Exactly‑Once).
+- OpB (Aggregator): tiêu thụ p1.orders.enriched → tổng hợp theo cửa sổ → xuất p1.orders.output; đồng thời ghi changelog, snapshot, manifest lên các topic opb-*.
+- Hạ tầng: Kafka/Redpanda, Prometheus/Grafana; web viz: /viz/cluster, /viz/zone-data (có lớp heatmap nếu UI hỗ trợ).
 
-- Thành phố gửi yêu cầu liên tục (10k/s).
-- Trạm A (OpA) chuẩn hóa và đảm bảo mỗi yêu cầu chỉ được tính một lần.
-- Trạm B (OpB) cập nhật bảng tổng hợp theo từng khu/giờ.
-- Khi tải tăng, đồng hồ lag cho thấy “xếp hàng”; ta chỉ việc thêm trạm B (scale) hoặc chia nhiều quầy (tăng partitions) để xử lý kịp.
-- Nếu mất điện, bật lại sẽ khôi phục bảng tổng hợp đúng như trước khi mất điện.
+Mục đích: giúp đội vận hành “nhìn thấy” nhịp đơn hàng theo khu/phút, vẫn đúng & liên tục khi có sự cố, và phục hồi trong vài giây.
 
 
-- Ai? Đội điều phối dịch vụ gọi xe trong thành phố.
-- Cần gì? Nhìn thấy nhịp nhu cầu theo khu mỗi phút để điều xe/giá.
-- Vấn đề? Khi hệ thống lỗi, dữ liệu dễ sai hoặc gián đoạn.
-- Giải pháp? Lưu lần chụp gần nhất và ghi nhật ký thay đổi; khi hồi phục, cộng bù để tiếp tục đúng & kịp thời.
-- Lợi ích? Không đếm trùng, không dừng toàn hệ thống, phục hồi trong vài giây.
+## 1) Kiến trúc & Luồng (mô tả text)
+- OpA: p1.orders → (chuẩn hoá/EOS) → p1.orders.enriched.
+- OpB: p1.orders.enriched → (tổng hợp cửa sổ) → p1.orders.output.
+  - Đồng thời xuất:
+    - p1.opb-changelog (delta, append‑only)
+    - p1.opb-snapshots (compacted, manifest snapshot mới nhất)
+    - p1.opb-store-touch (compacted, dấu vết phiên bản/instance dùng cho viz)
+- Quan trắc:
+  - HTTP metrics: /metrics (Prom/Graf)
+  - Web viz: /viz/cluster, /viz/zone-data?id=... (có heatmap nếu bật)
 
-## Build & Run (local)
+Topics mặc định (prefix p1.)
+- p1.orders, p1.orders.enriched, p1.orders.output
+- p1.opb-changelog, p1.opb-snapshots (compacted), p1.opb-store-touch (compacted)
 
-```bash
-make build
-./bin/opb --state-backend pebble --state-dir ./data/opb --snapshot-dir ./snapshots \
-  --kafka-bootstrap 127.0.0.1:9092 --group-id opb-g --topic-enriched p1.orders.enriched \
-  --output-topic p1.orders.output --http :8089
-```
 
-Notes:
-- Backend state dùng PebbleDB; snapshot/manifest lưu filesystem (và có thể publish lên Kafka nếu bật).
+## 2) Quickstart (local)
+Prerequisites
+- Kafka/Redpanda tại 127.0.0.1:9092; cổng HTTP rảnh: :8088 (OpA), :8089 (OpB)
+- Go toolchain + make
 
-## Testing (unit vs integration)
+Build
+- make build
 
-Tách rõ 2 lớp khôi phục trạng thái để tăng chất lượng code và độ tin cậy test:
+Chạy tối thiểu hạ tầng + pipeline
+- scripts/run_infra.sh (khởi động broker, Prom, Grafana, web viz nếu có trong repo)
+- scripts/run_opa.sh (OpA — chuẩn hoá, Exactly‑Once)
+- scripts/run_opb.sh (OpB — tổng hợp + snapshot/changelog)
+- scripts/start_pipeline.sh (bơm dữ liệu mẫu nếu cần)
 
-- `internal/restorefs` (unit): FS‑only (snapshot JSON + changelog JSONL). Đã có test table‑driven phủ các nhánh lỗi/offset/idempotency. Coverage mục tiêu 60–70%+ (hiện ~74%).
-- `internal/restorekafka` (integration): Kafka replay/reader, build bằng tag `integration`. Build thường dùng stub `!integration` để không kéo mẫu số unit.
+Mở giao diện web
+- Cluster overview: http://127.0.0.1:8089/viz/cluster
+- Zone data (theo store): http://127.0.0.1:8089/viz/zone-data?id=STORE_PREFIX
 
-Lệnh tiện dụng:
+Ghi chú
+- Các topic opb-* có mục tiêu compacted/append như trên. Nếu cần tạo thủ công bằng rpk/kafka-topics, hãy dùng prefix p1.* và số partitions phù hợp với demo.
 
-```bash
-# Unit tests (mặc định)
-make test
 
-# Race detector
-make test-race
+## 3) Demos (bám script — mỗi demo: Mục tiêu → Cách chạy → Verify → Links)
 
-# Coverage (tạo coverage.html, không tự mở trình duyệt)
-make coverage
+### Chuẩn bị trước mỗi demo
+Để tránh xung đột giữa các kịch bản (đặc biệt khi OpB có replica B2 đang chạy), hãy làm sạch môi trường trước MỖI demo:
 
-# Integration tests (Kafka path, cần môi trường Kafka)
-make test-integration   # tương đương: go test -tags=integration ./...
-```
+1. Dừng các tiến trình đang chạy  
+   `pkill -f bin/opb || true`  
+   `pkill -f bin/opa || true`  
+   `pkill -f ':8090' || true` # đảm bảo OpB2 không giữ partition
+2. Xoá và tạo lại topic sạch:  
+   `PREFIX=p1 bash scripts/run_infra.sh`
+3. Khởi động pipeline nền với Pebble + window 120s:  
+   `STATE_BACKEND=pebble WINDOW_SIZE=120 bash scripts/start_pipeline.sh`
+4. Đợi `http://127.0.0.1:8088/healthz` và `http://127.0.0.1:8089/healthz` trả `{"status":"ok"}` rồi mới chạy demo.
 
-Lưu ý: Integration có thể yêu cầu broker, topics… Unit không cần Kafka.
+Lưu ý: `scripts/demo_suite.sh` sẽ tự khởi động B2 (port 8090) trong pha scale-out; sau khi demo kết thúc hãy dừng B2 (`pkill -f ':8090'`) trước khi chuyển sang demo khác.
 
-## Flags
+### Demo 1 — Exactly‑Once (EOS)
+Mục tiêu
+- Không double‑count khi bơm bản ghi trùng (DUP) vào đường đi chuẩn.
 
+Cách chạy (headless)
+- INTERACTIVE=0 DEMO_ONLY=EOS bash scripts/demo_suite.sh
+
+Verify
+- sumQty giữ nguyên sau pha DUP (không tăng lần 2).
+- Metrics opb_events_skipped_dedup_total tăng tương ứng số DUP.
+
+Links
+- /viz/cluster, /viz/zone-data?id=EOS-TEST-D-
+
+
+### Demo 2 — Scale‑out (local)
+Mục tiêu
+- Tăng replica/số partitions để giảm lag, tăng throughput.
+
+Cách chạy (tuỳ chọn A — 1 giai đoạn)
+- INTERACTIVE=0 AUTO_Y=1 STORE=EOS-TEST-D- bash scripts/demo_scaleout.sh
+
+Cách chạy (tuỳ chọn B — 2 giai đoạn, có auto reset)
+- INTERACTIVE=0 AUTO_Y=1 \
+  RESET_AFTER_SEC=60 RESET_PARTS=4 RESET_MODE=delete_recreate \
+  STORE=EOS-TEST-D- bash scripts/demo_scaleout_2stage.sh
+
+Verify
+- Lag giảm, throughput tăng sau khi thêm replica/tăng partitions.
+- Ngay sau khi join group, LagTotal có thể >0 một thời gian rồi về 0 khi tiêu thụ xong.
+
+Links
+- /viz/cluster, /viz/zone-data?id=STORE
+
+
+### Demo 3 — Availability & Headroom (local)
+Mục tiêu
+- Một replica OpB bị kill tạm thời, hệ thống vẫn xử lý nhờ rebalance; sau đó replica trở lại và join nhóm.
+
+Cách chạy (headless)
+- INTERACTIVE=0 AUTO_Y=1 bash scripts/demo_availability_local.sh
+
+Cách chạy (clean backlog + drain lag trước khi gây lỗi)
+- INTERACTIVE=0 AUTO_Y=1 CLEAN_TOPICS=1 CLEAN_LAG=1 LAG_THRESH=0 LAG_TIMEOUT=180 bash scripts/demo_availability_local.sh
+  - CLEAN_TOPICS=1: xoá và tạo lại topics demo (enriched/output = 4 partitions; các topic compacted giữ cleanup.policy=compact)
+  - CLEAN_LAG=1: đợi tổng lag trên cụm về ≤ LAG_THRESH (mặc định 0) trong tối đa LAG_TIMEOUT giây trước khi bắt đầu bơm tải/gây lỗi
+
+Verify
+- Khi B2 down: B1/B3 tiếp quản partitions của B2, hệ thống vẫn xử lý.
+- Khi B2 phục hồi: partitions phân phối lại đều. Quan sát được trên /viz/cluster.
+
+Links
+- /viz/cluster
+
+
+### Demo 4 — Recovery (local)
+Mục tiêu
+- Khởi động lại OpB, phục hồi nhanh nhờ manifest snapshot + replay changelog, và chứng minh thời gian khôi phục (TTR) dưới 10 giây sau tối ưu.
+
+Cách chạy (headless)
+- bash scripts/demo_recovery.sh
+  - Script tự động:
+    - Xoá rồi tạo lại hai topic phục hồi (`p1.opb-snapshots`, `p1.opb-changelog`) để tránh backlog từ các lần demo trước (cần CLI `kafka-topics`).
+    - Bơm 1 000 bản ghi ban đầu → đợi manifest mới xuất hiện (poll log thay vì ngủ cố định).
+    - Bơm thêm 500 bản ghi delta, chờ Exact cập nhật đủ lastSeq.
+    - `kill -9` OpB, chạy lại hai giai đoạn: `--restore-on-start --restore-only` (foreground) rồi tiến trình thường.
+    - Warmup + verify, sau cùng giữ tiến trình chạy đến khi nhấn Enter (INTERACTIVE=1) hoặc ngủ theo `SLEEP_BEFORE_SHUTDOWN`.
+
+Verify
+- Log sẽ in rõ thời điểm bắt đầu/hoàn tất restore (`restore ts: start=…`, `restore ts: done=…`) cùng `restore completed: applied=500 skipped=3` (demo mặc định).
+- `/status` và file `data/opb-recovery/restore-metrics.json` phản ánh `ttrMs ≈ 9000`, `snapshotId`, `lastChangelogOffset=1200`, `lastRestoreApplied=500`, `lastRestoreSkipped=3`.
+- `/viz/zone-data?id=RECOVERY-TEST&productId=p1&ws=<ws>`: `sumQty(after)=1501` (500 delta + 1 warmup) và `lastSeq(after) >= 1500`.
+- Nếu cần so khớp offset, dùng `bin/count_changelog -topic p1.opb-changelog` sau khi script chạy xong.
+
+Links
+- /viz/cluster, /viz/zone-data?id=RECOVERY-TEST
+
+
+## 4) HEATMAP (bổ sung)
+Mục đích
+- Quan sát phân bố “điểm nóng” theo zone/key để thấy tải/độ tập trung theo thời gian.
+
+Cách xem
+- Mở http://127.0.0.1:8089/viz/zone-data?id=STORE_PREFIX
+- Nếu UI hỗ trợ heatmap, bật lớp heatmap trong trang zone‑data (layer/toggle). Khi bơm tải dàn trải, heatmap sẽ đều; khi dồn vào một số zone/key, khu vực đó sáng đậm hơn.
+
+
+## 5) Flags & Topics (chuẩn hoá theo THÀNH PHẦN)
+
+OpA (theo scripts/run_opa.sh)
+- -bootstrap: địa chỉ bootstrap (vd 127.0.0.1:9092)
+- -group-id: consumer group OpA
+- -topic-in: p1.orders
+- -topic-out: p1.orders.enriched
+- -tx-id (transactional.id): bật EOS khi ghi ra enriched
+- -http: địa chỉ HTTP (vd :8088)
+- (tuỳ chọn test) -crash-mode: before|mid|after
+
+OpB (theo scripts/run_opb.sh)
 - --state-backend: memory|pebble (mặc định pebble)
-- --state-dir: thư mục dữ liệu state (vd: ./data/opb)
-- --group-id: consumer group id (default: opb)
-- --window-size: aggregation window seconds (default: 300)
-- --snapshot-interval: seconds between snapshots (default: 60)
-- --changelog: on|off toggle for changelog emission (default: on)
-- --snapshot-dir: directory to store snapshots
-- --kafka-bootstrap: bootstrap servers (vd: 127.0.0.1:9092)
-- --topic-enriched: input (mặc định p1.orders.enriched)
-- --output-topic: output (mặc định p1.orders.output)
+- --state-dir: thư mục state (vd ./data/opb)
+- --snapshot-dir: nơi lưu snapshot (vd ./snapshots)
+- --kafka-bootstrap: bootstrap servers
+- --group-id: consumer group OpB
+- --input-source: kafka
+- --topic-enriched: input (p1.orders.enriched)
+- --output-topic: output (p1.orders.output)
+- --changelog-sink: none|kafka|fs|both
+- --manifest-sink: kafka|fs|both
+- --topic-changelog: p1.opb-changelog
+- --topic-snapshots: p1.opb-snapshots
+- --window-size: giây cho cửa sổ gom
+- --snapshot-interval: chu kỳ snapshot
+- --tx-batch-size, --tx-linger-ms: tinh chỉnh giao dịch/ghi
+- --http: địa chỉ HTTP (vd :8089)
+- (tuỳ chọn) --output-tx-id nếu binary hỗ trợ
 
-## Layout
-
-  ```json
-  key   = "storeId#productId#windowStart"
-  value = { "seq": 12345, "delta": 19900, "ts": 1694500000 }
-  ```
-
-  `seq` tăng dần theo key để bỏ qua lặp khi replay. (Tinh thần **FLIP-158**: log mọi thay đổi; snapshot chỉ “kết tinh” định kỳ.) ([Apache Software Foundation][2])
-* **Snapshot materializer:** mỗi T giây: freeze/flush Badger → tạo thư mục snapshot (copy hoặc export) → ghi **manifest**:
-
-  ```json
-  { "snapshotId": "2025-09-12T10:00:00Z",
-    "lastChangelogOffset": 7534221,
-    "createdAt": 1694499600 }
-  ```
-
-  manifest lưu trên `p1.opb-snapshots` (compacted) để lấy **bản mới nhất** nhanh chóng.
-* **Output EOS:** tương tự OpA, nhưng với `transactional.id=opB-...` và `SendOffsetsToTransaction()` cho `orders.enriched`. (Chuẩn **KIP-98**.) ([Apache Software Foundation][4])
-
-## 3.5. Recovery OpB (local)
-
-Khi khởi động:
-
-1. **Tải manifest mới nhất** từ `opb-snapshots` → xác định `lastChangelogOffset`.
-2. **Nạp snapshot** Badger tương ứng.
-3. **Replay `opb-changelog`** từ `lastChangelogOffset+1` đến “now” (áp dụng theo `seq` để idempotent).
-4. **Attach consumer** `orders.enriched` ở group cũ (read\_committed) và chạy tiếp.
-   → Chỉ OpB phải làm quy trình này; OpA không dừng (đúng “local recovery” của paper). ([SpringerLink][1])
-
----
-
-# 4) Mô hình dữ liệu demo
-
-* `orders`: `{orderId, productId, price, qty, storeId, ts}`
-* `orders.enriched`: thêm `validated`, `normTs`… (OpA tạo)
-* **State OpB**: `(storeId#productId#windowStart) -> {sum, count}` (tumbling window 1 phút)
-* `orders.output`: `{storeId, productId, windowStart, sum, count}`
-
-## 4.1) Kịch bản demo (ưu tiên chạy được trên 1 máy local)
-
-- Kịch bản 3 — Exactly-once correctness (OpA & OpB)
-  - Mục tiêu: không double-count, downstream không thấy bản ghi “bẩn”.
-  - Chạy:
-    ```bash
-    # Window 1: OpA (EOS + crash matrix tự động)
-    ./scripts/run_opa.sh
-    # Window 2: OpB (EOS, Kafka-mode)
-    ./scripts/run_opb.sh
-    # Window 3: Đo latency ổn định trên changelog bằng headers t0/t1
-    bin/bench_latency -bootstrap 127.0.0.1:9092 \
-      -topic-in p2.orders.enriched -topic-out p2.orders.output \
-      -store A -window 10 -n 5 -pid-prefix pL -measure-topic p2.opb-changelog
-    ```
-  - Pass: crash matrix OpA pass; latency HIT (không MISS), p95 < 1s; consumer `read_committed` không thấy record nửa vời.
-
-- Kịch bản 4 — Local recovery & partial snapshot (OpB)
-  - Mục tiêu: TTR nhỏ, replay đúng (applied/skipped), không mất/lặp.
-  - Chạy:
-    ```bash
-    # Window 3: bơm tải đều vào enriched
-    TOPIC=p2.orders.enriched MODE=enriched PARALLEL=2 N=10000 CHUNK=1000 SLEEP=0.02 ./scripts/pump_test.sh
-    # Kill OpB rồi start lại (dùng cửa sổ OpB)
-    pkill opb || true && ./scripts/run_opb.sh
-    # Đo TTR (từ log/metrics) và đếm throughput thực trong lúc phục hồi
-    bin/count_changelog -bootstrap 127.0.0.1:9092 -topic p2.opb-changelog -seconds 60
-    ```
-  - Pass: TTR ~5–10s; log restore `applied>0, skipped>=0`; manifest offset khớp.
-
-- Kịch bản 5 — Network partition (local)
-  - Mục tiêu: chịu lỗi mạng tạm thời, không mất dữ liệu, tự hồi phục.
-  - Chạy (Linux/macOS tương đương bằng tc/pfctl):
-    ```bash
-    # Window 4: áp dụng delay/drop tạm thời tới cổng Kafka
-    sudo tc qdisc add dev lo root netem delay 200ms 50ms 25%
-    # (sau 30–60s)
-    sudo tc qdisc del dev lo root netem
-    # Theo dõi metrics tiap 2s
-    HTTP=http://127.0.0.1:8089/metrics DURATION=60 ./scripts/monitor_metrics.sh
-    ```
-  - Pass: batch duration/tx latency tăng có kiểm soát, tx_aborted không tăng đột biến; bỏ chặn → throughput/lag trở lại bình thường.
-
-## 4.2) Kịch bản lớn (3 VM/3 broker)
-
-- Leader election & scale-out thực
-  - Mục tiêu: thể hiện rõ tính phân tán: leader failover, ISR catch-up, rebalance khi scale.
-  - Bước:
-    1) VM-1..3: Kafka 3 broker (RF=3), tạo topics P=6; Prom+Grafana (VM-1).
-    2) VM-2: chạy OpA; VM-3: chạy 2 instance OpB (group chung).
-    3) Bơm enriched song song (PARALLEL≈partitions), đo throughput thực: `bin/count_changelog -target N`.
-    4) Stop broker-2 → leader failover; Start lại → ISR catch-up.
-    5) Scale OpB: 1→2 instance → throughput tăng, lag giảm (Grafana).
-  - Pass: không gián đoạn dữ liệu khi failover; throughput/lag cải thiện khi scale-out.
-
----
-
-# 5) Test & tiêu chí pass
-
-Đã dựng một hệ thống tiếp nhận và tổng hợp dữ liệu theo thời gian thực ở quy mô ~10.000 yêu cầu mỗi giây, không trùng đếm, theo dõi được tải/lỗi, và có thể khôi phục nhanh khi sự cố nhờ snapshot + changelog.
-
-- Không trùng đếm, không mất bản ghi: OpA xử lý “đơn” từng request một cách exactly-once (đọc → xử lý → ghi) nên không bị double-count khi có lỗi hay restart.
-- Tổng hợp theo thời gian thực: OpB gom và cộng dồn theo key cửa hàng/sản phẩm/khung giờ, giống như “bảng tổng hợp theo quận/phường theo từng khung giờ”.
-- Chịu tải cao ~10.000 yêu cầu/giây: Load test bằng rpk local bắn ~10k RPS trong 60 giây thành công. Dữ liệu vào Kafka tăng đều; hệ thống quan trắc được tốc độ và “điểm nghẽn”.
-- Quan sát và kiểm soát: Có metric lag và throughput để thấy khi “đơn vào” nhanh hơn “đơn xử lý”, từ đó biết lúc nào cần tăng scale cho OpB hoặc số partition.
-- An toàn khi sự cố: OpB có snapshot + changelog recovery; nếu “mất điện” giữa chừng, bật lại sẽ khôi phục trạng thái và replay phần còn thiếu, không mất số liệu.
-- Độ trễ thấp ở đường đi chuẩn: Thiết kế hướng KV nhỏ + cập nhật tuần tự nên giữ được p95 sub-second trong điều kiện bình thường (đã đo trong test chức năng).
-- Mở đường nâng cấp: Có thể chuyển backend state sang PebbleDB để tăng headroom hiệu năng khi cần, mà không đổi giao diện/chức năng.
+Shared
+- Kafka bootstrap: 127.0.0.1:9092
+- Topics chỉ dùng prefix p1.* trong README (KHÔNG dùng p2.*)
+- Partitions: chọn theo demo (4, 8, ...)
 
 
-1. **Local recovery:** kill -9 OpB ngẫu nhiên trong khi OpA vẫn chạy; kỳ vọng **TTR** (time-to-recover) nhỏ (ví dụ ≤ 5–10s) tính từ lúc OpB restart đến lúc lại có `orders.output`. (Theo paper, local recovery rút ngắn TTR đáng kể so với global rollback). ([SpringerLink][1])
-2. **Partial snapshot vs no-changelog:** bật/tắt ghi delta → so **thời gian snapshot**, **kích thước snapshot**, **bytes replay**. (Ý tưởng FLIP-158/GIC: snapshot nhanh & ổn định nhờ changelog). ([Apache Flink][5])
-3. **Exactly-once (KIP-98):** tạo 3 kịch bản crash (trước/giữa/sau commit). Downstream (`read_committed`) **không** thấy bản ghi “nửa vời”; không double-count ở `orders.output`. ([Apache Software Foundation][4])
+## 6) Phụ lục & Liên kết
+- KIP-98: Exactly‑Once & Transactional Messaging
+- KIP-429: Cooperative Rebalancing; KIP-345: Static Membership
+- FLIP-158: Generalized incremental checkpoints (định hướng log‑based snapshot)
 
-**Chỉ số tối thiểu báo cáo:** TTR, p50/p95/p99 latency, throughput, snapshot size, bytes replay.
+Trích đoạn manifest (mẫu)
+```
+{ "snapshotId": "2025-09-12T10:00:00Z",
+  "lastChangelogOffset": 7534221,
+  "createdAt": 1694499600 }
+```
 
----
 
-[1]: https://link.springer.com/journal/10115/online-first?page=2 "Online first articles | Knowledge and Information Systems"
-[2]: https://cwiki.apache.org/confluence/display/FLINK/FLIP-158%3A%2BGeneralized%2Bincremental%2Bcheckpoints "FLIP-158: Generalized incremental checkpoints"
-[3]: https://github.com/dattskoushik/apolloflow "GitHub - dattskoushik/apolloflow: This project is a distributed task queue implemented in Go, using RabbitMQ/Kafka for message passing. The system allows clients to submit tasks and receive real-time notifications via WebSockets or gRPC when their tasks have been completed"
-[4]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging "KIP-98 - Exactly Once Delivery and Transactional Messaging"
-[5]: https://flink.apache.org/2022/05/30/improving-speed-and-stability-of-checkpointing-with-generic-log-based-incremental-checkpoints/ "Improving speed and stability of checkpointing with generic ..."
+## 7) Ghi chú phạm vi & đồng bộ
+- README này chỉ mô tả, không thay đổi code/scripts.
+- Ngôn ngữ: Tiếng Việt; giữ thuật ngữ kỹ thuật tiếng Anh khi cần.
+- Demos, topics, flags đã được chuẩn hoá về p1.* và bám đúng tên script:
+  - run_infra.sh, run_opa.sh, run_opb.sh, start_pipeline.sh
+  - demo_suite.sh (DEMO_ONLY=EOS)
+  - demo_scaleout.sh, demo_scaleout_2stage.sh
+  - demo_availability_local.sh
+  - demo_recovery.sh
+- Không thêm mục Troubleshooting trong lần này.

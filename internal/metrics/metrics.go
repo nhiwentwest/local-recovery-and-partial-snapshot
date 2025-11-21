@@ -29,6 +29,11 @@ type Registry struct {
 
 	// Per-partition lag (labels: topic, partition, group, instance)
 	PartitionLag *prometheus.GaugeVec
+
+	// New EOS fast-path counters
+	EventsApplied       prometheus.Counter
+	EventsSkippedDedup  prometheus.Counter
+	EventsSkippedSeq    prometheus.Counter
 }
 
 func NewRegistry() *Registry {
@@ -58,7 +63,12 @@ func NewRegistry() *Registry {
 
 	partLag := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_partition_lag"}, []string{"topic", "partition", "group", "instance"})
 
-	r.MustRegister(applied, skipped, ttr, replayBytes, replayRecords, lag, lastAge, snapTime, snapBytes, txProduced, txAborted, txLatency, txBatchDur, offsetsBoundLag, changelogAppended, partLag)
+	// New EOS counters
+	evApplied := prometheus.NewCounter(prometheus.CounterOpts{Name: "opb_events_applied_total"})
+	evSkipDedup := prometheus.NewCounter(prometheus.CounterOpts{Name: "opb_events_skipped_dedup_total"})
+	evSkipSeq := prometheus.NewCounter(prometheus.CounterOpts{Name: "opb_events_skipped_seq_total"})
+
+	r.MustRegister(applied, skipped, ttr, replayBytes, replayRecords, lag, lastAge, snapTime, snapBytes, txProduced, txAborted, txLatency, txBatchDur, offsetsBoundLag, changelogAppended, partLag, evApplied, evSkipDedup, evSkipSeq)
 	return &Registry{
 		reg:                r,
 		Applied:            applied,
@@ -77,6 +87,9 @@ func NewRegistry() *Registry {
 		OffsetsBoundLag:    offsetsBoundLag,
 		ChangelogAppended:  changelogAppended,
 		PartitionLag:       partLag,
+		EventsApplied:      evApplied,
+		EventsSkippedDedup: evSkipDedup,
+		EventsSkippedSeq:   evSkipSeq,
 	}
 }
 

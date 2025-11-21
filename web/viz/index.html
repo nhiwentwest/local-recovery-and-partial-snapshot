@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Heatmap</title>
+  <link rel="stylesheet" href="/viz/style.css" />
+</head>
+<body>
+  <div class="toolbar">
+    <label>Metric
+      <select id="metric">
+        <option value="total" selected>Total (cumulative)</option>
+        <option value="sumQty">sumQty (per window)</option>
+        <option value="sumAmount">sumAmount (per window)</option>
+      </select>
+    </label>
+    <label>Prefix <input id="prefix" placeholder="A-" /></label>
+    <label>Limit <input id="limit" type="number" min="1" max="2000" value="500" /></label>
+    <label>Window
+      <select id="ws-select">
+        <option value="">current</option>
+      </select>
+    </label>
+    <button id="refresh-ws">Refresh windows</button>
+    <button id="reload">Reload</button>
+  </div>
+  <div id="legend"></div>
+  <div id="grid" class="grid"></div>
+  <script src="/viz/app.js"></script>
+</body>
+</html>
+
+

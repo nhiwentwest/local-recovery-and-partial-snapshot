@@ -7,9 +7,10 @@ import (
 
 // RecordState represents aggregated state per key.
 type RecordState struct {
-	SumAmount int64
-	SumQty    int64
-	LastSeq   int64
+	SumAmount     int64
+	SumQty        int64
+	LastSeq       int64
+	LastUpdatedBy string `json:"-"`
 }
 
 // Store abstracts the state backend.
@@ -23,13 +24,17 @@ type Store interface {
 
 // InMemoryStore is a simple thread-safe map store.
 type InMemoryStore struct {
-	mu   sync.RWMutex
-	data map[string]RecordState
+	mu         sync.RWMutex
+	data       map[string]RecordState
+	instanceID string
 }
 
 func NewInMemoryStore() *InMemoryStore {
 	return &InMemoryStore{data: make(map[string]RecordState)}
 }
+
+// SetInstanceID sets the instance id used for LastUpdatedBy (transient only).
+func (s *InMemoryStore) SetInstanceID(id string) { s.instanceID = id }
 
 // LoadAll replaces the store contents with the provided snapshot (used by restore in Phase 1).
 func (s *InMemoryStore) LoadAll(all map[string]RecordState) {
@@ -55,6 +60,7 @@ func (s *InMemoryStore) Apply(key string, deltaAmount int64, deltaQty int64, seq
 	st.SumAmount += deltaAmount
 	st.SumQty += deltaQty
 	st.LastSeq = seq
+	st.LastUpdatedBy = s.instanceID
 	s.data[key] = st
 	return true, st, nil
 }

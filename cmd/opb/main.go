@@ -489,6 +489,39 @@ func run(cfg Config) error {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"found": false, "key": key})
 		})
+		// Debug endpoint: list all keys for a storeId to understand heatmap aggregation
+		mux.HandleFunc("/api/debug-store-keys", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			q := r.URL.Query()
+			storeID := q.Get("storeId")
+			if storeID == "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "missing storeId param"})
+				return
+			}
+			var keys []map[string]any
+			var totalSumQty int64
+			_ = st.Range(func(key string, rs state.RecordState) error {
+				parts := strings.Split(key, "#")
+				if len(parts) == 3 && parts[0] == storeID {
+					totalSumQty += rs.SumQty
+					keys = append(keys, map[string]any{
+						"key":       key,
+						"productId": parts[1],
+						"ws":        parts[2],
+						"sumQty":    rs.SumQty,
+						"sumAmount": rs.SumAmount,
+						"lastSeq":   rs.LastSeq,
+					})
+				}
+				return nil
+			})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"storeId":    storeID,
+				"keys":       keys,
+				"totalSumQty": totalSumQty,
+				"count":      len(keys),
+			})
+		})
 		fs := http.FileServer(http.Dir("./web/viz"))
 		noCache := func(h http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -800,7 +833,7 @@ func run(cfg Config) error {
 			"enable.auto.commit":            false,
 			"isolation.level":               "read_committed",
 			"auto.offset.reset":             "earliest",
-			"partition.assignment.strategy": "range", // Use range for more predictable rebalancing in demos
+			"partition.assignment.strategy": "cooperative-sticky",
 			"client.id":                     cfg.InstanceID,
 			// NOTE: disable static membership to avoid assigned-0 stalls on quick restarts
 			// "group.instance.id":             cfg.InstanceID,
@@ -809,37 +842,52 @@ func run(cfg Config) error {
 			"max.poll.interval.ms":  300000,
 			"debug":                 "cgrp,consumer,protocol",
 			// High throughput tuning
-			"fetch.min.bytes":           1,        // Đọc ngay, không đợi đủ batch (sửa lỗi test)
-			"fetch.wait.max.ms":         10,       // Giảm từ 25ms
-			"max.partition.fetch.bytes": 8388608,  // 8 MB (tăng từ 2MB)
-			"queued.min.messages":       500000,   // Tăng từ 100K
-			"fetch.max.bytes":           52428800, // 50 MB total fetch
+			"fetch.min.bytes":           1,
+			"fetch.wait.max.ms":         10,
+			"max.partition.fetch.bytes": 8388608,
+			"queued.min.messages":       500000,
+			"fetch.max.bytes":           52428800,
 		})
 		if err != nil {
 			return fmt.Errorf("consumer: %w", err)
 		}
 		defer c.Close()
+		refreshAssignment := func() {
+			ass, err := c.Assignment()
+			if err != nil {
+				return
+			}
+			if len(ass) == 0 {
+				appStatus.SetAssignment(cfg.TopicEnriched, nil)
+				appStatus.SetLagTotal(0)
+				return
+			}
+			parts := make([]int, 0, len(ass))
+			for _, tp := range ass {
+				parts = append(parts, int(tp.Partition))
+			}
+			appStatus.SetAssignment(cfg.TopicEnriched, parts)
+			appStatus.SetLagTotal(0)
+		}
 		rebalanceCb := func(c *ck.Consumer, event ck.Event) error {
 			switch ev := event.(type) {
 			case ck.AssignedPartitions:
 				log.Printf("%% Rebalance: %d partitions assigned", len(ev.Partitions))
 				appStatus.SetRebalanceStatus(fmt.Sprintf("assigned %d", len(ev.Partitions)))
-				c.Assign(ev.Partitions)
-				parts := make([]int, 0, len(ev.Partitions))
-				for _, tp := range ev.Partitions {
-					parts = append(parts, int(tp.Partition))
+				if err := c.IncrementalAssign(ev.Partitions); err != nil {
+					log.Printf("rebalance: incremental assign error: %v", err)
 				}
-				appStatus.SetAssignment(cfg.TopicEnriched, parts)
-				appStatus.SetLagTotal(0)
+				refreshAssignment()
 			case ck.RevokedPartitions:
 				log.Printf("%% Rebalance: %d partitions revoked", len(ev.Partitions))
 				appStatus.SetRebalanceStatus(fmt.Sprintf("revoked %d", len(ev.Partitions)))
-				// For transactional producer, it's important to commit offsets before revoking.
-				// The library handles this if enable.auto.commit=false and commits are done via the consumer.
-				// If not, manual commit might be needed here.
-				c.Unassign()
-				appStatus.SetAssignment(cfg.TopicEnriched, nil)
-				appStatus.SetLagTotal(0)
+				if _, err := c.Commit(); err != nil {
+					log.Printf("rebalance: commit before revoke error: %v", err)
+				}
+				if err := c.IncrementalUnassign(ev.Partitions); err != nil {
+					log.Printf("rebalance: incremental unassign error: %v", err)
+				}
+				refreshAssignment()
 			}
 			return nil
 		}

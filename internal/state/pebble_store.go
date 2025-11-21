@@ -11,7 +11,8 @@ import (
 
 // PebbleStore implements Store using PebbleDB.
 type PebbleStore struct {
-	db *pebble.DB
+	db         *pebble.DB
+	instanceID string
 }
 
 func NewPebbleStore(dir string) (*PebbleStore, error) {
@@ -32,6 +33,9 @@ func NewPebbleStore(dir string) (*PebbleStore, error) {
 	}
 	return &PebbleStore{db: d}, nil
 }
+
+// SetInstanceID sets the instance id used for LastUpdatedBy (transient only).
+func (p *PebbleStore) SetInstanceID(id string) { p.instanceID = id }
 
 func (p *PebbleStore) Close() error { return p.db.Close() }
 
@@ -66,6 +70,8 @@ func (p *PebbleStore) Apply(key string, deltaAmount int64, deltaQty int64, seq i
 	cur.SumAmount += deltaAmount
 	cur.SumQty += deltaQty
 	cur.LastSeq = seq
+	// Set transient field for the returned state (not persisted)
+	cur.LastUpdatedBy = p.instanceID
 	bytes, err := encodePebbleState(cur)
 	if err != nil {
 		return false, RecordState{}, err

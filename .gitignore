@@ -36,3 +36,11 @@ verify_eos
 
 # Ignore .canvas files
 *.canvas
+
+# Top-level built binaries
+/opb
+/opa
+/kadmin
+
+# Recovery snapshots
+snapshots-recovery/**
