@@ -97,6 +97,10 @@ func (a metricsAdapter) TxProduced()               { a.Registry.TxProduced.Inc()
 func (a metricsAdapter) TxLatencySec(v float64)    { a.Registry.TxLatencySec.Observe(v) }
 func (a metricsAdapter) OffsetsBoundLag(v float64) { a.Registry.OffsetsBoundLag.Set(v) }
 
+// Debug logger controlled by OPB_DEBUG env ("1" or "true")
+var opbDebug = func() bool { v := os.Getenv("OPB_DEBUG"); return v == "1" || strings.ToLower(v) == "true" }()
+func dlogf(format string, args ...any) { if opbDebug { log.Printf(format, args...) } }
+
 func main() {
 	cfg := readFlags()
 	if err := run(cfg); err != nil {
@@ -1062,12 +1066,12 @@ func run(cfg Config) error {
 			if strings.HasPrefix(ev.StoreID, "EOS-TEST-") {
 				part := msg.TopicPartition.Partition
 				off := msg.TopicPartition.Offset
-				log.Printf("diag: incoming store=%s product=%s qty=%d ws=%d key=%s part=%d off=%d", ev.StoreID, ev.ProductID, ev.Qty, ws, k, part, off)
+				dlogf("diag: incoming store=%s product=%s qty=%d ws=%d key=%s part=%d off=%d", ev.StoreID, ev.ProductID, ev.Qty, ws, k, part, off)
 			}
 			// In-process idempotency by eventId (orderId#ws) to avoid double-apply in low-load tests
 			eventID := fmt.Sprintf("%s#%d", ev.OrderID, ws)
 			if _, ok := dedupSeen[eventID]; ok {
-				log.Printf("diag: dedup skip eventID=%s key=%s", eventID, k)
+				dlogf("diag: dedup skip eventID=%s key=%s", eventID, k)
 				mreg.EventsSkippedDedup.Inc()
 				appStatus.IncEventsSkippedDedup(1)
 				continue
@@ -1095,11 +1099,11 @@ func run(cfg Config) error {
 						_ = storeTouchP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny}, Key: []byte(k), Value: val}, nil)
 					}
 				}
-				log.Printf("aggregate: applied key=%s seq=%d prevLast=%d", out.Key, seq, prevSt.LastSeq)
+				dlogf("aggregate: applied key=%s seq=%d prevLast=%d", out.Key, seq, prevSt.LastSeq)
 				b, _ := json.Marshal(out)
 				if p != nil {
 					if !batchStarted {
-						log.Printf("tx: begin transaction")
+						dlogf("tx: begin transaction")
 						if err := p.BeginTransaction(); err != nil {
 							return fmt.Errorf("begin tx: %w", err)
 						}

@@ -106,7 +106,7 @@ ensure_topics() {
   create_if_missing "${TOPIC_RAW}" "$ORDERS_PARTITIONS" 1
   create_if_missing "${TOPIC_IN}" "$ENRICHED_PARTITIONS" 1
   create_if_missing "${TOPIC_OUT}" "$OUTPUT_PARTITIONS" 1
-  create_if_missing "${TOPIC_CHANGELOG}" 1 1 "cleanup.policy=compact"
+  create_if_missing "${TOPIC_CHANGELOG}" "$ENRICHED_PARTITIONS" 1 "cleanup.policy=delete,retention.ms=${CHANGELOG_RETENTION_MS:-604800000}"
   create_if_missing "${TOPIC_SNAPSHOTS}" 1 1 "cleanup.policy=compact"
   say "All topics are ready."
 }

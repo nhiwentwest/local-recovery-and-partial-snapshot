@@ -9,6 +9,9 @@ NUM_OPB=${NUM_OPB:-4}
 DATA_PARTITIONS=${DATA_PARTITIONS:-16}
 OPA_HTTP=${OPA_HTTP:-:8088}
 OPB_BASE_PORT=${OPB_BASE_PORT:-8089}
+# TX tuning for OpB
+TX_BATCH_SIZE=${TX_BATCH_SIZE:-20000}
+TX_LINGER_MS=${TX_LINGER_MS:-100}
 
 # Binaries & Logs
 BIN_OPA=./bin/opa
@@ -58,6 +61,7 @@ for ((i=0;i<NUM_OPB;i++)); do
   rm -rf "$state_dir"; mkdir -p "$state_dir"
   nohup "$BIN_OPB" --kafka-bootstrap "$BOOTSTRAP" --input-source kafka --group-id opb-bench \
     --topic-enriched "${PREFIX}.orders.enriched" --state-backend pebble --state-dir "$state_dir" \
+    --changelog-sink kafka --snapshot-interval 0 --tx-batch-size "$TX_BATCH_SIZE" --tx-linger-ms "$TX_LINGER_MS" \
     --instance-id "$inst" --http "$http" > "${LOG_DIR}/opb_${inst}.log" 2>&1 &
 done
 
