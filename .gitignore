@@ -1,9 +1,13 @@
 # Build outputs
 bin/
+/opb
+/opa
+/kadmin
 
 # Runtime state / generated data
 data/
 logs/
+*.log
 
 # Snapshots & changelogs (generated)
 snapshots/
@@ -15,8 +19,9 @@ changelog-recovery/
 
 # Temp artifacts created by scripts (root-level)
 /tmp-*
-tmp-*/
 /tmp-causal*
+tmp-*/
+tmp*/
 *.tmp
 *.tmp.*
 
