@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -13,7 +14,34 @@ import (
 type PebbleStore struct {
 	db         *pebble.DB
 	instanceID string
+	// In-memory set for dirty keys since the last snapshot.
+	// This is simpler than using a separate Pebble key-space for this transient data.
+	dirtyMu sync.Mutex
+	dirty   map[string]struct{}
 }
+
+type pebbleSnapshotView struct {
+	snap *pebble.Snapshot
+}
+
+func (v *pebbleSnapshotView) Range(fn func(key string, st RecordState) error) error {
+	it, _ := v.snap.NewIter(nil)
+	defer it.Close()
+	for it.First(); it.Valid(); it.Next() {
+		k := append([]byte(nil), it.Key()...)
+		vbytes := append([]byte(nil), it.Value()...)
+		st, err := decodePebbleState(vbytes)
+		if err != nil {
+			return err
+		}
+		if err := fn(string(k), st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (v *pebbleSnapshotView) Close() error { return v.snap.Close() }
 
 func NewPebbleStore(dir string) (*PebbleStore, error) {
 	opts := &pebble.Options{
@@ -31,13 +59,19 @@ func NewPebbleStore(dir string) (*PebbleStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pebble open: %w", err)
 	}
-	return &PebbleStore{db: d}, nil
+	return &PebbleStore{db: d, dirty: make(map[string]struct{})}, nil
 }
 
 // SetInstanceID sets the instance id used for LastUpdatedBy (transient only).
 func (p *PebbleStore) SetInstanceID(id string) { p.instanceID = id }
 
 func (p *PebbleStore) Close() error { return p.db.Close() }
+
+// NewSnapshotView creates a consistent read-only snapshot using Pebble's snapshot API.
+func (p *PebbleStore) NewSnapshotView() (SnapshotView, error) {
+	s := p.db.NewSnapshot()
+	return &pebbleSnapshotView{snap: s}, nil
+}
 
 func encodePebbleState(st RecordState) ([]byte, error) { return json.Marshal(st) }
 func decodePebbleState(val []byte) (RecordState, error) {
@@ -80,7 +114,82 @@ func (p *PebbleStore) Apply(key string, deltaAmount int64, deltaQty int64, seq i
 	if err := p.db.Set(k, bytes, pebble.NoSync); err != nil {
 		return false, RecordState{}, err
 	}
+	p.dirtyMu.Lock()
+	p.dirty[key] = struct{}{}
+	p.dirtyMu.Unlock()
 	return true, cur, nil
+}
+
+// ApplyBatch applies a batch of deltas grouped by key using a Pebble write batch.
+func (p *PebbleStore) ApplyBatch(batch []Delta) (int, int, error) {
+	if len(batch) == 0 {
+		return 0, 0, nil
+	}
+	// Group deltas by key to minimize reads/writes
+	groups := make(map[string][]Delta)
+	for _, d := range batch {
+		groups[d.Key] = append(groups[d.Key], d)
+	}
+	wb := p.db.NewBatch()
+	applied, skipped := 0, 0
+	newlyDirty := make([]string, 0, len(groups))
+	for key, ds := range groups {
+		k := []byte(key)
+		// Read current state (if any)
+		var cur RecordState
+		v, closer, err := p.db.Get(k)
+		if err == nil {
+			cur, err = decodePebbleState(v)
+			_ = closer.Close()
+			if err != nil {
+				_ = wb.Close()
+				return applied, skipped, err
+			}
+		} else if err != pebble.ErrNotFound {
+			_ = wb.Close()
+			return applied, skipped, err
+		}
+		// Apply in-order
+		anyApplied := false
+		for _, d := range ds {
+			if d.Seq <= cur.LastSeq {
+				skipped++
+				continue
+			}
+			cur.SumAmount += d.DeltaAmount
+			cur.SumQty += d.DeltaQty
+			cur.LastSeq = d.Seq
+			cur.LastUpdatedBy = p.instanceID // transient
+			applied++
+			anyApplied = true
+		}
+		// Write only if this key had at least one applied
+		if anyApplied {
+			bytes, err := encodePebbleState(cur)
+			if err != nil {
+				_ = wb.Close()
+				return applied, skipped, err
+			}
+			if err := wb.Set(k, bytes, nil); err != nil {
+				_ = wb.Close()
+				return applied, skipped, err
+			}
+			newlyDirty = append(newlyDirty, key)
+		}
+	}
+	if err := wb.Commit(pebble.NoSync); err != nil {
+		_ = wb.Close()
+		return applied, skipped, err
+	}
+	_ = wb.Close()
+	if len(newlyDirty) > 0 {
+		p.dirtyMu.Lock()
+		for _, key := range newlyDirty {
+			p.dirty[key] = struct{}{}
+		}
+		p.dirtyMu.Unlock()
+	}
+	return applied, skipped, nil
 }
 
 func (p *PebbleStore) Get(key string) (RecordState, bool) {
@@ -142,5 +251,39 @@ func (p *PebbleStore) LoadAll(all map[string]RecordState) {
 		}
 		_ = wb.Commit(pebble.NoSync)
 		_ = wb.Close()
+	}
+	p.dirtyMu.Lock()
+	p.dirty = make(map[string]struct{}) // Reset dirty map after loading
+	p.dirtyMu.Unlock()
+}
+
+func (p *PebbleStore) Delete(key string) error {
+	p.dirtyMu.Lock()
+	p.dirty[key] = struct{}{}
+	p.dirtyMu.Unlock()
+	return p.db.Delete([]byte(key), pebble.NoSync)
+}
+
+// GetDirtyKeys returns a slice of keys that have been modified since the last snapshot.
+func (p *PebbleStore) GetDirtyKeys() []string {
+	p.dirtyMu.Lock()
+	defer p.dirtyMu.Unlock()
+	keys := make([]string, 0, len(p.dirty))
+	for k := range p.dirty {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// MarkSnapshotDone clears the dirty key tracking map.
+func (p *PebbleStore) MarkSnapshotDone(keys ...string) {
+	p.dirtyMu.Lock()
+	defer p.dirtyMu.Unlock()
+	if len(keys) == 0 {
+	p.dirty = make(map[string]struct{}) // Reset dirty map
+		return
+	}
+	for _, k := range keys {
+		delete(p.dirty, k)
 	}
 }

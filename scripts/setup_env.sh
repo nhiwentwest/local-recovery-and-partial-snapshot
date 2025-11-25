@@ -68,15 +68,12 @@ sleep 2
 say "Preparing Kafka topics..."
 create_topic p1.orders.enriched 4
 create_topic p1.orders.output 4
-create_topic p1.opb-audit 1
 create_topic p1.opb-snapshots 3 "--config cleanup.policy=compact"
-create_topic p1.opb-changelog 3 "--config cleanup.policy=compact"
-create_topic p1.opb-store-touch 3 "--config cleanup.policy=compact"
+create_topic p1.opb-changelog ${CHLOG_PARTITIONS:-4} "--config cleanup.policy=delete --config retention.ms=${CHANGELOG_RETENTION_MS:-604800000}"
 
 say "Waiting for all topics to be ready..."
 wait_topic_ready p1.orders.enriched
 wait_topic_ready p1.opb-snapshots
 wait_topic_ready p1.opb-changelog
-wait_topic_ready p1.opb-store-touch
 
 say "Environment is clean and ready."

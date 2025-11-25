@@ -12,7 +12,7 @@ func TestZoneIndex_OnAppliedAndSnapshot(t *testing.T) {
 	idx := NewZoneIndex()
 	idx.OnApplied("A", 100, 2, "B1")
 	idx.OnApplied("A", 50, 1, "B2")
-	sa, sq, rel := idx.Snapshot("A", 0)
+	sa, sq, rel := idx.Snapshot("A")
 	if sa != 150 || sq != 3 {
 		t.Fatalf("agg mismatch: sumAmount=%d sumQty=%d", sa, sq)
 	}

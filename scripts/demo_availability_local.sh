@@ -56,7 +56,7 @@ start_instance(){
     --input-source kafka \
     --topic-enriched p1.orders.enriched --output-topic p1.orders.output \
     --changelog-sink both --manifest-sink both \
-    --topic-changelog p1.opb-changelog --topic-snapshots p1.opb-snapshots --topic-store-touch p1.opb-store-touch \
+    --topic-changelog p1.opb-changelog --topic-snapshots p1.opb-snapshots \
     --window-size 60 --tx-batch-size 1000 --tx-linger-ms 100 \
     --session-timeout-ms 6000 --heartbeat-interval-ms 2000 \
     --http :${port} --instance-id "$id" \

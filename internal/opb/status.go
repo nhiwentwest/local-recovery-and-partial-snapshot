@@ -25,6 +25,12 @@ type AppStatus struct {
 	Partitions      []int   `json:"partitions"`
 	LagTotal        float64 `json:"lagTotal"`
 	RebalanceStatus string  `json:"rebalanceStatus,omitempty"`
+	CausalInflight  int     `json:"causalInflight,omitempty"`
+	CausalReplay    int64   `json:"causalReplayTotal,omitempty"`
+	CausalCutID     string  `json:"causalCutId,omitempty"`
+	CausalPhase     string  `json:"causalPhase,omitempty"`
+	CausalMarkers   int     `json:"causalMarkersSeen,omitempty"`
+	CausalMarkersOf int     `json:"causalMarkersTotal,omitempty"`
 }
 
 // StatusManager manages the application status atomically.
@@ -105,6 +111,53 @@ func (s *StatusManager) SetLagTotal(v float64) {
 // SetRebalanceStatus updates the consumer group rebalance status.
 func (s *StatusManager) SetRebalanceStatus(st string) {
 	s.with(func(a AppStatus) AppStatus { a.RebalanceStatus = st; return a })
+}
+
+func (s *StatusManager) SetCausalInflight(v int) {
+	s.with(func(a AppStatus) AppStatus { a.CausalInflight = v; return a })
+}
+
+func (s *StatusManager) AddCausalReplay(n int64) {
+	s.with(func(a AppStatus) AppStatus { a.CausalReplay += n; return a })
+}
+
+func (s *StatusManager) SetCausalReplay(n int64) {
+	s.with(func(a AppStatus) AppStatus { a.CausalReplay = n; return a })
+}
+
+func (s *StatusManager) BeginCausalCut(id string, total int) {
+	s.with(func(a AppStatus) AppStatus {
+		a.CausalCutID = id
+		a.CausalPhase = "tracking"
+		a.CausalMarkersOf = total
+		a.CausalMarkers = 0
+		return a
+	})
+}
+
+func (s *StatusManager) SetCausalPhase(phase string) {
+	s.with(func(a AppStatus) AppStatus { a.CausalPhase = phase; return a })
+}
+
+func (s *StatusManager) SetCausalMarkers(seen int) {
+	s.with(func(a AppStatus) AppStatus {
+		a.CausalMarkers = seen
+		if seen >= a.CausalMarkersOf && a.CausalMarkersOf > 0 {
+			a.CausalMarkers = a.CausalMarkersOf
+		}
+		return a
+	})
+}
+
+func (s *StatusManager) ClearCausalCut() {
+	s.with(func(a AppStatus) AppStatus {
+		a.CausalCutID = ""
+		a.CausalPhase = ""
+		a.CausalMarkers = 0
+		a.CausalMarkersOf = 0
+		a.CausalInflight = 0
+		return a
+	})
 }
 
 func (s *StatusManager) ApplyRestoreHistory(ttrMs int64, snapshotID string, offset, applied, skipped int64) {

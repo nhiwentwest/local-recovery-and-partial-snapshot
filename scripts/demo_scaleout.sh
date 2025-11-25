@@ -80,13 +80,6 @@ if ! wait_for_http "$OPB1_HTTP/healthz" 60 "Waiting for OpB1 to be healthy"; the
 fi
 echo "\nOpB1 OK"
 
-# Ensure store-touch topic exists (compacted)
-if command -v kafka-topics >/dev/null 2>&1; then
-  kafka-topics --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic p1.opb-store-touch --partitions 3 --replication-factor 1 --config cleanup.policy=compact >/dev/null 2>&1 || true
-elif [ -x /opt/homebrew/bin/kafka-topics ]; then
-  /opt/homebrew/bin/kafka-topics --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic p1.opb-store-touch --partitions 3 --replication-factor 1 --config cleanup.policy=compact >/dev/null 2>&1 || true
-fi
-
 say "Starting OpB2 (instance $INSTANCE2_ID) to join group: $GROUP_ID"
 if ! http_ok "$OPB2_HTTP/healthz"; then
   mkdir -p "$STATE2_DIR" ./logs
@@ -97,7 +90,7 @@ if ! http_ok "$OPB2_HTTP/healthz"; then
     --input-source kafka \
     --topic-enriched p1.orders.enriched --output-topic p1.orders.output \
     --changelog-sink both --manifest-sink both \
-    --topic-changelog p1.opb-changelog --topic-snapshots p1.opb-snapshots --topic-store-touch p1.opb-store-touch \
+    --topic-changelog p1.opb-changelog --topic-snapshots p1.opb-snapshots \
     --window-size 60 --tx-batch-size 1000 --tx-linger-ms 100 \
     --http :${OPB2_HTTP##*:} --instance-id "$INSTANCE2_ID" \
     > ./logs/opb2.out 2>&1 &

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,13 +15,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"hpb/internal/changelog"
+	"hpb/internal/kafkautil"
 	"hpb/internal/manifest"
 	"hpb/internal/metrics"
 	"hpb/internal/opb"
+	snapcut "hpb/internal/opb/snapcut"
 	rf "hpb/internal/restorefs"
 	rk "hpb/internal/restorekafka"
 	"hpb/internal/snapshot"
@@ -31,15 +35,16 @@ import (
 
 // Config holds CLI flags for OpB.
 type Config struct {
-	TopicPrefix      string
+	// Multi-input PoC
+	MultiInputTopics string // comma-separated input topics for multi-input runtime (Phase 3.3)
 	GroupID          string
 	WindowSizeSec    int
 	SnapshotInterval int
-	ChangelogOn      bool
 	SnapshotDir      string
+	SnapshotFormat   string
+	SnapshotShards   int
 	StateDir         string
 	StateBackend     string // memory|pebble
-	CrashMode        string // ""|before|mid|after
 	InstanceID       string // for logging/visibility when running multiple replicas
 	// Kafka sinks
 	KafkaBootstrap  string
@@ -50,35 +55,45 @@ type Config struct {
 	TopicChangelog  string
 	TopicSnapshots  string
 	ManifestSource  string // file|kafka
-	// Store-touch topic for cluster-wide store instance visibility (compacted)
-	TopicStoreTouch string
 	// Kafka input for orders.enriched
 	InputSource   string // sample|kafka
 	TopicEnriched string
 	// Output EOS (orders.output)
 	OutputTopic string
-	TopicAudit  string
 	// HTTP
 	HTTPAddr string
-	Once     bool // process exactly one message then exit (for EOS tests)
-	EOSTest  bool // test mode: simulate crash cases without process exit
 	// EOS batching
-	TxBatchSize int
-	TxLingerMs  int
+	TxBatchSize      int
+	TxLingerMs       int
+	InjectorLingerMs int
 	// Consumer group tuning
 	SessionTimeoutMs    int
 	HeartbeatIntervalMs int
 	// Peers for cluster viz (comma-separated HTTP base URLs)
 	PeersCSV string
-	// Viz/cluster cache tuning
-	VizPeerIntervalMs    int
-	VizPeerTimeoutMs     int
-	VizPeerTTLMs         int
-	VizPeerDownBackoffMs int
 	// Restore control
-	RestoreOnStart bool // perform restore at process start (use true on restart)
-	RestoreOnly    bool // perform restore then exit (no consume); useful for staged restart
+	RestoreOnStart          bool // perform restore at process start (use true on restart)
+	RestoreOnly             bool // perform restore then exit (no consume); useful for staged restart
+	RestoreParallelism      int  // parallelism for snapshot restore (0=auto)
+	RestoreValidateChain    bool // validate chain integrity before restore (default true)
+	RestoreSkipMissingDelta bool // skip missing delta files instead of failing (default false)
+	ReplayWorkers           int  // workers for Kafka changelog replay (0=auto)
+	RebalanceImportState    bool // on partition assignment, attempt to import state from a peer (best-effort)
+	// Snapshot compaction policy
+	SnapMaxDeltas  int // after this many deltas -> cut full (<=0 disables delta)
+	SnapMaxDeltaMB int // after delta chain bytes exceed this (MB) -> cut full (0=ignore)
+	// Snapshot retention/GC
+	SnapRetentionCount int // keep last N snapshots (0=disable)
+	SnapRetentionDays  int // keep snapshots newer than N days (0=disable)
+	SnapGCIntervalSec  int // run GC every N seconds (0=disable, default 3600)
 }
+
+const (
+	defaultVizPeerInterval = 500 * time.Millisecond
+	defaultVizPeerTimeout  = 250 * time.Millisecond
+	defaultVizPeerTTL      = 2 * time.Second
+	defaultVizPeerBackoff  = 2 * time.Second
+)
 
 type restoreMetrics struct {
 	SnapshotID          string    `json:"snapshotId"`
@@ -86,7 +101,26 @@ type restoreMetrics struct {
 	Applied             int64     `json:"applied"`
 	Skipped             int64     `json:"skipped"`
 	TTRMs               int64     `json:"ttrMs"`
+	CausalReplayEvents  int64     `json:"causalReplayEvents,omitempty"`
+	InflightEvents      int       `json:"inflightEvents,omitempty"`
+	InflightChannels    int       `json:"inflightChannels,omitempty"`
 	UpdatedAt           time.Time `json:"updatedAt"`
+}
+
+type restorePhaseTimings struct {
+	ManifestMs       int64 `json:"manifestMs,omitempty"`
+	SnapshotTotalMs  int64 `json:"snapshotTotalMs,omitempty"`
+	SnapshotReadMs   int64 `json:"snapshotReadMs,omitempty"`
+	SnapshotDecodeMs int64 `json:"snapshotDecodeMs,omitempty"`
+	SnapshotLoadMs   int64 `json:"snapshotLoadMs,omitempty"`
+	ChangelogMs      int64 `json:"changelogMs,omitempty"`
+	MetricsMs        int64 `json:"metricsMs,omitempty"`
+	TotalMs          int64 `json:"totalMs,omitempty"`
+}
+
+type ingestCommand struct {
+	pause bool
+	done  chan error
 }
 
 // metricsAdapter implements the opb.TxMetrics interface using a metrics.Registry.
@@ -99,7 +133,12 @@ func (a metricsAdapter) OffsetsBoundLag(v float64) { a.Registry.OffsetsBoundLag.
 
 // Debug logger controlled by OPB_DEBUG env ("1" or "true")
 var opbDebug = func() bool { v := os.Getenv("OPB_DEBUG"); return v == "1" || strings.ToLower(v) == "true" }()
-func dlogf(format string, args ...any) { if opbDebug { log.Printf(format, args...) } }
+
+func dlogf(format string, args ...any) {
+	if opbDebug {
+		log.Printf(format, args...)
+	}
+}
 
 func main() {
 	cfg := readFlags()
@@ -110,15 +149,14 @@ func main() {
 
 func readFlags() Config {
 	var cfg Config
-	flag.StringVar(&cfg.TopicPrefix, "topic-prefix", "p1", "topic prefix")
 	flag.StringVar(&cfg.GroupID, "group-id", "opb", "consumer group id")
 	flag.IntVar(&cfg.WindowSizeSec, "window-size", 300, "aggregation window seconds")
 	flag.IntVar(&cfg.SnapshotInterval, "snapshot-interval", 60, "snapshot interval seconds")
-	flag.BoolVar(&cfg.ChangelogOn, "changelog", true, "enable changelog emission")
 	flag.StringVar(&cfg.SnapshotDir, "snapshot-dir", "./snapshots", "snapshot directory")
+	flag.StringVar(&cfg.SnapshotFormat, "snapshot-format", "json", "snapshot format: json|msgpack")
+	flag.IntVar(&cfg.SnapshotShards, "snapshot-shards", 1, "snapshot shards per cut (>=1)")
 	flag.StringVar(&cfg.StateDir, "state-dir", "./data/opb", "state data directory")
 	flag.StringVar(&cfg.StateBackend, "state-backend", "pebble", "state backend: memory|pebble")
-	flag.StringVar(&cfg.CrashMode, "crash", "", "simulate crash: before|mid|after")
 	flag.StringVar(&cfg.InstanceID, "instance-id", "", "instance id for logging (replicas)")
 	flag.StringVar(&cfg.KafkaBootstrap, "kafka-bootstrap", "", "kafka bootstrap servers, e.g. localhost:9092")
 	flag.StringVar(&cfg.ChangelogSink, "changelog-sink", "file", "changelog sink: file|kafka|both")
@@ -128,16 +166,13 @@ func readFlags() Config {
 	flag.StringVar(&cfg.TopicChangelog, "topic-changelog", "p1.opb-changelog", "kafka topic for changelog (compacted)")
 	flag.StringVar(&cfg.TopicSnapshots, "topic-snapshots", "p1.opb-snapshots", "kafka topic for manifest (compacted)")
 	flag.StringVar(&cfg.ManifestSource, "manifest-source", "file", "manifest source for restore: file|kafka")
-	flag.StringVar(&cfg.TopicStoreTouch, "topic-store-touch", "p1.opb-store-touch", "compacted topic for store touch (storeId#instanceId)")
 	flag.StringVar(&cfg.InputSource, "input-source", "sample", "orders.enriched source: sample|kafka")
 	flag.StringVar(&cfg.TopicEnriched, "topic-enriched", "p1.orders.enriched", "kafka topic for orders.enriched input")
 	flag.StringVar(&cfg.OutputTopic, "output-topic", "p1.orders.output", "kafka topic for orders.output")
-	flag.StringVar(&cfg.TopicAudit, "topic-audit", "p1.opb-audit", "audit topic for tx BEGIN/COMMIT/ABORT")
 	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "http listen address for metrics/health")
-	flag.BoolVar(&cfg.Once, "once", false, "process exactly one message then exit (testing)")
-	flag.BoolVar(&cfg.EOSTest, "eos-test-mode", false, "simulate crash cases without process exit (testing)")
 	flag.IntVar(&cfg.TxBatchSize, "tx-batch-size", 1000, "transactional batch size (messages per commit)")
 	flag.IntVar(&cfg.TxLingerMs, "tx-linger-ms", 100, "transactional linger in ms before forcing a commit")
+	flag.IntVar(&cfg.InjectorLingerMs, "injector-linger-ms", 5, "injector producer linger ms")
 	// Peers for cluster viz from flag or env OPB_PEERS
 	flag.StringVar(&cfg.PeersCSV, "peers", os.Getenv("OPB_PEERS"), "peer HTTP base URLs, comma-separated (e.g. http://127.0.0.1:8089,http://127.0.0.1:8090)")
 	flag.IntVar(&cfg.SessionTimeoutMs, "session-timeout-ms", 10000, "consumer session timeout")
@@ -145,16 +180,108 @@ func readFlags() Config {
 	// Restore control: perform restore at process start only when explicitly enabled (use true on restart)
 	flag.BoolVar(&cfg.RestoreOnStart, "restore-on-start", false, "perform restore at process start (use true on restart)")
 	flag.BoolVar(&cfg.RestoreOnly, "restore-only", false, "perform restore then exit (no consume); useful for staged restart")
-	flag.IntVar(&cfg.VizPeerIntervalMs, "viz-peer-interval-ms", 500, "interval ms for peer polling")
-	flag.IntVar(&cfg.VizPeerTimeoutMs, "viz-peer-timeout-ms", 250, "timeout ms for peer status fetch")
-	flag.IntVar(&cfg.VizPeerTTLMs, "viz-peer-ttl-ms", 2000, "ttl ms before marking a peer down in cache")
-	flag.IntVar(&cfg.VizPeerDownBackoffMs, "viz-peer-down-backoff-ms", 2000, "backoff ms when peer is down")
+	flag.IntVar(&cfg.RestoreParallelism, "restore-parallelism", 0, "parallelism for snapshot restore (0=auto)")
+	flag.BoolVar(&cfg.RestoreValidateChain, "restore-validate-chain", true, "validate chain integrity before restore")
+	flag.BoolVar(&cfg.RestoreSkipMissingDelta, "restore-skip-missing-delta", false, "skip missing delta files instead of failing")
+	flag.IntVar(&cfg.ReplayWorkers, "replay-workers", 0, "workers for Kafka changelog replay (0=auto)")
+	flag.BoolVar(&cfg.RebalanceImportState, "rebalance-import-state", false, "on partition assignment, attempt to import state from a peer (best-effort)")
+	flag.IntVar(&cfg.SnapMaxDeltas, "snap-max-deltas", 3, "after this many deltas, force full (<=0 disables)")
+	flag.IntVar(&cfg.SnapMaxDeltaMB, "snap-max-delta-mb", 128, "after delta chain bytes exceed this (MB), force full (0=ignore)")
+	flag.IntVar(&cfg.SnapRetentionCount, "snap-retention-count", 0, "keep last N snapshots (0=disable GC)")
+	flag.IntVar(&cfg.SnapRetentionDays, "snap-retention-days", 0, "keep snapshots newer than N days (0=disable)")
+	flag.IntVar(&cfg.SnapGCIntervalSec, "snap-gc-interval-sec", 3600, "run GC every N seconds (0=disable)")
+	flag.StringVar(&cfg.MultiInputTopics, "multi-input-topics", "", "comma-separated input topics for multi-input runtime (Phase 3.3)")
 	flag.Parse()
 	return cfg
 }
 
 func run(cfg Config) error {
-	log.Printf("starting OpB with prefix=%s window=%ds snapshot-interval=%ds changelog=%v", cfg.TopicPrefix, cfg.WindowSizeSec, cfg.SnapshotInterval, cfg.ChangelogOn)
+	log.Printf("starting OpB with window=%ds snapshot-interval=%ds", cfg.WindowSizeSec, cfg.SnapshotInterval)
+
+	// Phase 3.3: multi-input runtime (partition-level channels)
+	if cfg.MultiInputTopics != "" && cfg.KafkaBootstrap != "" {
+		log.Printf("phase 3.3: running multi-input runtime (topics=%s)", cfg.MultiInputTopics)
+		return runMultiInputRuntime(cfg)
+	}
+
+	snapFormat, err := snapshot.ParseFormat(cfg.SnapshotFormat)
+	if err != nil {
+		return err
+	}
+	if cfg.SnapshotShards < 1 {
+		cfg.SnapshotShards = 1
+	}
+	resolveSnapshotFormat := func(manifestFormat string) snapshot.Format {
+		format := snapFormat
+		if manifestFormat != "" {
+			if parsed, perr := snapshot.ParseFormat(manifestFormat); perr == nil {
+				format = parsed
+			} else {
+				log.Printf("restore: unknown snapshot format %s, defaulting to %s", manifestFormat, format)
+			}
+		}
+		return format
+	}
+	resolveSnapshotShards := func(manifestShards int) int {
+		if manifestShards > 0 {
+			return manifestShards
+		}
+		if cfg.SnapshotShards > 0 {
+			return cfg.SnapshotShards
+		}
+		return 1
+	}
+	readSnapshotManifest := func(snapID string) (manifest.Manifest, error) {
+		if snapID == "" {
+			return manifest.Manifest{}, fmt.Errorf("empty snapshot id")
+		}
+		p := filepath.Join(cfg.SnapshotDir, snapID, "manifest.json")
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return manifest.Manifest{}, err
+		}
+		var m manifest.Manifest
+		if err := json.Unmarshal(b, &m); err != nil {
+			return manifest.Manifest{}, err
+		}
+		return m, nil
+	}
+	snapshotSizeBytes := func(snapshotID string, format snapshot.Format, shards int) float64 {
+		dir := filepath.Join(cfg.SnapshotDir, snapshotID)
+		if shards <= 1 {
+			fp := filepath.Join(dir, format.FileName())
+			if fi, err := os.Stat(fp); err == nil {
+				return float64(fi.Size())
+			}
+			return 0
+		}
+		var total float64
+		for i := 0; i < shards; i++ {
+			fp := filepath.Join(dir, format.FileNameForShard(i, shards))
+			if fi, err := os.Stat(fp); err == nil {
+				total += float64(fi.Size())
+			}
+		}
+		return total
+	}
+	deltaSnapshotSizeBytes := func(snapshotID string, format snapshot.Format, shards int) float64 {
+		dir := filepath.Join(cfg.SnapshotDir, snapshotID)
+		if shards <= 1 {
+			fp := filepath.Join(dir, format.FileNameDelta())
+			if fi, err := os.Stat(fp); err == nil {
+				return float64(fi.Size())
+			}
+			return 0
+		}
+		var total float64
+		for i := 0; i < shards; i++ {
+			fp := filepath.Join(dir, format.FileNameDeltaForShard(i, shards))
+			if fi, err := os.Stat(fp); err == nil {
+				total += float64(fi.Size())
+			}
+		}
+		return total
+	}
 
 	// Init state store
 	var st state.Store
@@ -181,7 +308,7 @@ func run(cfg Config) error {
 	}
 
 	// Init snapshotter and manifest (filesystem by default)
-	snap := snapshot.NewFilesystemSnapshotter(cfg.SnapshotDir)
+	snap := snapshot.NewFilesystemSnapshotter(cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
 	maniFS := manifest.NewFilesystemManifest(cfg.SnapshotDir)
 	var mani manifest.Publisher = maniFS
 	var maniReader rf.Reader = rf.NewFilesystemReader(cfg.SnapshotDir)
@@ -219,49 +346,65 @@ func run(cfg Config) error {
 			clog = changelog.NewMultiWriter(clog, kw)
 		}
 	}
+	changelogKafkaEnabled := cfg.ChangelogSink == "kafka" || cfg.ChangelogSink == "both"
 
 	// Prometheus metrics registry
 	mreg := metrics.NewRegistry()
 	// HTTP for health/metrics on dedicated mux to avoid handler conflicts
 	appStatus := opb.NewStatusManager(cfg.InstanceID, cfg.GroupID, cfg.WindowSizeSec)
 	metricsPath := filepath.Join(cfg.StateDir, "restore-metrics.json")
-	if !cfg.RestoreOnStart {
+	// Admin channels
+	type snapshotCutRequest struct {
+		cutType string
+		prev    *manifest.Manifest
+	}
+	snapshotCutReq := make(chan snapshotCutRequest, 4)
+	ingestCtrl := make(chan ingestCommand)
+	var ingestPaused atomic.Bool
+	var importOnce sync.Once
+	var stateImported atomic.Bool
+	// Barrier cut tracking (non-blocking snapshot)
+	type barrierCut struct {
+		id          string
+		expected    []int32
+		seen        map[int32]bool
+		started     bool // guard to avoid double-trigger
+		cutType     string
+		prev        *manifest.Manifest
+		channels    []string
+		inflight    map[string][]inflightRecord
+		vectorClock opb.VectorClock
+		preView     state.SnapshotView // snapshot view captured at cut-begin (pre-cut)
+	}
+	var (
+		cutMu      sync.Mutex
+		currentCut *barrierCut
+	)
+	ingestControlEnabled := cfg.InputSource == "kafka" && cfg.KafkaBootstrap != ""
 		if rm, err := readRestoreMetrics(metricsPath); err == nil {
 			appStatus.ApplyRestoreHistory(rm.TTRMs, rm.SnapshotID, rm.LastChangelogOffset, rm.Applied, rm.Skipped)
-			log.Printf("restore history: loaded snapshotId=%s applied=%d skipped=%d", rm.SnapshotID, rm.Applied, rm.Skipped)
+		appStatus.SetCausalReplay(rm.CausalReplayEvents)
+		log.Printf("restore history: loaded snapshotId=%s applied=%d skipped=%d causalReplay=%d", rm.SnapshotID, rm.Applied, rm.Skipped, rm.CausalReplayEvents)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("restore history: read error: %v", err)
-		}
 	}
 	zoneIdx := opb.NewZoneIndex()
-	storeTouchIdx := opb.NewStoreTouchIndex()
 	// Shared injection producer and simple rate limiter
 	var injP *ck.Producer
 	var injErr error
-	var storeTouchP *ck.Producer
+	// Admin snapshot-cut helpers
+	var pauseMu sync.Mutex
 	if cfg.KafkaBootstrap != "" {
 		injP, injErr = ck.NewProducer(&ck.ConfigMap{
 			"bootstrap.servers": cfg.KafkaBootstrap,
-			"linger.ms":         5,
+			"linger.ms":         cfg.InjectorLingerMs,
 			"compression.type":  "lz4",
 		})
 		if injErr != nil {
 			log.Printf("inject: producer init error: %v", injErr)
 		}
-		// producer for store-touch (non-transactional)
-		p2, err := ck.NewProducer(&ck.ConfigMap{
-			"bootstrap.servers": cfg.KafkaBootstrap,
-			"linger.ms":         50,
-			"compression.type":  "lz4",
-		})
-		if err == nil {
-			storeTouchP = p2
-		} else {
-			log.Printf("store-touch: producer init error: %v", err)
-		}
 	}
 	injLast := make(map[string]time.Time)
-	lastTouch := make(map[string]time.Time) // key: storeId#instanceId
 
 	go func(addr string) {
 		mux := http.NewServeMux()
@@ -277,6 +420,21 @@ func run(cfg Config) error {
 			m  map[string]*peerEntry
 		}
 		cc := &clusterCache{m: make(map[string]*peerEntry)}
+		sendIngestCmd := func(pause bool) error {
+			cmd := ingestCommand{pause: pause, done: make(chan error, 1)}
+			select {
+			case ingestCtrl <- cmd:
+			case <-time.After(5 * time.Second):
+				return fmt.Errorf("timeout enqueue ingest command")
+			}
+			select {
+			case err := <-cmd.done:
+				return err
+			case <-time.After(10 * time.Second):
+				return fmt.Errorf("timeout waiting ingest ack")
+			}
+		}
+
 		mkSelf := func() string {
 			addr := strings.TrimSpace(cfg.HTTPAddr)
 			if strings.HasPrefix(addr, ":") {
@@ -305,10 +463,10 @@ func run(cfg Config) error {
 			}
 			return urls
 		}
-		vizInt := time.Duration(cfg.VizPeerIntervalMs) * time.Millisecond
-		vizTmo := time.Duration(cfg.VizPeerTimeoutMs) * time.Millisecond
-		vizTTL := time.Duration(cfg.VizPeerTTLMs) * time.Millisecond
-		vizBackoff := time.Duration(cfg.VizPeerDownBackoffMs) * time.Millisecond
+		vizInt := defaultVizPeerInterval
+		vizTmo := defaultVizPeerTimeout
+		vizTTL := defaultVizPeerTTL
+		vizBackoff := defaultVizPeerBackoff
 		// Self updater
 		go func() {
 			t := time.NewTicker(vizInt)
@@ -381,6 +539,276 @@ func run(cfg Config) error {
 			}
 		}()
 		mux.Handle("/metrics", mreg.Handler())
+		// Admin: trigger snapshot cut (best-effort). POST only.
+		mux.HandleFunc("/admin/snapshot-cut", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			q := r.URL.Query()
+			stype := strings.ToLower(strings.TrimSpace(q.Get("type")))
+			if stype == "" {
+				stype = manifest.SnapshotTypeFull
+			}
+			if stype != manifest.SnapshotTypeFull && stype != manifest.SnapshotTypeDelta && stype != "auto" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid type (use full|delta|auto)"})
+				return
+			}
+			var prev *manifest.Manifest
+			resolved := stype
+			// Auto policy: decide between full|delta based on chain length/bytes
+			if stype == "auto" {
+				m, err := maniReader.ReadLatest()
+				if err != nil || m.SnapshotID == "" {
+					resolved = manifest.SnapshotTypeFull
+				} else {
+					// If delta disabled by config
+					if cfg.SnapMaxDeltas <= 0 {
+						resolved = manifest.SnapshotTypeFull
+					} else {
+						// compute delta chain count and bytes from latest backwards
+						deltaCount := 0
+						var deltaBytes float64
+						// The logic should check the chain *ending at* the current latest manifest.
+						// If the latest is already a 'full', the delta count is 0.
+						// If it's a 'delta', we walk backwards to count the chain length.
+						if strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta {
+							cur := m
+							for {
+								deltaCount++
+								cm, e2 := readSnapshotManifest(cur.SnapshotID)
+								if e2 == nil {
+									format := resolveSnapshotFormat(cm.SnapshotFormat)
+									shards := resolveSnapshotShards(cm.SnapshotShards)
+									deltaBytes += deltaSnapshotSizeBytes(cur.SnapshotID, format, shards)
+								}
+								if cur.ParentSnapshotID == "" || strings.ToLower(cur.SnapshotType) != manifest.SnapshotTypeDelta {
+									break
+								}
+								pm, e3 := readSnapshotManifest(cur.ParentSnapshotID)
+								if e3 != nil {
+									break
+								}
+								cur = pm
+							}
+						}
+						// apply thresholds
+						if deltaCount >= cfg.SnapMaxDeltas {
+							resolved = manifest.SnapshotTypeFull
+						} else if cfg.SnapMaxDeltaMB > 0 && (deltaBytes/1024.0/1024.0) >= float64(cfg.SnapMaxDeltaMB) {
+							resolved = manifest.SnapshotTypeFull
+						} else if m.Changelog != nil && len(m.Changelog.Offsets) > 0 && m.Changelog.Topic != "" {
+							resolved = manifest.SnapshotTypeDelta
+							prev = &m
+						} else {
+							resolved = manifest.SnapshotTypeFull
+						}
+					}
+				}
+			}
+			if resolved == manifest.SnapshotTypeDelta && prev == nil {
+				// explicit delta or resolved delta: need prev manifest with offsets
+				m, err := maniReader.ReadLatest()
+				if err != nil || m.SnapshotID == "" || m.Changelog == nil || len(m.Changelog.Offsets) == 0 || m.Changelog.Topic == "" {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": "delta cut requires existing manifest with per-partition offsets"})
+					return
+				}
+				prev = &m
+			}
+			req := snapshotCutRequest{cutType: resolved, prev: prev}
+			select {
+			case snapshotCutReq <- req:
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted", "type": resolved})
+			default:
+				w.WriteHeader(http.StatusTooManyRequests)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "busy"})
+			}
+		})
+
+		// Admin: trigger snapshot GC (best-effort). POST only.
+		gc := snapshot.NewGarbageCollector(cfg.SnapshotDir, cfg.SnapRetentionCount, cfg.SnapRetentionDays, maniReader)
+		mux.HandleFunc("/admin/snapshot-gc", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			deleted, err := gc.Collect()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"deleted": deleted, "count": len(deleted)})
+		})
+
+		// Admin: export full state as NDJSON of {key,state}
+		mux.HandleFunc("/admin/state/export", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			view, err := st.NewSnapshotView()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("{\"error\":\"snapshot view error\"}\n"))
+				return
+			}
+			defer view.Close()
+			bw := bufio.NewWriter(w)
+			type row struct {
+				Key   string            `json:"key"`
+				State state.RecordState `json:"state"`
+			}
+			_ = view.Range(func(k string, rs state.RecordState) error {
+				b, _ := json.Marshal(row{Key: k, State: rs})
+				bw.Write(b)
+				bw.WriteByte('\n')
+				return nil
+			})
+			bw.Flush()
+		})
+
+		mux.HandleFunc("/admin/ingest/pause", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			if !ingestControlEnabled {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "ingest control not available"})
+				return
+			}
+			if ingestPaused.Load() {
+				_ = json.NewEncoder(w).Encode(map[string]any{"paused": true, "status": "already-paused"})
+				return
+			}
+			if err := sendIngestCmd(true); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"paused": true})
+		})
+		mux.HandleFunc("/admin/ingest/resume", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			if !ingestControlEnabled {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "ingest control not available"})
+				return
+			}
+			if !ingestPaused.Load() {
+				_ = json.NewEncoder(w).Encode(map[string]any{"paused": false, "status": "already-running"})
+				return
+			}
+			if err := sendIngestCmd(false); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"paused": false})
+		})
+		// Admin: prune state keys older than a window start threshold.
+		mux.HandleFunc("/admin/prune-state", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			var req struct {
+				StoreID           string `json:"storeId"`
+				ProductID         string `json:"productId"`
+				WindowStartBefore int64  `json:"windowStartBefore"`
+				Limit             int    `json:"limit"`
+				DryRun            bool   `json:"dryRun"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid json"})
+				return
+			}
+			if req.WindowStartBefore <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "windowStartBefore must be >0"})
+				return
+			}
+			limit := req.Limit
+			if limit <= 0 || limit > 50000 {
+				limit = 1000
+			}
+			start := time.Now()
+			var (
+				scanned   int
+				selected  []string
+				sample    []map[string]any
+				errLimit  = errors.New("prune limit reached")
+				matchFunc = func(key string, rs state.RecordState) error {
+					scanned++
+					parts := strings.Split(key, "#")
+					if len(parts) != 3 {
+						return nil
+					}
+					if req.StoreID != "" && parts[0] != req.StoreID {
+						return nil
+					}
+					if req.ProductID != "" && parts[1] != req.ProductID {
+						return nil
+					}
+					ws, err := strconv.ParseInt(parts[2], 10, 64)
+					if err != nil {
+						return nil
+					}
+					if ws >= req.WindowStartBefore {
+						return nil
+					}
+					selected = append(selected, key)
+					if len(sample) < 10 {
+						sample = append(sample, map[string]any{
+							"key":       key,
+							"storeId":   parts[0],
+							"productId": parts[1],
+							"ws":        ws,
+							"sumQty":    rs.SumQty,
+							"sumAmount": rs.SumAmount,
+						})
+					}
+					if len(selected) >= limit {
+						return errLimit
+					}
+					return nil
+				}
+			)
+			if err := st.Range(matchFunc); err != nil && !errors.Is(err, errLimit) {
+				log.Printf("prune-state: range error: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+				return
+			}
+			deleted := 0
+			if !req.DryRun {
+				for _, key := range selected {
+					if err := st.Delete(key); err != nil {
+						log.Printf("prune-state: delete key=%s err=%v", key, err)
+						continue
+					}
+					deleted++
+				}
+			}
+			resp := map[string]any{
+				"storeId":           req.StoreID,
+				"productId":         req.ProductID,
+				"windowStartBefore": req.WindowStartBefore,
+				"limit":             limit,
+				"matched":           len(selected),
+				"deleted":           deleted,
+				"dryRun":            req.DryRun,
+				"scanned":           scanned,
+				"durationMs":        time.Since(start).Milliseconds(),
+				"sample":            sample,
+			}
+			log.Printf("prune-state: store=%s product=%s before=%d dryRun=%v matched=%d deleted=%d scanned=%d", req.StoreID, req.ProductID, req.WindowStartBefore, req.DryRun, len(selected), deleted, scanned)
+			_ = json.NewEncoder(w).Encode(resp)
+		})
 		// Heatmap JSON and static UI
 		mux.Handle("/viz/heatmap", opb.NewHeatmapHandler(st, cfg.WindowSizeSec, cfg.InstanceID))
 		mux.Handle("/api/zone-details", opb.NewZoneDetailsHandler(st, zoneIdx, cfg.WindowSizeSec, cfg.InstanceID, opb.RealClock{}))
@@ -403,72 +831,92 @@ func run(cfg Config) error {
 				return
 			}
 			injLast[ip] = now
-			var req struct {
+			type injectJob struct {
 				StoreID   string `json:"storeId"`
 				ProductID string `json:"productId"`
 				WS        int64  `json:"ws"`
 				Mode      string `json:"mode"`
 				N         int    `json:"n"`
 				Start     int    `json:"start"`
+				Sync      bool   `json:"sync"`
 			}
+			var req []injectJob
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid json"})
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid json, expected array of jobs"})
 				return
 			}
-			if req.StoreID == "" {
-				req.StoreID = "A-"
+
+			if len(req) == 0 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "no-jobs", "jobs": 0, "totalEvents": 0})
+				return
 			}
-			if req.N <= 0 {
-				req.N = 1000
+
+			jobs := make([]injectJob, len(req))
+			totalInjected := 0
+			isSync := false
+			for i, job := range req {
+				if job.N > 50000 {
+					job.N = 50000
+				}
+				jobs[i] = job
+				totalInjected += job.N
+				if job.Sync {
+					isSync = true
+				}
 			}
-			if req.N > 5000 {
-				req.N = 5000
-			}
-			if req.Mode == "" {
-				req.Mode = "new"
-			}
-			// Produce asynchronously
-			rr := req
-			go func() {
+
+			producerFunc := func() {
+				var wg sync.WaitGroup
+				for _, job := range jobs {
+					job := job
+					wg.Add(1)
+					go func(rr injectJob) {
+						defer wg.Done()
 				defer func() { recover() }()
 				for i := 0; i < rr.N; i++ {
 					store := rr.StoreID
 					prod := rr.ProductID
-					// Match NEW generation deterministically so DUP truly replays the same orders
 					if prod == "" {
 						prod = fmt.Sprintf("p%d", (i%100)+1)
 					}
-					// For duplicate mode, reuse the exact same ordId pattern used in NEW
 					idx := i + rr.Start
-					ordID := fmt.Sprintf("ord-%d-%d", rr.WS, idx)
+					ordID := fmt.Sprintf("%s-ord-%d-%d", rr.StoreID, rr.WS, idx)
 					ts := time.Now().Unix()
 					ws := opb.WindowStart(ts, cfg.WindowSizeSec)
 					if rr.WS > 0 {
 						ws = rr.WS
 						ts = rr.WS
 					}
-					price := int64(10000)
-					qty := int64(1)
-					payload := map[string]any{
-						"orderId":   ordID,
-						"productId": prod,
-						"price":     price,
-						"qty":       qty,
-						"storeId":   store,
-						"ts":        ts,
-						"validated": true,
-						"normTs":    ws,
+							payload := opb.OrderEnriched{
+								OrderID:   ordID,
+								ProductID: prod,
+								Price:     10000,
+								Qty:       1,
+								StoreID:   store,
+								TS:        ts,
+								Validated: true,
+								NormTS:    ws,
 					}
 					val, _ := json.Marshal(payload)
 					key := []byte(fmt.Sprintf("%s#%s#%d", store, prod, ws))
-					// Add epoch header so consumer AcceptMessageByEpoch will accept injected messages
 					headers := []ck.Header{{Key: "epoch", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))}}
 					_ = injP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicEnriched, Partition: ck.PartitionAny}, Key: key, Value: val, Headers: headers}, nil)
 				}
+					}(job)
+				}
+				wg.Wait()
 				injP.Flush(15000)
-			}()
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "queued", "n": req.N, "mode": req.Mode, "storeId": req.StoreID})
+			}
+
+			if isSync {
+				producerFunc()
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "jobs": len(req), "totalEvents": totalInjected})
+				return
+			}
+
+			go producerFunc()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "queued", "jobs": len(req), "totalEvents": totalInjected})
 		})
 		// Lightweight exact state JSON endpoint for diagnostics
 		mux.HandleFunc("/api/exact", func(w http.ResponseWriter, r *http.Request) {
@@ -520,10 +968,10 @@ func run(cfg Config) error {
 				return nil
 			})
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"storeId":    storeID,
-				"keys":       keys,
+				"storeId":     storeID,
+				"keys":        keys,
 				"totalSumQty": totalSumQty,
-				"count":      len(keys),
+				"count":       len(keys),
 			})
 		})
 		fs := http.FileServer(http.Dir("./web/viz"))
@@ -653,11 +1101,10 @@ func run(cfg Config) error {
 				fmt.Fprintf(w, "<div style='color:#b00020'>missing id</div></body></html>")
 				return
 			}
-			// Store mode snapshot via index (sums local) + cluster-wide instances from StoreTouchIndex
+			// Store mode snapshot via index (sums local)
 			sumA, sumQ, _ := zoneIdx.Snapshot(id)
-			insts := storeTouchIdx.Instances(id)
 			fmt.Fprintf(w, "<h4>Store mode (aggregates)</h4>")
-			fmt.Fprintf(w, "<pre>{\n  \"storeId\": \"%s\",\n  \"sumAmount\": %d,\n  \"sumQty\": %d,\n  \"instances\": %q\n}</pre>", id, sumA, sumQ, insts)
+			fmt.Fprintf(w, "<pre>{\n  \"storeId\": \"%s\",\n  \"sumAmount\": %d,\n  \"sumQty\": %d\n}</pre>", id, sumA, sumQ)
 			// Exact if pid+ws provided
 			if pid != "" && wsStr != "" {
 				if ws, err := strconv.ParseInt(wsStr, 10, 64); err == nil {
@@ -670,12 +1117,31 @@ func run(cfg Config) error {
 					}
 				}
 			}
-			// Recovery Info (fetched from /status)
-			fmt.Fprintf(w, "<div id='recovery-info' style='margin:12px 0; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef'>")
-			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Recovery Info</div>")
+			// Recovery + Causal + Cluster panels (data from /status and /api/cluster)
+			fmt.Fprintf(w, "<div style='display:flex; flex-wrap:wrap; gap:12px; margin:12px 0'>")
+			// Recovery Summary
+			fmt.Fprintf(w, "<div style='flex:1 1 360px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef'>")
+			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Recovery Summary</div>")
 			fmt.Fprintf(w, "<div class='small' id='rec-body'>loading...</div>")
 			fmt.Fprintf(w, "</div>")
-			fmt.Fprintf(w, "<script>(async function(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();const el=document.getElementById('rec-body');if(!el)return;const ttr=(j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');const snap=(j.restoringSnapshotId||'N/A');const off=(j.lastChangelogOffset!==undefined? j.lastChangelogOffset:'N/A');const ap=(j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');const sk=(j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');el.innerHTML=`<div>ttrMs: <b>${ttr}</b></div><div>snapshotId: <span class='muted'>${snap}</span></div><div>lastChangelogOffset: <span class='muted'>${off}</span></div><div>restore applied/skipped: <span class='muted'>${ap}</span>/<span class='muted'>${sk}</span></div>`;}catch(e){const el=document.getElementById('rec-body');if(el)el.textContent='N/A';}})();</script>")
+			// Live Causal Cut Status (hidden by default)
+			fmt.Fprintf(w, "<div id='causal-cut' style='flex:1 1 360px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef; display:none'>")
+			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Live Causal Cut</div>")
+			fmt.Fprintf(w, "<div class='small' id='causal-body'>no active cut</div>")
+			fmt.Fprintf(w, "</div>")
+			// Cluster Assignment
+			fmt.Fprintf(w, "<div style='flex:1 1 520px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef'>")
+			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Cluster Assignment</div>")
+			fmt.Fprintf(w, "<div class='small' style='margin-bottom:6px'>Instances</div>")
+			fmt.Fprintf(w, "<table style='border-collapse:collapse; width:100%%'><thead><tr><th style='text-align:left;border-bottom:1px solid #2b3152'>Instance</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Status</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Topic</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Partitions</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Lag</th></tr></thead><tbody id='inst-body'></tbody></table>")
+			fmt.Fprintf(w, "<div class='small' style='margin:8px 0 4px'>Partition -> Instance</div>")
+			fmt.Fprintf(w, "<table style='border-collapse:collapse; width:100%%'><thead><tr><th style='text-align:left;border-bottom:1px solid #2b3152'>Partition</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Instance</th></tr></thead><tbody id='assign-body'></tbody></table>")
+			fmt.Fprintf(w, "</div>")
+			fmt.Fprintf(w, "</div>")
+			// Script to populate panels
+			fmt.Fprintf(w, "<script>(async function(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();var el=document.getElementById('rec-body');if(el){var ttr=(j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');var snap=(j.restoringSnapshotId||'N/A');var ap=(j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');var sk=(j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');var cr=(j.causalReplayTotal!==undefined? j.causalReplayTotal:'N/A');el.innerHTML='<div>ttrMs: <b>'+ttr+'</b></div><div>snapshotId: <span class=\"muted\">'+snap+'</span></div><div>restore applied/skipped: <span class=\"muted\">'+ap+'</span>/<span class=\"muted\">'+sk+'</span></div><div>causal replay events: <span class=\"muted\">'+cr+'</span></div>';}"+
+			"var cut=document.getElementById('causal-cut');var body=document.getElementById('causal-body');if(cut&&body){if(j.causalCutId){cut.style.display='block';var id=j.causalCutId;var phase=j.causalPhase||'tracking';var seen=j.causalMarkersSeen||0;var total=j.causalMarkersTotal||0;var infl=j.causalInflight||0;body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { cut.style.display='none'; } }}catch(e){var el=document.getElementById('rec-body');if(el)el.textContent='N/A';}"+
+			"try{const cr=await fetch('/api/cluster',{cache:'no-store'});const c=await cr.json();var inst=document.getElementById('inst-body');if(inst&&Array.isArray(c.instances)){inst.innerHTML='';for(const it of c.instances){const parts=Array.isArray(it.partitions)?it.partitions.join(', '):'';const st=(it.status||'');const row='<tr><td>'+(it.instance||'')+'</td><td>'+st+'</td><td>'+(it.topic||'')+'</td><td>'+parts+'</td><td>'+Math.round(((it.lagTotal||0)*10))/10+'</td></tr>';inst.insertAdjacentHTML('beforeend',row);}}var ab=document.getElementById('assign-body');if(ab&&c.assignment){ab.innerHTML='';const keys=Object.keys(c.assignment);keys.sort((a,b)=>parseInt(a,10)-parseInt(b,10));for(const k of keys){const row='<tr><td>'+k+'</td><td>'+c.assignment[k]+'</td></tr>';ab.insertAdjacentHTML('beforeend',row);}}}catch(e){}})();</script>")
 			fmt.Fprintf(w, "<hr/><div><a href='/viz/'>Back to heatmap</a></div>")
 			fmt.Fprintf(w, "</body></html>")
 		})
@@ -698,21 +1164,43 @@ func run(cfg Config) error {
 		_ = http.ListenAndServe(addr, mux)
 	}(cfg.HTTPAddr)
 
+	// Start GC worker if enabled
+	if cfg.SnapGCIntervalSec > 0 && (cfg.SnapRetentionCount > 0 || cfg.SnapRetentionDays > 0) {
+		gc := snapshot.NewGarbageCollector(cfg.SnapshotDir, cfg.SnapRetentionCount, cfg.SnapRetentionDays, maniReader)
+		go func() {
+			ticker := time.NewTicker(time.Duration(cfg.SnapGCIntervalSec) * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				deleted, err := gc.Collect()
+				if err != nil {
+					log.Printf("gc: error: %v", err)
+				} else if len(deleted) > 0 {
+					log.Printf("gc: deleted %d snapshots: %v", len(deleted), deleted)
+				}
+			}
+		}()
+	}
+
 	// Perform recovery (restore snapshot + replay changelog) before starting Kafka consume loop
 	// Only when explicitly enabled via --restore-on-start to avoid delaying first start
-	if cfg.RestoreOnStart {
+	var phaseTimings restorePhaseTimings
+	if cfg.RestoreOnStart && !stateImported.Load() {
 		restoreTsStart := time.Now()
 		log.Printf("restore: starting (source=%s, changelogSource=%s, topicSnapshots=%s) at %s", cfg.ManifestSource, cfg.ChangelogSource, cfg.TopicSnapshots, restoreTsStart.Format(time.RFC3339Nano))
 		// Read latest manifest with internal reader timeout (no long outer loop)
+		manifestStart := time.Now()
 		var m manifest.Manifest
 		m, mErr := maniReader.ReadLatest()
+		phaseTimings.ManifestMs = time.Since(manifestStart).Milliseconds()
 		if mErr != nil || m.SnapshotID == "" {
 			// Fallback: try filesystem manifest reader if kafka source fails and FS snapshot exists
 			if cfg.SnapshotDir != "" {
+				manifestStart = time.Now()
 				if m2, e2 := rf.NewFilesystemReader(cfg.SnapshotDir).ReadLatest(); e2 == nil && m2.SnapshotID != "" {
 					log.Printf("restore: fallback FS manifest loaded snapshotId=%s lastChangelogOffset=%d", m2.SnapshotID, m2.LastChangelogOffset)
 					m, mErr = m2, nil
 				}
+				phaseTimings.ManifestMs += time.Since(manifestStart).Milliseconds()
 			}
 		}
 		if mErr != nil || m.SnapshotID == "" {
@@ -721,36 +1209,131 @@ func run(cfg Config) error {
 			log.Printf("restore: manifest loaded snapshotId=%s lastChangelogOffset=%d", m.SnapshotID, m.LastChangelogOffset)
 			appStatus.SetRecovering(m.SnapshotID, m.LastChangelogOffset)
 			t0 := time.Now()
-			restorer := rf.NewRestorer(st, snap, maniReader, cfg.SnapshotDir)
-			// Always restore snapshot before replaying changelog
-			if e := restorer.RestoreFromSnapshot(m.SnapshotID); e != nil {
-				log.Printf("restore snapshot error: %v", e)
+			restorer := rf.NewRestorerWithOptions(st, snap, maniReader, cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
+			restoreFormat := resolveSnapshotFormat(m.SnapshotFormat)
+			restoreShards := resolveSnapshotShards(m.SnapshotShards)
+			// Always restore snapshot before replaying changelog (supports chain)
+			snapshotStart := time.Now()
+			var restoreErr error
+			if strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta {
+				restoreErr = restorer.RestoreChainFromLatestWithOptions(m, rf.RestoreOptions{Parallelism: cfg.RestoreParallelism, SkipMissingDelta: cfg.RestoreSkipMissingDelta, ValidateChain: cfg.RestoreValidateChain})
 			} else {
-				log.Printf("restore: snapshot restored snapshotId=%s", m.SnapshotID)
+				restoreErr = restorer.RestoreFromSnapshotWithFormatParallel(m.SnapshotID, restoreFormat, restoreShards, m.SnapshotKeys, cfg.RestoreParallelism)
+			}
+			if restoreErr != nil {
+				log.Printf("restore snapshot error: %v", restoreErr)
+				if cfg.RestoreOnly {
+					return fmt.Errorf("restore failed: %w", restoreErr)
+				}
+			} else {
+				phaseTimings.SnapshotTotalMs = time.Since(snapshotStart).Milliseconds()
+				if stats := restorer.LastSnapshotStats(); stats.Shards >= 0 {
+					phaseTimings.SnapshotReadMs = stats.ReadNs / int64(time.Millisecond)
+					phaseTimings.SnapshotDecodeMs = stats.DecodeNs / int64(time.Millisecond)
+					phaseTimings.SnapshotLoadMs = stats.LoadNs / int64(time.Millisecond)
+				}
+				log.Printf("restore: snapshot restored snapshotId=%s type=%s base=%s dseq=%d", m.SnapshotID, m.SnapshotType, m.BaseSnapshotID, m.DeltaSequence)
+				var causalReplayEvents int64
+				var inflightEventCount int
+				var inflightChannelCount int
+				if m.InflightFile != "" {
+					if snap, ierr := readInflightSnapshot(cfg.SnapshotDir, m.SnapshotID, m.InflightFile); ierr != nil {
+						log.Printf("restore: inflight read error: %v", ierr)
+					} else if err := replayInflightEvents(cfg, st, snap); err != nil {
+						log.Printf("restore: inflight replay error: %v", err)
+					} else if snap.Events != nil && len(snap.Events) > 0 {
+						var replayTotal int
+						for _, evs := range snap.Events {
+							replayTotal += len(evs)
+						}
+						mreg.CausalReplay.Add(float64(replayTotal))
+						appStatus.AddCausalReplay(int64(replayTotal))
+						causalReplayEvents = int64(replayTotal)
+						inflightEventCount = replayTotal
+						if snap.Events != nil {
+							inflightChannelCount = len(snap.Events)
+						} else if snap.Channels != nil {
+							inflightChannelCount = len(snap.Channels)
+						}
+						log.Printf("restore: inflight replay applied channels=%d events=%d", len(snap.Events), replayTotal)
+					}
+				}
 				var result rf.RestoreResult
+				var changelogStart time.Time
 				if cfg.ChangelogSource == "kafka" && cfg.KafkaBootstrap != "" {
-					result = rk.ReplayChangelogKafka(st, []string{cfg.KafkaBootstrap}, cfg.TopicChangelog, m.LastChangelogOffset)
+					var skipKafkaReplay bool
+					if m.Changelog != nil && m.Changelog.Topic != "" && len(m.Changelog.Offsets) > 0 {
+						if hasBacklog, err := kafkautil.ChangelogHasBacklog(cfg.KafkaBootstrap, m.Changelog.Topic, m.Changelog.Offsets); err != nil {
+							log.Printf("restore: changelog backlog check error: %v", err)
+						} else if !hasBacklog {
+							skipKafkaReplay = true
+							log.Printf("restore: skipping changelog replay (no backlog beyond manifest offsets)")
+						}
+					}
+					if !skipKafkaReplay {
+						changelogStart = time.Now()
+						if m.Changelog != nil && m.Changelog.Topic != "" && len(m.Changelog.Offsets) > 0 {
+							result = rk.ReplayChangelogKafkaParallel(st, []string{cfg.KafkaBootstrap}, m.Changelog.Topic, m.Changelog.Offsets, 0, cfg.ReplayWorkers)
+						} else {
+							result = rk.ReplayChangelogKafkaParallel(st, []string{cfg.KafkaBootstrap}, cfg.TopicChangelog, nil, m.LastChangelogOffset, cfg.ReplayWorkers)
+						}
+					}
 				} else {
 					// file mode
+					changelogStart = time.Now()
 					result = restorer.ReplayChangelog(fmt.Sprintf("%s/opb.jsonl", cfg.ChangelogDir), m.LastChangelogOffset)
+				}
+				if !changelogStart.IsZero() {
+					phaseTimings.ChangelogMs = time.Since(changelogStart).Milliseconds()
 				}
 				if result.Error != nil {
 					log.Printf("restore replay error: %v", result.Error)
+					if cfg.RestoreOnly {
+						return fmt.Errorf("replay failed: %w", result.Error)
+					}
 				} else {
 					elapsed := time.Since(t0)
 					appStatus.SetRecovered(elapsed, int64(result.Applied), int64(result.Skipped))
 					restoreTsDone := time.Now()
 					log.Printf("restore completed: applied=%d skipped=%d elapsedMs=%.0f finishedAt=%s", result.Applied, result.Skipped, elapsed.Seconds()*1000, restoreTsDone.Format(time.RFC3339Nano))
 					log.Printf("restore ts: start=%s done=%s", restoreTsStart.Format(time.RFC3339Nano), restoreTsDone.Format(time.RFC3339Nano))
-					if err := writeRestoreMetrics(metricsPath, restoreMetrics{
+					metricsStart := time.Now()
+					newMetrics := restoreMetrics{
 						SnapshotID:          m.SnapshotID,
 						LastChangelogOffset: m.LastChangelogOffset,
 						Applied:             int64(result.Applied),
 						Skipped:             int64(result.Skipped),
 						TTRMs:               time.Since(t0).Milliseconds(),
+						CausalReplayEvents:  causalReplayEvents,
+						InflightEvents:      inflightEventCount,
+						InflightChannels:    inflightChannelCount,
 						UpdatedAt:           time.Now().UTC(),
-					}); err != nil {
+					}
+
+					shouldWrite := true
+					if prevMetrics, err := readRestoreMetrics(metricsPath); err == nil {
+						if prevMetrics.SnapshotID == newMetrics.SnapshotID &&
+							prevMetrics.Applied == newMetrics.Applied &&
+							prevMetrics.Skipped == newMetrics.Skipped &&
+							prevMetrics.CausalReplayEvents == newMetrics.CausalReplayEvents {
+							shouldWrite = false
+						}
+					}
+					if shouldWrite {
+						if err := writeRestoreMetrics(metricsPath, newMetrics); err != nil {
 						log.Printf("restore history: write error: %v", err)
+						}
+					}
+					phaseTimings.MetricsMs = time.Since(metricsStart).Milliseconds()
+					phaseTimings.TotalMs = time.Since(restoreTsStart).Milliseconds()
+					if phaseTimings.TotalMs > 0 {
+						line := map[string]any{
+							"phase":   "restore-phases",
+							"timings": phaseTimings,
+						}
+						if b, err := json.Marshal(line); err == nil {
+							log.Printf("restore phases: %s", b)
+						}
 					}
 					if cfg.RestoreOnly {
 						log.Printf("restore-only: exiting after successful restore")
@@ -763,45 +1346,6 @@ func run(cfg Config) error {
 		log.Printf("restore: skipped at start (restore-on-start=false)")
 	}
 
-	// Background consumer for store-touch compacted topic to build cluster-wide instances index
-	if cfg.KafkaBootstrap != "" && cfg.TopicStoreTouch != "" {
-		go func() {
-			cst, err := ck.NewConsumer(&ck.ConfigMap{
-				"bootstrap.servers":  cfg.KafkaBootstrap,
-				"group.id":           fmt.Sprintf("opb-storeviz-%s", cfg.InstanceID),
-				"enable.auto.commit": true,
-				"auto.offset.reset":  "earliest",
-				"isolation.level":    "read_committed",
-				"session.timeout.ms": 10000,
-			})
-			if err != nil {
-				log.Printf("store-touch: consumer error: %v", err)
-				return
-			}
-			defer cst.Close()
-			if err := cst.SubscribeTopics([]string{cfg.TopicStoreTouch}, nil); err != nil {
-				log.Printf("store-touch: subscribe error: %v", err)
-				return
-			}
-			for {
-				msg, err := cst.ReadMessage(2 * time.Second)
-				if err != nil { // timeout
-					continue
-				}
-				if msg == nil || len(msg.Key) == 0 {
-					continue
-				}
-				// key format: storeId#instanceId
-				parts := strings.SplitN(string(msg.Key), "#", 2)
-				if len(parts) != 2 {
-					continue
-				}
-				storeID, instID := parts[0], parts[1]
-				storeTouchIdx.Add(storeID, instID)
-			}
-		}()
-	}
-
 	if cfg.InputSource == "kafka" && cfg.KafkaBootstrap != "" {
 		// Start periodic snapshot + manifest publisher in background (Kafka mode)
 		if cfg.SnapshotInterval > 0 {
@@ -810,28 +1354,154 @@ func run(cfg Config) error {
 				defer ticker.Stop()
 				for range ticker.C {
 					id := time.Now().UTC().Format(time.RFC3339)
+					// Collect current changelog offsets first (needed for delta dirty-keys window)
+					var offInfo *manifest.OffsetsInfo
+					if cfg.KafkaBootstrap != "" && cfg.TopicChangelog != "" {
+						if offs, parts, err := kafkautil.CollectChangelogOffsets(cfg.KafkaBootstrap, cfg.TopicChangelog); err == nil {
+							offInfo = &manifest.OffsetsInfo{Topic: cfg.TopicChangelog, Partitions: parts, Offsets: offs}
+						} else {
+							log.Printf("manifest: collect offsets error: %v", err)
+						}
+					}
+					// Decide full vs delta (auto policy using thresholds and manifest chain)
+					cutType := manifest.SnapshotTypeFull
+					var prev *manifest.Manifest
+					if cfg.SnapMaxDeltas > 0 {
+						if m, err := maniReader.ReadLatest(); err == nil && m.SnapshotID != "" {
+							// compute delta chain length and bytes
+							deltaCount := 0
+							var deltaBytes float64
+							if strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta {
+								cur := m
+								for {
+									deltaCount++
+									cm, e2 := readSnapshotManifest(cur.SnapshotID)
+									if e2 == nil {
+										format := resolveSnapshotFormat(cm.SnapshotFormat)
+										shards := resolveSnapshotShards(cm.SnapshotShards)
+										deltaBytes += deltaSnapshotSizeBytes(cur.SnapshotID, format, shards)
+									}
+									if cur.ParentSnapshotID == "" || strings.ToLower(cur.SnapshotType) != manifest.SnapshotTypeDelta {
+										break
+									}
+									pm, e3 := readSnapshotManifest(cur.ParentSnapshotID)
+									if e3 != nil {
+										break
+									}
+									cur = pm
+								}
+							}
+							if deltaCount < cfg.SnapMaxDeltas && (cfg.SnapMaxDeltaMB <= 0 || (deltaBytes/1024.0/1024.0) < float64(cfg.SnapMaxDeltaMB)) && offInfo != nil && m.Changelog != nil && len(m.Changelog.Offsets) > 0 && m.Changelog.Topic != "" {
+								cutType = manifest.SnapshotTypeDelta
+								prev = &m
+							}
+						}
+					}
 					t0 := time.Now()
-					if err := snap.WriteSnapshot(id, st); err != nil {
-						log.Printf("snapshot error: %v", err)
+					var meta snapshot.Result
+					var serr error
+					mtype := manifest.SnapshotTypeFull
+					var baseID, parentID string
+					var dseq int
+					var deltaKeys []string
+					doDelta := cutType == manifest.SnapshotTypeDelta && prev != nil && offInfo != nil
+					if doDelta {
+						// Determine base/parent and delta sequence
+						if strings.ToLower(prev.SnapshotType) == manifest.SnapshotTypeDelta && prev.BaseSnapshotID != "" {
+							baseID = prev.BaseSnapshotID
+							dseq = prev.DeltaSequence + 1
+						} else {
+							baseID = prev.SnapshotID
+							dseq = 1
+						}
+						parentID = prev.SnapshotID
+						// Delta: snapshot only dirty keys between prev and current offsets
+						view, verr := st.NewSnapshotView()
+						if verr != nil {
+							log.Printf("snapshot view error: %v", verr)
+							doDelta = false
+						} else {
+							keys, kerr := kafkautil.ScanDirtyKeysKafka([]string{cfg.KafkaBootstrap}, prev.Changelog.Topic, prev.Changelog.Offsets, offInfo.Offsets, 0, 1500*time.Millisecond)
+							if kerr != nil {
+								_ = view.Close()
+								log.Printf("delta dirty-keys scan error: %v", kerr)
+								doDelta = false
+							} else {
+								deltaKeys = keys
+								meta, serr = snap.WriteDeltaSnapshotFromView(id, view, keys)
+								_ = view.Close()
+								if serr != nil {
+									log.Printf("snapshot error: %v", serr)
+									doDelta = false
+								}
+							}
+						}
+					}
+					if doDelta {
+						mtype = manifest.SnapshotTypeDelta
+					} else {
+						meta, serr = snap.WriteSnapshot(id, st)
+						mtype = manifest.SnapshotTypeFull
+						baseID = ""
+						parentID = ""
+						dseq = 0
+					}
+					if serr != nil {
 						continue
 					}
 					durMs := float64(time.Since(t0).Milliseconds())
 					mreg.SnapshotTimeMs.Observe(durMs)
-					// read snapshot bytes
-					fp := fmt.Sprintf("%s/%s/state.json", cfg.SnapshotDir, id)
-					if fi, err := os.Stat(fp); err == nil {
-						mreg.SnapshotBytes.Set(float64(fi.Size()))
+					// Metrics: set SnapshotBytes based on type
+					var bytes float64
+					if mtype == manifest.SnapshotTypeDelta {
+						bytes = deltaSnapshotSizeBytes(id, meta.Format, meta.Shards)
+						log.Printf("periodic-cut: delta-metrics id=%s keys=%d bytes=%.0f durMs=%.0f", id, meta.Keys, bytes, durMs)
+					} else {
+						bytes = snapshotSizeBytes(id, meta.Format, meta.Shards)
 					}
-					if err := mani.PublishLatest(id, changelogAppendedCount); err != nil {
-						log.Printf("manifest publish error: %v", err)
-						continue
+					mreg.SnapshotBytes.Set(bytes)
+					// Build and publish manifest
+					m := manifest.Manifest{
+						SnapshotID:           id,
+						SnapshotFormat:       meta.Format.String(),
+						SnapshotShards:       meta.Shards,
+						SnapshotKeys:         meta.Keys,
+						SnapshotType:         mtype,
+						BaseSnapshotID:       baseID,
+						ParentSnapshotID:     parentID,
+						DeltaSequence:        dseq,
+						LastChangelogOffset:  changelogAppendedCount,
+						CreatedAtEpochSecond: time.Now().UTC().Unix(),
+						Changelog:            offInfo,
 					}
-					log.Printf("snapshot and manifest published: %s (offset=%d)", id, changelogAppendedCount)
+					if fp, ok := mani.(manifest.FullPublisher); ok {
+						if err := fp.Publish(m); err != nil {
+							log.Printf("manifest publish error: %v", err)
+							continue
+						}
+					} else {
+						if err := mani.PublishLatest(id, changelogAppendedCount); err != nil {
+							log.Printf("manifest publish error: %v", err)
+							continue
+						}
+					}
+					// Reset dirty keys after successful snapshot publish
+					if mtype == manifest.SnapshotTypeDelta && len(deltaKeys) > 0 {
+						switch v := st.(type) {
+						case *state.InMemoryStore:
+							v.MarkSnapshotDone(deltaKeys...)
+						case *state.PebbleStore:
+							v.MarkSnapshotDone(deltaKeys...)
+						default:
+							st.MarkSnapshotDone(deltaKeys...)
+						}
+					}
+					log.Printf("snapshot and manifest published: %s type=%s (offset=%d)", id, mtype, changelogAppendedCount)
 				}
 			}()
 		}
 		// Consume orders.enriched from Kafka
-		c, err := ck.NewConsumer(&ck.ConfigMap{
+		cfgMap := &ck.ConfigMap{
 			"bootstrap.servers":             cfg.KafkaBootstrap,
 			"group.id":                      cfg.GroupID,
 			"enable.auto.commit":            false,
@@ -844,14 +1514,70 @@ func run(cfg Config) error {
 			"session.timeout.ms":    cfg.SessionTimeoutMs,
 			"heartbeat.interval.ms": cfg.HeartbeatIntervalMs,
 			"max.poll.interval.ms":  300000,
-			"debug":                 "cgrp,consumer,protocol",
 			// High throughput tuning
 			"fetch.min.bytes":           1,
 			"fetch.wait.max.ms":         10,
 			"max.partition.fetch.bytes": 8388608,
 			"queued.min.messages":       500000,
 			"fetch.max.bytes":           52428800,
-		})
+		}
+		if opbDebug {
+			_ = cfgMap.SetKey("debug", "cgrp,consumer,protocol")
+		}
+		c, err := ck.NewConsumer(cfgMap)
+		// Admin snapshot-cut worker using barrier injection (non-blocking)
+		go func() {
+			for req := range snapshotCutReq {
+				if injP == nil {
+					log.Printf("snapshot-cut: injector unavailable; cannot inject barrier")
+					continue
+				}
+				ass, _ := c.Assignment()
+				if len(ass) == 0 {
+					log.Printf("snapshot-cut: no assignment; cannot inject barrier")
+					continue
+				}
+				parts := make([]int32, 0, len(ass))
+				for _, tp := range ass {
+					parts = append(parts, tp.Partition)
+				}
+				id := fmt.Sprintf("cut-%d", time.Now().UnixNano())
+				channels := make([]string, 0, len(parts))
+				for _, pnum := range parts {
+					channels = append(channels, fmt.Sprintf("%s#%d", cfg.TopicEnriched, pnum))
+				}
+				// Capture pre-cut snapshot view before enabling inflight recording
+				view, vErr := st.NewSnapshotView()
+				if vErr != nil {
+					log.Printf("snapshot-cut: snapshot view error: %v", vErr)
+				}
+				cutMu.Lock()
+				currentCut = &barrierCut{
+					id:       id,
+					expected: parts,
+					seen:     map[int32]bool{},
+					cutType:  req.cutType,
+					prev:     req.prev,
+					channels: channels,
+				}
+				cutMu.Unlock()
+				appStatus.BeginCausalCut(id, len(parts))
+				// attach pre-cut snapshot view
+				cutMu.Lock()
+				if currentCut != nil {
+					currentCut.preView = view
+				}
+				cutMu.Unlock()
+				for _, pnum := range parts {
+					hdrs := opb.BarrierHeaders(id)
+					tp := ck.TopicPartition{Topic: &cfg.TopicEnriched, Partition: pnum}
+					_ = injP.Produce(&ck.Message{TopicPartition: tp, Key: []byte("barrier"), Value: nil, Headers: hdrs}, nil)
+				}
+				injP.Flush(5000)
+				appStatus.SetCausalPhase("marker-propagation")
+				log.Printf("snapshot-cut: barrier injected id=%s parts=%v type=%s", id, parts, req.cutType)
+			}
+		}()
 		if err != nil {
 			return fmt.Errorf("consumer: %w", err)
 		}
@@ -882,6 +1608,96 @@ func run(cfg Config) error {
 					log.Printf("rebalance: incremental assign error: %v", err)
 				}
 				refreshAssignment()
+				// Best-effort state import from a peer when enabled
+				if cfg.RebalanceImportState && cfg.PeersCSV != "" {
+					importOnce.Do(func() {
+						go func() {
+							// helper to send ingest command and wait ack
+							sendIngestCmd := func(pause bool) error {
+								cmd := ingestCommand{pause: pause, done: make(chan error, 1)}
+								select {
+								case ingestCtrl <- cmd:
+									// ok
+								case <-time.After(5 * time.Second):
+									return fmt.Errorf("timeout enqueue ingest command")
+								}
+								select {
+								case err := <-cmd.done:
+									return err
+								case <-time.After(10 * time.Second):
+									return fmt.Errorf("timeout waiting ingest ack")
+								}
+							}
+							// derive self url
+							mkSelf := func() string {
+								addr := strings.TrimSpace(cfg.HTTPAddr)
+								if strings.HasPrefix(addr, ":") {
+									return "http://127.0.0.1" + addr
+								}
+								if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+									return addr
+								}
+								return "http://" + addr
+							}
+							self := mkSelf()
+							var peer string
+							for _, p := range strings.Split(cfg.PeersCSV, ",") {
+								p = strings.TrimSpace(p)
+								if p == "" || p == self {
+									continue
+								}
+								peer = p
+								break
+							}
+							if peer == "" {
+								return
+							}
+							// pause ingestion
+							if err := sendIngestCmd(true); err != nil {
+								log.Printf("import: pause error: %v", err)
+								return
+							}
+							defer func() {
+								if err := sendIngestCmd(false); err != nil {
+									log.Printf("import: resume error: %v", err)
+								}
+							}()
+							// fetch NDJSON
+							cli := &http.Client{Timeout: 15 * time.Second}
+							resp, err := cli.Get(strings.TrimRight(peer, "/") + "/admin/state/export")
+							if err != nil {
+								log.Printf("import: fetch from %s error: %v", peer, err)
+								return
+							}
+							defer resp.Body.Close()
+							scanner := bufio.NewScanner(resp.Body)
+							buf := make(map[string]state.RecordState)
+							for scanner.Scan() {
+								line := scanner.Bytes()
+								var row struct {
+									Key   string            `json:"key"`
+									State state.RecordState `json:"state"`
+								}
+								if err := json.Unmarshal(line, &row); err == nil && row.Key != "" {
+									buf[row.Key] = row.State
+								}
+							}
+							if err := scanner.Err(); err != nil {
+								log.Printf("import: scanner error: %v", err)
+								return
+							}
+							if len(buf) == 0 {
+								log.Printf("import: no data from %s", peer)
+								return
+							}
+							// load snapshot into store
+							log.Printf("import: preparing to load %d keys into state store...", len(buf))
+							st.LoadAll(buf)
+							stateImported.Store(true)
+							log.Printf("import: finished loading %d keys from %s", len(buf), peer)
+						}()
+					})
+				}
 			case ck.RevokedPartitions:
 				log.Printf("%% Rebalance: %d partitions revoked", len(ev.Partitions))
 				appStatus.SetRebalanceStatus(fmt.Sprintf("revoked %d", len(ev.Partitions)))
@@ -948,9 +1764,13 @@ func run(cfg Config) error {
 		}()
 		// Always create transactional producer (EOS by default) when consuming from Kafka
 		var p opb.TxProducer
-		var auditP *ck.Producer
 		// fencing epoch token per-process
 		epoch := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+		// vector clock operator id (use instance id when provided)
+		operatorID := cfg.InstanceID
+		if operatorID == "" {
+			operatorID = "opb"
+		}
 		// derive transactional.id: stable across restarts if instance id is provided; else fallback to timestamp
 		txID := cfg.InstanceID
 		if txID == "" {
@@ -958,7 +1778,7 @@ func run(cfg Config) error {
 		} else {
 			txID = fmt.Sprintf("opb-%s-%s", cfg.GroupID, cfg.InstanceID)
 		}
-		prod, err := ck.NewProducer(&ck.ConfigMap{
+		pCfg := &ck.ConfigMap{
 			"bootstrap.servers":  cfg.KafkaBootstrap,
 			"enable.idempotence": true,
 			"acks":               "all",
@@ -977,8 +1797,11 @@ func run(cfg Config) error {
 			"transaction.timeout.ms": 600000,     // 10 min transaction timeout
 			"retries":                2147483647, // Max retries
 			"retry.backoff.ms":       100,        // Fast retry
-			"debug":                  "eos,broker,protocol",
-		})
+		}
+		if opbDebug {
+			_ = pCfg.SetKey("debug", "eos,broker,protocol")
+		}
+		prod, err := ck.NewProducer(pCfg)
 		if err != nil {
 			return fmt.Errorf("producer: %w", err)
 		}
@@ -987,12 +1810,6 @@ func run(cfg Config) error {
 		}
 		p = prod // as interface
 		defer p.Close()
-		// audit producer (non-transactional)
-		ap, err := ck.NewProducer(&ck.ConfigMap{"bootstrap.servers": cfg.KafkaBootstrap})
-		if err == nil {
-			auditP = ap
-			defer auditP.Close()
-		}
 		// Mark ready once consumer has partition assignment (and producer, if any, is initialized)
 		go func() {
 			for {
@@ -1013,16 +1830,106 @@ func run(cfg Config) error {
 		}()
 		// Continuous processing loop with transactional batching.
 		var (
-			batchStarted      bool
-			batchStartTime    time.Time
-			batchCount        int
-			batchOffsets      = make(map[int32]ck.TopicPartition) // partition -> highest offset+1
-			opbCrashTriggered bool
+			batchStarted   bool
+			batchStartTime time.Time
+			batchCount     int
+			batchOffsets   = make(map[int32]ck.TopicPartition) // partition -> highest offset+1
 		)
 		// Simple in-process idempotency for verify: eventId = orderId#windowStart
 		dedupSeen := make(map[string]struct{})
 		var latestEpochSeen int64
+		handleIngestCommand := func(cmd ingestCommand) {
+			var cmdErr error
+			if cmd.pause {
+				if ingestPaused.Load() {
+					// already paused
+				} else {
+					if p != nil && batchStarted {
+						if e := opb.CommitBatch(c, p, batchOffsets, metricsAdapter{mreg}); e != nil {
+							cmdErr = fmt.Errorf("commit before pause: %w", e)
+						}
+						batchStarted = false
+						batchCount = 0
+						batchOffsets = make(map[int32]ck.TopicPartition)
+					}
+					pauseMu.Lock()
+					ass, aerr := c.Assignment()
+					if cmdErr == nil && aerr != nil {
+						cmdErr = fmt.Errorf("assignment before pause: %w", aerr)
+					} else if cmdErr == nil && len(ass) > 0 {
+						if e := c.Pause(ass); e != nil {
+							cmdErr = fmt.Errorf("pause assignment: %w", e)
+						}
+					}
+					if cmdErr == nil {
+						ingestPaused.Store(true)
+					}
+					pauseMu.Unlock()
+				}
+			} else {
+				if !ingestPaused.Load() {
+					// already running
+				} else {
+					pauseMu.Lock()
+					ass, aerr := c.Assignment()
+					if aerr != nil {
+						cmdErr = fmt.Errorf("assignment before resume: %w", aerr)
+					} else if len(ass) > 0 {
+						if e := c.Resume(ass); e != nil {
+							cmdErr = fmt.Errorf("resume assignment: %w", e)
+						}
+					}
+					if cmdErr == nil {
+						ingestPaused.Store(false)
+					}
+					pauseMu.Unlock()
+				}
+			}
+			if cmd.done != nil {
+				cmd.done <- cmdErr
+			}
+		}
+		channelName := func(partition int32) string {
+			return fmt.Sprintf("%s#%d", cfg.TopicEnriched, partition)
+		}
+		recordInflightEvent := func(partition int32, key string, payload []byte, vc opb.VectorClock) {
+			cutMu.Lock()
+			defer cutMu.Unlock()
+			if currentCut == nil {
+				return
+			}
+			if currentCut.seen[partition] {
+				return // Barrier for this partition has been seen, stop recording.
+			}
+			ch := channelName(partition)
+			if currentCut.inflight == nil {
+				currentCut.inflight = make(map[string][]inflightRecord)
+			}
+			rec := inflightRecord{Key: key}
+			if opbDebug {
+				log.Printf("inflight capture: part=%d key=%s", partition, key)
+			}
+			if len(payload) > 0 {
+				rec.Payload = append([]byte(nil), payload...)
+			}
+			if vc != nil {
+				rec.VC = vc.Copy()
+			}
+			currentCut.inflight[ch] = append(currentCut.inflight[ch], rec)
+		}
 		for {
+			if ingestControlEnabled {
+				select {
+				case cmd := <-ingestCtrl:
+					handleIngestCommand(cmd)
+					continue
+				default:
+				}
+			}
+			if ingestPaused.Load() {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 			// Read first to avoid spinning when no input
 			msg, err := c.ReadMessage(200 * time.Millisecond)
 			if err != nil {
@@ -1042,6 +1949,153 @@ func run(cfg Config) error {
 			if existing, ok := batchOffsets[tpTrack.Partition]; !ok || tpTrack.Offset > existing.Offset {
 				batchOffsets[tpTrack.Partition] = tpTrack
 			}
+			// Barrier detection before payload decode
+			if ok, bid := opb.IsBarrier(msg.Headers); ok {
+				cutMu.Lock()
+				bc := currentCut
+				if bc != nil && bc.id == bid {
+					bc.seen[msg.TopicPartition.Partition] = true
+					seenCount := 0
+					for _, ok := range bc.seen {
+						if ok {
+							seenCount++
+						}
+					}
+					appStatus.SetCausalMarkers(seenCount)
+					if opbDebug {
+						log.Printf("barrier-cut: ack id=%s part=%d seen=%d/%d", bid, msg.TopicPartition.Partition, seenCount, len(bc.expected))
+					}
+					// check all seen
+					all := true
+					for _, p := range bc.expected {
+						if !bc.seen[p] {
+							all = false
+							break
+						}
+					}
+					if all && !bc.started {
+						appStatus.SetCausalPhase("channel-state")
+						if opbDebug {
+							log.Printf("barrier-cut: all partitions ready id=%s type=%s", bid, bc.cutType)
+						}
+						bc.started = true
+						cutMu.Unlock()
+							pauseMu.Lock()
+						func(bc *barrierCut) {
+							defer pauseMu.Unlock()
+							ass, _ := c.Assignment()
+							if opbDebug {
+								log.Printf("barrier-cut: pause request id=%s partitions=%v", bc.id, ass)
+							}
+							if len(ass) > 0 {
+								_ = c.Pause(ass)
+							}
+							if p != nil && batchStarted {
+								if opbDebug {
+									log.Printf("barrier-cut: committing batch before snapshot id=%s count=%d", bc.id, batchCount)
+								}
+								if err := opb.CommitBatch(c, p, batchOffsets, metricsAdapter{mreg}); err != nil {
+									log.Printf("barrier-cut: commit before snapshot error: %v", err)
+								}
+								// Force commit of consumer offsets to ensure no reprocessing after restart
+								if _, err := c.Commit(); err != nil {
+									log.Printf("barrier-cut: explicit consumer commit error: %v", err)
+								}
+								batchStarted = false
+								batchCount = 0
+								batchOffsets = make(map[int32]ck.TopicPartition)
+							}
+							if opbDebug {
+								log.Printf("barrier-cut: commit sync complete id=%s", bc.id)
+							}
+							time.Sleep(150 * time.Millisecond)
+
+							ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							defer cancel()
+							collector := kafkaOffsetsCollector{bootstrap: cfg.KafkaBootstrap, topic: cfg.TopicChangelog}
+							scanner := kafkaDirtyScanner{bootstrap: cfg.KafkaBootstrap, timeout: 1500 * time.Millisecond}
+							// Use pre-cut snapshot view when available to ensure snapshot is pre-cut
+							var sw snapshotViewWriter = snap
+							if bc.preView != nil {
+								sw = fixedViewWriter{snap: sw, view: bc.preView}
+							}
+							writer := snapshotWriter{snap: sw}
+								t0 := time.Now()
+							causalFn := func(snapID string) (*snapcut.CausalInfo, error) {
+								cutMu.Lock()
+								defer cutMu.Unlock()
+								channels := append([]string(nil), bc.channels...)
+								vc := bc.vectorClock
+								inflight := bc.inflight
+								relPath := ""
+								total := 0
+								var err error
+								if len(inflight) > 0 {
+									relPath, total, err = writeInflightSnapshot(cfg.SnapshotDir, snapID, channels, inflight)
+									if err != nil {
+										return nil, err
+									}
+									if opbDebug {
+										log.Printf("barrier-cut: inflight recorded events=%d channels=%d", total, len(channels))
+									}
+									mreg.CausalInflight.Set(float64(total))
+									appStatus.SetCausalInflight(total)
+									} else {
+									if opbDebug {
+										log.Printf("barrier-cut: inflight empty")
+									}
+									mreg.CausalInflight.Set(0)
+									appStatus.SetCausalInflight(0)
+								}
+								info := &snapcut.CausalInfo{
+									Channels:       channels,
+									InflightFile:   relPath,
+									InflightEvents: total,
+								}
+								if vc != nil {
+									info.VectorClock = vc.Copy()
+								}
+								return info, nil
+							}
+							if opbDebug {
+								log.Printf("barrier-cut: invoking perform id=%s type=%s", bc.id, bc.cutType)
+							}
+							m, res, err := snapcut.PerformBarrierCut(ctx, bc.cutType, bc.prev, st, collector, scanner, writer, mani, changelogAppendedCount, causalFn, time.Now)
+							if err != nil {
+								log.Printf("barrier-cut: perform error: %v", err)
+								} else {
+									durMs := float64(time.Since(t0).Milliseconds())
+									mreg.SnapshotTimeMs.Observe(durMs)
+								var bytes float64
+								if strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta {
+									bytes = deltaSnapshotSizeBytes(m.SnapshotID, res.Format, res.Shards)
+									log.Printf("barrier-cut: delta-metrics id=%s keys=%d bytes=%.0f durMs=%.0f", m.SnapshotID, res.Keys, bytes, durMs)
+									} else {
+									bytes = snapshotSizeBytes(m.SnapshotID, res.Format, res.Shards)
+									}
+								mreg.SnapshotBytes.Set(bytes)
+								log.Printf("barrier-cut: manifest published id=%s type=%s", m.SnapshotID, m.SnapshotType)
+								}
+
+							if len(ass) > 0 && !ingestPaused.Load() {
+								if opbDebug {
+									log.Printf("barrier-cut: resuming partitions id=%s", bc.id)
+							}
+								if err := c.Resume(ass); err != nil {
+									log.Printf("barrier-cut: resume error: %v", err)
+							}
+							}
+							cutMu.Lock()
+							currentCut = nil
+							cutMu.Unlock()
+							appStatus.ClearCausalCut()
+						}(bc)
+						continue
+					}
+				}
+				cutMu.Unlock()
+				continue // barrier message not processed as data
+			}
 			var ev opb.OrderEnriched
 			if err := json.Unmarshal(msg.Value, &ev); err != nil {
 				log.Printf("unmarshal error: %v", err)
@@ -1060,6 +2114,9 @@ func run(cfg Config) error {
 			if !opb.AcceptMessageByEpoch(&latestEpochSeen, msg.Headers) {
 				continue
 			}
+			// Phase 3.1: extract vector clock from input, tick for this operator
+			inVC := opb.ExtractVectorClock(msg.Headers)
+			outVC := inVC.Copy().Tick(operatorID)
 			// Pre-compute key for diagnostics
 			ws := opb.WindowStart(ev.NormTS, cfg.WindowSizeSec)
 			k := opb.OutputKey(ev.StoreID, ev.ProductID, ws)
@@ -1077,6 +2134,7 @@ func run(cfg Config) error {
 				continue
 			}
 			dedupSeen[eventID] = struct{}{}
+			recordInflightEvent(msg.TopicPartition.Partition, k, msg.Value, outVC)
 
 			prevSt, _ := st.Get(k)
 			applied, out, seq, err := opb.AggregateAndBuildOutput(st, cfg.WindowSizeSec, ev)
@@ -1088,17 +2146,6 @@ func run(cfg Config) error {
 				appStatus.IncEventsApplied(1)
 				// Update per-store aggregates index for zone details
 				zoneIdx.OnApplied(ev.StoreID, ev.Price*ev.Qty, ev.Qty, cfg.InstanceID)
-				// Emit store-touch (throttled) for cluster-wide instance visibility
-				if storeTouchP != nil && cfg.TopicStoreTouch != "" {
-					k := ev.StoreID + "#" + cfg.InstanceID
-					now := time.Now()
-					if last, ok := lastTouch[k]; !ok || now.Sub(last) > 10*time.Second {
-						lastTouch[k] = now
-						val := []byte(fmt.Sprintf("{\"ts\":%d}", now.Unix()))
-						topic := cfg.TopicStoreTouch
-						_ = storeTouchP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny}, Key: []byte(k), Value: val}, nil)
-					}
-				}
 				dlogf("aggregate: applied key=%s seq=%d prevLast=%d", out.Key, seq, prevSt.LastSeq)
 				b, _ := json.Marshal(out)
 				if p != nil {
@@ -1109,14 +2156,9 @@ func run(cfg Config) error {
 						}
 						batchStarted = true
 						batchStartTime = time.Now()
-						if auditP != nil {
-							ev := map[string]any{"evt": "BEGIN", "txId": txID, "ts": time.Now().UnixNano()}
-							b, _ := json.Marshal(ev)
-							_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: b}, nil)
-						}
 					}
 					// set t1 header, propagate t0 nếu có, kèm fencing epoch
-					headers := opb.BuildHeadersWithEpoch(opb.RealClock{}, hdrT0, epoch)
+					headers := opb.BuildHeadersWithEpochAndVC(opb.RealClock{}, hdrT0, epoch, outVC)
 					if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: ck.PartitionAny}, Key: []byte(out.Key), Value: b, Headers: headers}, nil); err != nil {
 						_ = p.AbortTransaction(context.TODO())
 						mreg.TxAborted.Inc()
@@ -1124,11 +2166,6 @@ func run(cfg Config) error {
 						batchCount = 0
 						batchOffsets = make(map[int32]ck.TopicPartition)
 						log.Printf("tx: produce error, aborted: %v", err)
-						if auditP != nil {
-							ev := map[string]any{"evt": "ABORT", "txId": txID, "ts": time.Now().UnixNano(), "reason": "produce_error"}
-							ab, _ := json.Marshal(ev)
-							_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: ab}, nil)
-						}
 						continue
 					}
 					batchCount++
@@ -1138,12 +2175,12 @@ func run(cfg Config) error {
 						batchOffsets[tp.Partition] = tp
 					}
 				}
-				if cfg.ChangelogOn {
+				if changelogKafkaEnabled || clog != nil {
 					d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
 					// If we have a transactional producer, write changelog to Kafka in the same transaction for immediate visibility
-					if p != nil && (cfg.ChangelogSink == "kafka" || cfg.ChangelogSink == "both") {
+					if changelogKafkaEnabled && p != nil {
 						bchg, _ := json.Marshal(d)
-						headers := opb.BuildHeadersWithEpoch(opb.RealClock{}, hdrT0, epoch)
+						headers := opb.BuildHeadersWithEpochAndVC(opb.RealClock{}, hdrT0, epoch, outVC)
 						if err := p.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicChangelog, Partition: ck.PartitionAny}, Key: []byte(d.Key), Value: bchg, Headers: headers}, nil); err != nil {
 							_ = p.AbortTransaction(context.TODO())
 							mreg.TxAborted.Inc()
@@ -1151,11 +2188,6 @@ func run(cfg Config) error {
 							batchCount = 0
 							batchOffsets = make(map[int32]ck.TopicPartition)
 							log.Printf("tx: produce changelog error, aborted: %v", err)
-							if auditP != nil {
-								ev := map[string]any{"evt": "ABORT", "txId": txID, "ts": time.Now().UnixNano(), "reason": "changelog_error"}
-								ab, _ := json.Marshal(ev)
-								_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: ab}, nil)
-							}
 							return nil
 						}
 					} else if clog != nil {
@@ -1170,7 +2202,7 @@ func run(cfg Config) error {
 							return fmt.Errorf("append changelog: %w", err)
 						}
 					}
-					log.Printf("changelog: appended key=%s seq=%d", out.Key, seq)
+					dlogf("changelog: appended key=%s seq=%d", out.Key, seq)
 					mreg.ChangelogAppended.Inc()
 					changelogAppendedCount++
 				}
@@ -1181,36 +2213,12 @@ func run(cfg Config) error {
 			}
 			// Commit batch if thresholds met
 			if p != nil && batchStarted && (batchCount >= cfg.TxBatchSize || time.Since(batchStartTime) >= time.Duration(cfg.TxLingerMs)*time.Millisecond) {
-				// Crash injection points for OpB EOS (before/mid/after one-shot per process)
-				if cfg.CrashMode == "before" && !opbCrashTriggered {
-					log.Fatalf("opb crash: before commit (simulated)")
-				}
 				if err := opb.CommitBatch(c, p, batchOffsets, metricsAdapter{mreg}); err != nil {
 					log.Printf("tx: batch commit error: %v", err)
-				} else {
-					if auditP != nil {
-						// build offsets summary (count only to avoid heavy msg)
-						ev := map[string]any{"evt": "COMMIT", "txId": txID, "ts": time.Now().UnixNano(), "parts": len(batchOffsets)}
-						b, _ := json.Marshal(ev)
-						_ = auditP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicAudit, Partition: ck.PartitionAny}, Value: b}, nil)
-					}
-				}
-				if cfg.CrashMode == "mid" && !opbCrashTriggered {
-					log.Fatalf("opb crash: mid commit (simulated)")
 				}
 				batchStarted = false
 				batchCount = 0
 				batchOffsets = make(map[int32]ck.TopicPartition)
-				if cfg.CrashMode == "after" && !opbCrashTriggered {
-					log.Fatalf("opb crash: after commit (simulated)")
-				}
-				if cfg.CrashMode != "" {
-					opbCrashTriggered = true
-				}
-			}
-			if cfg.Once {
-				log.Printf("once: exiting after one message")
-				return nil
 			}
 		}
 	} else {
@@ -1228,7 +2236,7 @@ func run(cfg Config) error {
 			if applied {
 				b, _ := json.Marshal(out)
 				log.Printf("orders.output key=%s seq=%d value=%s", out.Key, seq, string(b))
-				if cfg.ChangelogOn {
+				if clog != nil {
 					d := changelog.Delta{Key: out.Key, Seq: seq, Delta: ev.Price * ev.Qty, DeltaQty: ev.Qty, TS: out.UpdatedAt}
 					if err := clog.Append(d); err != nil {
 						return fmt.Errorf("append changelog: %w", err)
@@ -1243,7 +2251,7 @@ func run(cfg Config) error {
 	// Test restore and replay with status transitions only in non-Kafka input mode
 	if cfg.InputSource != "kafka" {
 		log.Printf("testing restore and replay...")
-		restorer := rf.NewRestorer(st, snap, maniReader, cfg.SnapshotDir)
+		restorer := rf.NewRestorerWithOptions(st, snap, maniReader, cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
 		// Read manifest first to expose details to status manager
 		m, mErr := maniReader.ReadLatest()
 		if mErr != nil {
@@ -1254,15 +2262,23 @@ func run(cfg Config) error {
 		t0 := time.Now()
 		var result rf.RestoreResult
 		var err error
+		restoreFmt := snapFormat
+		restoreShards := cfg.SnapshotShards
+		keysHint := 0
+		if mErr == nil {
+			restoreFmt = resolveSnapshotFormat(m.SnapshotFormat)
+			restoreShards = resolveSnapshotShards(m.SnapshotShards)
+			keysHint = m.SnapshotKeys
+		}
 		if cfg.ChangelogSource == "kafka" && cfg.KafkaBootstrap != "" {
 			if mErr != nil {
 				err = mErr
 			} else {
 				// Always restore snapshot before replaying changelog
-				if e := restorer.RestoreFromSnapshot(m.SnapshotID); e != nil {
+				if e := restorer.RestoreFromSnapshotWithFormatParallel(m.SnapshotID, restoreFmt, restoreShards, keysHint, cfg.RestoreParallelism); e != nil {
 					err = e
 				} else {
-					result = rk.ReplayChangelogKafka(st, []string{cfg.KafkaBootstrap}, cfg.TopicChangelog, m.LastChangelogOffset)
+					result = rk.ReplayChangelogKafkaParallel(st, []string{cfg.KafkaBootstrap}, cfg.TopicChangelog, nil, m.LastChangelogOffset, cfg.ReplayWorkers)
 					if result.Error != nil {
 						err = result.Error
 					}
@@ -1273,7 +2289,7 @@ func run(cfg Config) error {
 				err = mErr
 			} else {
 				// File-based: manual restore + replay to track offsets and TTR
-				if e := restorer.RestoreFromSnapshot(m.SnapshotID); e != nil {
+				if e := restorer.RestoreFromSnapshotWithFormat(m.SnapshotID, restoreFmt, restoreShards, keysHint); e != nil {
 					err = e
 				} else {
 					result = restorer.ReplayChangelog(fmt.Sprintf("%s/opb.jsonl", cfg.ChangelogDir), m.LastChangelogOffset)

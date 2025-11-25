@@ -11,6 +11,7 @@ import (
 	"hpb/internal/metrics"
 	rf "hpb/internal/restorefs"
 	rk "hpb/internal/restorekafka"
+	"hpb/internal/snapshot"
 	"hpb/internal/state"
 
 	"github.com/segmentio/kafka-go"
@@ -26,6 +27,8 @@ func main() {
 		topicSnapshots  string
 		topicChangelog  string
 		snapshotDir     string
+		snapshotFormat  string
+		snapshotShards  int
 		httpAddr        string
 		pollIntervalSec int
 		advanceManifest bool
@@ -38,6 +41,8 @@ func main() {
 	flag.StringVar(&topicSnapshots, "topic-snapshots", "p1.opb-snapshots", "manifest topic")
 	flag.StringVar(&topicChangelog, "topic-changelog", "p1.opb-changelog", "changelog topic")
 	flag.StringVar(&snapshotDir, "snapshot-dir", "./snapshots", "snapshot dir for file mode")
+	flag.StringVar(&snapshotFormat, "snapshot-format", "json", "snapshot format to expect when manifest is missing field (json|msgpack)")
+	flag.IntVar(&snapshotShards, "snapshot-shards", 1, "snapshot shards to assume when manifest omits the field")
 	flag.StringVar(&httpAddr, "http", ":9090", "http listen for /metrics")
 	flag.IntVar(&pollIntervalSec, "poll", 10, "poll interval seconds for manifest")
 	flag.BoolVar(&advanceManifest, "advance-manifest", true, "after replay, publish updated manifest with new last offset")
@@ -67,7 +72,31 @@ func main() {
 		}
 	}
 
-	// no-op
+	defaultFormat, err := snapshot.ParseFormat(snapshotFormat)
+	if err != nil {
+		log.Fatalf("parse snapshot-format: %v", err)
+	}
+	if snapshotShards < 1 {
+		snapshotShards = 1
+	}
+
+	resolveFormat := func(manifestFormat string) snapshot.Format {
+		format := defaultFormat
+		if manifestFormat != "" {
+			if parsed, perr := snapshot.ParseFormat(manifestFormat); perr == nil {
+				format = parsed
+			} else {
+				log.Printf("recover: unknown snapshot format %s, defaulting to %s", manifestFormat, format)
+			}
+		}
+		return format
+	}
+	resolveShards := func(manifestShards int) int {
+		if manifestShards > 0 {
+			return manifestShards
+		}
+		return snapshotShards
+	}
 
 	ticker := time.NewTicker(time.Duration(pollIntervalSec) * time.Second)
 	defer ticker.Stop()
@@ -75,14 +104,15 @@ func main() {
 		t1 := time.Now()
 		// Use Restorer with a fresh in-memory state each cycle (demo simplicity)
 		st := state.NewInMemoryStore()
-		r := rf.NewRestorer(st, nil, mReader, snapshotDir)
+		r := rf.NewRestorerWithOptions(st, nil, mReader, snapshotDir, defaultFormat, snapshotShards)
 		m, err := mReader.ReadLatest()
 		if err != nil {
 			log.Printf("read manifest: %v", err)
 			<-ticker.C
 			continue
 		}
-		if err := r.RestoreFromSnapshot(m.SnapshotID); err != nil {
+		restoreFmt := resolveFormat(m.SnapshotFormat)
+		if err := r.RestoreFromSnapshotWithFormat(m.SnapshotID, restoreFmt, resolveShards(m.SnapshotShards), m.SnapshotKeys); err != nil {
 			log.Printf("restore snapshot: %v", err)
 			<-ticker.C
 			continue

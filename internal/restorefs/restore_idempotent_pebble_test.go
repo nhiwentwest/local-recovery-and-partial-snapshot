@@ -47,6 +47,56 @@ func (p *testPebbleStore) Apply(key string, da, dq, seq int64) (bool, state.Reco
 	}
 	return true, cur, nil
 }
+
+// ApplyBatch implements the state.Store batching contract for tests.
+func (p *testPebbleStore) ApplyBatch(batch []state.Delta) (int, int, error) {
+	if len(batch) == 0 {
+		return 0, 0, nil
+	}
+	groups := make(map[string][]state.Delta)
+	for _, d := range batch {
+		groups[d.Key] = append(groups[d.Key], d)
+	}
+	wb := p.db.NewBatch()
+	applied, skipped := 0, 0
+	for key, ds := range groups {
+		k := []byte(key)
+		var cur state.RecordState
+		v, closer, err := p.db.Get(k)
+		if err == nil {
+			_ = json.Unmarshal(v, &cur)
+			_ = closer.Close()
+		} else if err != pebble.ErrNotFound {
+			_ = wb.Close()
+			return applied, skipped, err
+		}
+		any := false
+		for _, d := range ds {
+			if d.Seq <= cur.LastSeq {
+				skipped++
+				continue
+			}
+			cur.SumAmount += d.DeltaAmount
+			cur.SumQty += d.DeltaQty
+			cur.LastSeq = d.Seq
+			applied++
+			any = true
+		}
+		if any {
+			b, _ := json.Marshal(cur)
+			if err := wb.Set(k, b, nil); err != nil {
+				_ = wb.Close()
+				return applied, skipped, err
+			}
+		}
+	}
+	if err := wb.Commit(pebble.NoSync); err != nil {
+		_ = wb.Close()
+		return applied, skipped, err
+	}
+	_ = wb.Close()
+	return applied, skipped, nil
+}
 func (p *testPebbleStore) Get(key string) (state.RecordState, bool) {
 	v, closer, err := p.db.Get([]byte(key))
 	if err != nil {
@@ -98,6 +148,41 @@ func (p *testPebbleStore) LoadAll(all map[string]state.RecordState) {
 		_ = wb.Close()
 	}
 }
+
+type pebbleSnapshotView struct{ data map[string]state.RecordState }
+
+func (v *pebbleSnapshotView) Range(fn func(key string, st state.RecordState) error) error {
+	for k, st := range v.data {
+		if err := fn(k, st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (v *pebbleSnapshotView) Close() error { return nil }
+
+func (p *testPebbleStore) NewSnapshotView() (state.SnapshotView, error) {
+	// Create a consistent copy-at-time view
+	it, _ := p.db.NewIter(nil)
+	defer it.Close()
+	m := make(map[string]state.RecordState)
+	for it.First(); it.Valid(); it.Next() {
+		k := string(append([]byte(nil), it.Key()...))
+		v := append([]byte(nil), it.Value()...)
+		var st state.RecordState
+		_ = json.Unmarshal(v, &st)
+		m[k] = st
+	}
+	return &pebbleSnapshotView{data: m}, nil
+}
+
+func (p *testPebbleStore) Delete(key string) error {
+	return p.db.Delete([]byte(key), pebble.NoSync)
+}
+
+// Dirty key tracking is not needed for this test store
+func (p *testPebbleStore) GetDirtyKeys() []string { return nil }
+func (p *testPebbleStore) MarkSnapshotDone(keys ...string) {}
 
 func TestEndToEnd_PebbleMem_SnapshotThenRestoreReplay_Idempotent_FS(t *testing.T) {
 	base := t.TempDir()

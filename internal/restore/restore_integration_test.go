@@ -29,14 +29,14 @@ func TestIntegration_RestoreAndReplay_EndToEnd(t *testing.T) {
 	// key2: B#p2#100 -> seq=1, amount=50, qty=1
 	_, _, _ = prep.Apply("B#p2#100", 50, 1, 1)
 
-	snap := snapshot.NewFilesystemSnapshotter(base)
+	snap := snapshot.NewFilesystemSnapshotter(base, snapshot.FormatJSON, 1)
 	sid := "sid-int"
-	if err := snap.WriteSnapshot(sid, prep); err != nil {
+	if _, err := snap.WriteSnapshot(sid, prep); err != nil {
 		t.Fatalf("write snapshot: %v", err)
 	}
 
 	// Sanity: snapshot file exists and contains data
-	b, err := os.ReadFile(filepath.Join(base, sid, "state.json"))
+	b, err := os.ReadFile(filepath.Join(base, sid, snapshot.FormatJSON.FileName()))
 	if err != nil {
 		t.Fatalf("read state.json: %v", err)
 	}

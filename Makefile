@@ -1,4 +1,4 @@
-.PHONY: build build-all test test-race coverage test-integration
+.PHONY: build build-all test test-race coverage test-integration integration-test causal-demo
 
 build:
 	mkdir -p bin
@@ -28,3 +28,9 @@ coverage:
 test-integration:
 	go test -tags=integration ./...
 	@echo "Coverage report written to coverage.html"
+
+integration-test:
+	go test -tags=integration ./cmd/opb -run '(TestBarrierCutDelta_Integration|TestCausalReplay_Restore)' -v
+
+causal-demo:
+	bash scripts/demo_causal_snapshot.sh

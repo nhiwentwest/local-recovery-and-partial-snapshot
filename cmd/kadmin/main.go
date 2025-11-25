@@ -122,7 +122,7 @@ func doDeleteGroup(ac *ck.AdminClient, group string, timeout time.Duration) erro
 func main() {
 	var (
 		bootstrap = flag.String("bootstrap", "127.0.0.1:9092", "bootstrap servers")
-		cmd       = flag.String("cmd", "describe", "command: describe|delete|create|increase|delete-group")
+		cmd       = flag.String("cmd", "describe", "command: describe|delete|create|increase|delete-group|watermarks")
 		topic     = flag.String("topic", "", "topic name")
 		group     = flag.String("group", "", "consumer group id for delete-group")
 		parts     = flag.Int("partitions", 4, "partitions for create/increase")
@@ -162,6 +162,37 @@ func main() {
 	}
 	cfgMap := parseConfigs(*configStr)
 	switch *cmd {
+	case "watermarks":
+		if *topic == "" {
+			log.Fatalf("missing -topic")
+		}
+		c, err := ck.NewConsumer(&ck.ConfigMap{
+			"bootstrap.servers":  *bootstrap,
+			"group.id":           "kadmin-wm",
+			"enable.auto.commit": false,
+		})
+		if err != nil {
+			log.Fatalf("wm consumer: %v", err)
+		}
+		defer c.Close()
+		md, err := c.GetMetadata(topic, false, 5000)
+		if err != nil {
+			log.Fatalf("wm metadata: %v", err)
+		}
+		tp, ok := md.Topics[*topic]
+		if !ok {
+			log.Fatalf("topic not found: %s", *topic)
+		}
+		highs := make([]int64, len(tp.Partitions))
+		for i := range tp.Partitions {
+			_, high, err := c.QueryWatermarkOffsets(*topic, int32(i), 2000)
+			if err != nil {
+				highs[i] = 0
+				continue
+			}
+			highs[i] = high
+		}
+		fmt.Printf("{\"topic\":%q,\"partitions\":%d,\"high\":%v}\n", *topic, len(tp.Partitions), highs)
 	case "describe":
 		if *topic == "" {
 			log.Fatalf("missing -topic")

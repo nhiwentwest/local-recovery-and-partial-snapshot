@@ -74,29 +74,22 @@ function render(data){
     wsSelect.appendChild(opt);
   }
   
-  // Tạo map theo storeId và sắp xếp cố định A, B, C, D...
-  const cellMap = new Map();
-  cells.forEach(c => {
-    cellMap.set(c.storeId, c);
-  });
-  
-  // Thứ tự ưu tiên cố định (A-P), nhưng bổ sung bất kỳ store nào xuất hiện trong dữ liệu
-  const baseOrder = ['A-', 'B-', 'C-', 'D-', 'E-', 'F-', 'G-', 'H-', 'I-', 'J-', 'K-', 'L-', 'M-', 'N-', 'O-', 'P-'];
-  const dynamicOrder = [...baseOrder];
-  cells.forEach(c => {
-    if (!dynamicOrder.includes(c.storeId)) {
-      dynamicOrder.push(c.storeId);
-    }
-  });
-
   grid.innerHTML='';
-  dynamicOrder.forEach(storeId => {
-    const c = cellMap.get(storeId);
+  if (cells.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'cell no-data';
+    empty.textContent = 'No data';
+    grid.appendChild(empty);
+    return;
+  }
+
+  cells.forEach(c => {
+    const storeId = c.storeId;
     const el = document.createElement('div');
     el.className='cell';
     let valueDisplay = '0';
     
-    if (!c || c.value === 0) {
+    if (!c.value) {
       // Không có data: màu xám
       el.classList.add('no-data');
       el.style.background = '#e0e0e0';

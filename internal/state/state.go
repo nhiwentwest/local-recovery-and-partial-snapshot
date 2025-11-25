@@ -13,30 +13,79 @@ type RecordState struct {
 	LastUpdatedBy string `json:"-"`
 }
 
+// Delta is a batched state change for a single key.
+type Delta struct {
+	Key         string
+	DeltaAmount int64
+	DeltaQty    int64
+	Seq         int64
+}
+
+// SnapshotView is a read-only, point-in-time view over the store.
+// Implementations must provide a consistent snapshot that is unaffected by
+// concurrent writes after the view is created.
+type SnapshotView interface {
+	// Range iterates over all key/value pairs in the snapshot view.
+	Range(fn func(key string, st RecordState) error) error
+	// Close releases resources held by the snapshot view.
+	Close() error
+}
+
 // Store abstracts the state backend.
 // Note: For Phase 1, only InMemoryStore is implemented.
 type Store interface {
 	Apply(key string, deltaAmount int64, deltaQty int64, seq int64) (applied bool, newState RecordState, err error)
+	// ApplyBatch applies a batch of deltas atomically from the perspective of external readers.
+	// Implementations may choose their own internal locking/transaction semantics.
+	// The method should process deltas in-order and return counts of applied vs skipped (by seq).
+	ApplyBatch(batch []Delta) (applied int, skipped int, err error)
 	Get(key string) (RecordState, bool)
 	Range(fn func(key string, st RecordState) error) error
 	LoadAll(all map[string]RecordState)
+	Delete(key string) error
+	// NewSnapshotView returns a consistent, read-only view for iteration without
+	// blocking writers. Callers must Close() the returned view.
+	NewSnapshotView() (SnapshotView, error)
+	// Dirty key tracking for incremental snapshots
+	GetDirtyKeys() []string
+	// MarkSnapshotDone clears dirty tracking. If keys are provided, only those keys are cleared; if none provided, clears all.
+	MarkSnapshotDone(keys ...string)
 }
 
 // InMemoryStore is a simple thread-safe map store.
 type InMemoryStore struct {
 	mu         sync.RWMutex
 	data       map[string]RecordState
+	dirty      map[string]struct{}
 	instanceID string
 }
 
+type memSnapshotView struct {
+	data map[string]RecordState
+}
+
+func (v *memSnapshotView) Range(fn func(key string, st RecordState) error) error {
+	for k, st := range v.data {
+		if err := fn(k, st); err != nil {
+			return fmt.Errorf("range callback failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *memSnapshotView) Close() error { return nil }
+
 func NewInMemoryStore() *InMemoryStore {
-	return &InMemoryStore{data: make(map[string]RecordState)}
+	return &InMemoryStore{
+		data:  make(map[string]RecordState),
+		dirty: make(map[string]struct{}),
+	}
 }
 
 // SetInstanceID sets the instance id used for LastUpdatedBy (transient only).
 func (s *InMemoryStore) SetInstanceID(id string) { s.instanceID = id }
 
-// LoadAll replaces the store contents with the provided snapshot (used by restore in Phase 1).
+// LoadAll replaces the store contents with the provided snapshot and resets the dirty map.
 func (s *InMemoryStore) LoadAll(all map[string]RecordState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -44,6 +93,17 @@ func (s *InMemoryStore) LoadAll(all map[string]RecordState) {
 	for k, v := range all {
 		s.data[k] = v
 	}
+	s.dirty = make(map[string]struct{}) // Reset dirty map after loading
+}
+
+func (s *InMemoryStore) Delete(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[key]; ok {
+		delete(s.data, key)
+		s.dirty[key] = struct{}{}
+	}
+	return nil
 }
 
 func (s *InMemoryStore) Apply(key string, deltaAmount int64, deltaQty int64, seq int64) (bool, RecordState, error) {
@@ -54,15 +114,40 @@ func (s *InMemoryStore) Apply(key string, deltaAmount int64, deltaQty int64, seq
 		return false, st, nil
 	}
 	if seq > st.LastSeq+1 {
-		// For Phase 1, allow gap but note it.
-		// In later phases, we may enforce ordering.
+		// Allow gap but note: later phases may enforce ordering.
 	}
 	st.SumAmount += deltaAmount
 	st.SumQty += deltaQty
 	st.LastSeq = seq
 	st.LastUpdatedBy = s.instanceID
 	s.data[key] = st
+	s.dirty[key] = struct{}{}
 	return true, st, nil
+}
+
+// ApplyBatch applies deltas sequentially under a single lock for efficiency.
+func (s *InMemoryStore) ApplyBatch(batch []Delta) (int, int, error) {
+	if len(batch) == 0 {
+		return 0, 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	applied, skipped := 0, 0
+	for _, d := range batch {
+		st := s.data[d.Key]
+		if d.Seq <= st.LastSeq {
+			skipped++
+			continue
+		}
+		st.SumAmount += d.DeltaAmount
+		st.SumQty += d.DeltaQty
+		st.LastSeq = d.Seq
+		st.LastUpdatedBy = s.instanceID
+		s.data[d.Key] = st
+		s.dirty[d.Key] = struct{}{}
+		applied++
+	}
+	return applied, skipped, nil
 }
 
 func (s *InMemoryStore) Get(key string) (RecordState, bool) {
@@ -81,4 +166,39 @@ func (s *InMemoryStore) Range(fn func(key string, st RecordState) error) error {
 		}
 	}
 	return nil
+}
+
+// NewSnapshotView returns a stable copy of the current map for iteration.
+func (s *InMemoryStore) NewSnapshotView() (SnapshotView, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	copyMap := make(map[string]RecordState, len(s.data))
+	for k, v := range s.data {
+		copyMap[k] = v
+	}
+	return &memSnapshotView{data: copyMap}, nil
+}
+
+// GetDirtyKeys returns a slice of keys that have been modified since the last snapshot.
+func (s *InMemoryStore) GetDirtyKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]string, 0, len(s.dirty))
+	for k := range s.dirty {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// MarkSnapshotDone clears the dirty key tracking map.
+func (s *InMemoryStore) MarkSnapshotDone(keys ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(keys) == 0 {
+	s.dirty = make(map[string]struct{}) // Reset dirty map
+		return
+	}
+	for _, k := range keys {
+		delete(s.dirty, k)
+	}
 }

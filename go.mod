@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/segmentio/kafka-go v0.4.49
 	github.com/stretchr/testify v1.11.1
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
 require (
@@ -36,6 +37,7 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/rogpeppe/go-internal v1.10.0 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/exp v0.0.0-20240112132812-db7319d0e0e3 // indirect
 	golang.org/x/sys v0.35.0 // indirect

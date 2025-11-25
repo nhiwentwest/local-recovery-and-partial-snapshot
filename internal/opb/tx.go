@@ -4,6 +4,7 @@ package opb
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -56,6 +57,63 @@ func BuildHeadersWithEpoch(clock Clock, hdrT0 []byte, epoch []byte) []ck.Header 
 		hs = append(hs, ck.Header{Key: "epoch", Value: epoch})
 	}
 	return hs
+}
+
+// Header key for vector clock JSON
+const HeaderVectorClock = "vc"
+
+// BuildHeadersWithEpochAndVC builds headers including t0/t1, epoch and a vector clock.
+// Vector clock is encoded as JSON map[string]uint64 under header key "vc".
+func BuildHeadersWithEpochAndVC(clock Clock, hdrT0 []byte, epoch []byte, vc VectorClock) []ck.Header {
+	hs := BuildHeadersWithEpoch(clock, hdrT0, epoch)
+	if vc != nil {
+		if b, err := json.Marshal(vc); err == nil {
+			hs = append(hs, ck.Header{Key: HeaderVectorClock, Value: b})
+		}
+	}
+	return hs
+}
+
+// ExtractVectorClock parses the vector clock from headers, if present. Missing/invalid -> empty clock.
+func ExtractVectorClock(headers []ck.Header) VectorClock {
+	for _, h := range headers {
+		if h.Key == HeaderVectorClock && len(h.Value) > 0 {
+			var vc VectorClock
+			if err := json.Unmarshal(h.Value, &vc); err == nil {
+				return vc
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// Barrier header keys
+const (
+	HeaderBarrier   = "barrier"
+	HeaderBarrierID = "barrier-id"
+)
+
+// BarrierHeaders returns headers marking a message as a snapshot barrier with a given id.
+func BarrierHeaders(id string) []ck.Header {
+	return []ck.Header{{Key: HeaderBarrier, Value: []byte("1")}, {Key: HeaderBarrierID, Value: []byte(id)}}
+}
+
+// IsBarrier inspects headers to detect a barrier message and returns (ok, id).
+func IsBarrier(headers []ck.Header) (bool, string) {
+	var id string
+	var mark bool
+	for _, h := range headers {
+		if h.Key == HeaderBarrier {
+			mark = true
+		} else if h.Key == HeaderBarrierID {
+			id = string(h.Value)
+		}
+	}
+	if mark && id != "" {
+		return true, id
+	}
+	return false, ""
 }
 
 // TxMetrics provides an interface for metrics related to transactions, allowing for

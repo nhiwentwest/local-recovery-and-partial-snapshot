@@ -209,7 +209,7 @@ start_instance() {
     --input-source kafka \
     --topic-enriched p1.orders.enriched --output-topic p1.orders.output \
     --changelog-sink both --manifest-sink both \
-    --topic-changelog p1.opb-changelog --topic-snapshots p1.opb-snapshots --topic-store-touch p1.opb-store-touch \
+    --topic-changelog p1.opb-changelog --topic-snapshots p1.opb-snapshots \
     --http :${port} --instance-id "$instance_id" \
     > ./logs/${instance_id}.out 2>&1 &
 }
@@ -223,8 +223,7 @@ stop_instance() {
 
 require_kadmin
 
-say "Prepare topics (store-touch compacted) and set partitions=4 for p1.orders.enriched"
-create_compacted_topic_if_needed p1.opb-store-touch
+# Prepare topics and set partitions=4 for p1.orders.enriched
 
 # FORCE p1.orders.enriched to 4 partitions BEFORE starting anything
 say "FORCE reset p1.orders.enriched to 4 partitions (quiesce producers)"

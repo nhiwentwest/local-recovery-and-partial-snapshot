@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"hpb/internal/changelog"
 	"hpb/internal/manifest"
@@ -20,6 +22,10 @@ type Restorer struct {
 	snapshotter     snapshot.Snapshotter
 	manifestReader  manifest.Reader
 	snapshotBaseDir string
+	defaultFormat   snapshot.Format
+	defaultShards   int
+	statsMu         sync.Mutex
+	lastStats       SnapshotStats
 }
 
 type Reader interface {
@@ -50,11 +56,27 @@ func (r *FilesystemReader) ReadLatest() (manifest.Manifest, error) {
 // Kafka manifest reader moved to integration build (see restore_kafka.go).
 
 func NewRestorer(st state.Store, snap snapshot.Snapshotter, mr manifest.Reader, snapshotBaseDir string) *Restorer {
+	return NewRestorerWithFormat(st, snap, mr, snapshotBaseDir, snapshot.FormatJSON)
+}
+
+func NewRestorerWithFormat(st state.Store, snap snapshot.Snapshotter, mr manifest.Reader, snapshotBaseDir string, format snapshot.Format) *Restorer {
+	return NewRestorerWithOptions(st, snap, mr, snapshotBaseDir, format, 1)
+}
+
+func NewRestorerWithOptions(st state.Store, snap snapshot.Snapshotter, mr manifest.Reader, snapshotBaseDir string, format snapshot.Format, shards int) *Restorer {
+	if format == "" {
+		format = snapshot.FormatJSON
+	}
+	if shards < 1 {
+		shards = 1
+	}
 	return &Restorer{
 		stateStore:      st,
 		snapshotter:     snap,
 		manifestReader:  mr,
 		snapshotBaseDir: snapshotBaseDir,
+		defaultFormat:   format,
+		defaultShards:   shards,
 	}
 }
 
@@ -68,26 +90,128 @@ type RestoreResult struct {
 	Error             error
 }
 
+type SnapshotStats struct {
+	Shards     int
+	Keys       int
+	ReadNs     int64
+	DecodeNs   int64
+	LoadNs     int64
+	Format     snapshot.Format
+	SnapshotID string
+}
+
+func (r *Restorer) setSnapshotStats(stats SnapshotStats) {
+	r.statsMu.Lock()
+	r.lastStats = stats
+	r.statsMu.Unlock()
+}
+
+func (r *Restorer) LastSnapshotStats() SnapshotStats {
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
+	return r.lastStats
+}
+
 func (r *Restorer) RestoreFromSnapshot(snapshotID string) error {
-	// Phase 1: simple restore from JSON snapshot
+	return r.RestoreFromSnapshotWithFormat(snapshotID, r.defaultFormat, r.defaultShards, 0)
+}
+
+func (r *Restorer) RestoreFromSnapshotWithFormat(snapshotID string, format snapshot.Format, shards int, keysHint int) error {
 	if snapshotID == "" {
 		return nil
 	}
-	path := filepath.Join(r.snapshotBaseDir, snapshotID, "state.json")
+	if format == "" {
+		format = r.defaultFormat
+	}
+	if shards <= 0 {
+		shards = r.defaultShards
+	}
+	if shards <= 0 {
+		shards = 1
+	}
+	baseDir := filepath.Join(r.snapshotBaseDir, snapshotID)
+	if shards <= 1 {
+		path := filepath.Join(baseDir, format.FileName())
+		readStart := time.Now()
 	data, err := os.ReadFile(path)
+		readDur := time.Since(readStart)
 	if err != nil {
+			if os.IsNotExist(err) && format == snapshot.FormatMsgpack {
+				format = snapshot.FormatJSON
+				path = filepath.Join(baseDir, format.FileName())
+				readStart = time.Now()
+				data, err = os.ReadFile(path)
+				readDur = time.Since(readStart)
+			}
 		if os.IsNotExist(err) {
 			log.Printf("restore: snapshot not found at %s, skipping", path)
 			return nil
 		}
 		return fmt.Errorf("read snapshot: %w", err)
 	}
-	var dump map[string]state.RecordState
-	if err := json.Unmarshal(data, &dump); err != nil {
-		return fmt.Errorf("unmarshal snapshot: %w", err)
-	}
+		decodeStart := time.Now()
+		dump, err := snapshot.DecodeSnapshot(data, format)
+		decodeDur := time.Since(decodeStart)
+		if err != nil {
+			return err
+		}
+		loadStart := time.Now()
 	r.stateStore.LoadAll(dump)
+		loadDur := time.Since(loadStart)
+		r.setSnapshotStats(SnapshotStats{
+			Shards:     1,
+			Keys:       len(dump),
+			ReadNs:     readDur.Nanoseconds(),
+			DecodeNs:   decodeDur.Nanoseconds(),
+			LoadNs:     loadDur.Nanoseconds(),
+			Format:     format,
+			SnapshotID: snapshotID,
+		})
 	log.Printf("restore: loaded %d keys from snapshot %s", len(dump), snapshotID)
+		return nil
+	}
+	firstShard := filepath.Join(baseDir, format.FileNameForShard(0, shards))
+	if _, err := os.Stat(firstShard); os.IsNotExist(err) {
+		return r.RestoreFromSnapshotWithFormat(snapshotID, format, 1, keysHint)
+	}
+	var merged map[string]state.RecordState
+	if keysHint > 0 {
+		merged = make(map[string]state.RecordState, keysHint)
+	} else {
+		merged = make(map[string]state.RecordState)
+	}
+	var readNs, decodeNs int64
+	for i := 0; i < shards; i++ {
+		fp := filepath.Join(baseDir, format.FileNameForShard(i, shards))
+		readStart := time.Now()
+		data, err := os.ReadFile(fp)
+		readNs += time.Since(readStart).Nanoseconds()
+		if err != nil {
+			return fmt.Errorf("read shard %d: %w", i, err)
+		}
+		decodeStart := time.Now()
+		dump, err := snapshot.DecodeSnapshot(data, format)
+		decodeNs += time.Since(decodeStart).Nanoseconds()
+		if err != nil {
+			return fmt.Errorf("decode shard %d: %w", i, err)
+		}
+		for k, v := range dump {
+			merged[k] = v
+		}
+	}
+	loadStart := time.Now()
+	r.stateStore.LoadAll(merged)
+	loadDur := time.Since(loadStart)
+	r.setSnapshotStats(SnapshotStats{
+		Shards:     shards,
+		Keys:       len(merged),
+		ReadNs:     readNs,
+		DecodeNs:   decodeNs,
+		LoadNs:     loadDur.Nanoseconds(),
+		Format:     format,
+		SnapshotID: snapshotID,
+	})
+	log.Printf("restore: loaded %d keys from snapshot %s (shards=%d)", len(merged), snapshotID, shards)
 	return nil
 }
 
@@ -112,7 +236,19 @@ func (r *Restorer) RestoreAndReplay() (RestoreResult, error) {
 	}
 
 	// Restore from snapshot
-	if err := r.RestoreFromSnapshot(m.SnapshotID); err != nil {
+	format := r.defaultFormat
+	if m.SnapshotFormat != "" {
+		if parsed, perr := snapshot.ParseFormat(m.SnapshotFormat); perr == nil {
+			format = parsed
+		} else {
+			log.Printf("restore: unknown snapshot format %s, defaulting to %s", m.SnapshotFormat, format)
+		}
+	}
+	shards := m.SnapshotShards
+	if shards == 0 {
+		shards = r.defaultShards
+	}
+	if err := r.RestoreFromSnapshotWithFormat(m.SnapshotID, format, shards, m.SnapshotKeys); err != nil {
 		return RestoreResult{}, fmt.Errorf("restore snapshot: %w", err)
 	}
 
