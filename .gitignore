@@ -1,46 +1,31 @@
-# binaries
+# Build outputs
 bin/
 
-# local state (Badger)
+# Runtime state / generated data
 data/
-**/*.sst
-**/LOCK
-**/MANIFEST
-**/DISCARD
+logs/
 
-# snapshots and changelog artefacts
-snapshots/**
-changelog/**
+# Snapshots & changelogs (generated)
+snapshots/
+snapshots-*/
+snapshots-recovery/
+changelog/
+changelog-*/
+changelog-recovery/
 
-# macOS
+# Temp artifacts created by scripts (root-level)
+/tmp-*
+tmp-*/
+/tmp-causal*
+*.tmp
+*.tmp.*
+
+# Restore metrics artifacts
+**/restore-metrics.json
+
+# OS/editor junk
 .DS_Store
-
-# editor
+*.swp
+*.swo
 .idea/
 .vscode/
-
-# Ignore big changelog artifacts
-changelog/*.jsonl
-
-# Demo artifacts
-logs/**
-changelog/*.jsonl
-*.out
-/tmp/**
-
-# Ignore local artifacts
-.cursor/
-coverage.html
-coverage.out
-verify_eos
-
-# Ignore .canvas files
-*.canvas
-
-# Top-level built binaries
-/opb
-/opa
-/kadmin
-
-# Recovery snapshots
-snapshots-recovery/**

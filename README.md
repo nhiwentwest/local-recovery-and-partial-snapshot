@@ -9,7 +9,7 @@ Dự án mô phỏng một hệ thống giám sát/tổng hợp dữ liệu đơ
 Thành phần chính
 - OpA (Normalizer/EOS): tiêu thụ p1.orders → chuẩn hoá → xuất p1.orders.enriched (Exactly‑Once).
 - OpB (Aggregator): tiêu thụ p1.orders.enriched → tổng hợp theo cửa sổ → xuất p1.orders.output; đồng thời ghi changelog, snapshot, manifest lên các topic opb-*.
-- Hạ tầng: Kafka/Redpanda, Prometheus/Grafana; web viz: /viz/cluster, /viz/zone-data (có lớp heatmap nếu UI hỗ trợ).
+- Hạ tầng: Kafka, Prometheus/Grafana; web viz: /viz/cluster, /viz/zone-data (có lớp heatmap nếu UI hỗ trợ).
 
 Mục đích: giúp đội vận hành “nhìn thấy” nhịp đơn hàng theo khu/phút, vẫn đúng & liên tục khi có sự cố, và phục hồi trong vài giây.
 
@@ -20,19 +20,18 @@ Mục đích: giúp đội vận hành “nhìn thấy” nhịp đơn hàng the
   - Đồng thời xuất:
     - p1.opb-changelog (delta, append‑only)
     - p1.opb-snapshots (compacted, manifest snapshot mới nhất)
-    - p1.opb-store-touch (compacted, dấu vết phiên bản/instance dùng cho viz)
 - Quan trắc:
   - HTTP metrics: /metrics (Prom/Graf)
   - Web viz: /viz/cluster, /viz/zone-data?id=... (có heatmap nếu bật)
 
 Topics mặc định (prefix p1.)
 - p1.orders, p1.orders.enriched, p1.orders.output
-- p1.opb-changelog, p1.opb-snapshots (compacted), p1.opb-store-touch (compacted)
+- p1.opb-changelog, p1.opb-snapshots (compacted)
 
 
 ## 2) Quickstart (local)
 Prerequisites
-- Kafka/Redpanda tại 127.0.0.1:9092; cổng HTTP rảnh: :8088 (OpA), :8089 (OpB)
+- Kafka tại 127.0.0.1:9092; cổng HTTP rảnh: :8088 (OpA), :8089 (OpB)
 - Go toolchain + make
 
 Build
@@ -131,17 +130,15 @@ Mục tiêu
 Cách chạy (headless)
 - bash scripts/demo_recovery.sh
   - Script tự động:
-    - Xoá rồi tạo lại hai topic phục hồi (`p1.opb-snapshots`, `p1.opb-changelog`) để tránh backlog từ các lần demo trước (cần CLI `kafka-topics`).
-    - Bơm 1 000 bản ghi ban đầu → đợi manifest mới xuất hiện (poll log thay vì ngủ cố định).
-    - Bơm thêm 500 bản ghi delta, chờ Exact cập nhật đủ lastSeq.
+    - Xoá rồi tạo lại hai topic phục hồi (`p1.opb-snapshots`, `p1.opb-changelog`) để tránh backlog từ các lần demo trước (cần CLI `kadmin`).
+    - Bơm baseline + delta theo cấu hình, chụp snapshot bằng barrier-cut, có thể tạo causal inflight.
     - `kill -9` OpB, chạy lại hai giai đoạn: `--restore-on-start --restore-only` (foreground) rồi tiến trình thường.
-    - Warmup + verify, sau cùng giữ tiến trình chạy đến khi nhấn Enter (INTERACTIVE=1) hoặc ngủ theo `SLEEP_BEFORE_SHUTDOWN`.
+    - Warmup + verify, in `/status` và các checkpoint heatmap/exact.
 
 Verify
-- Log sẽ in rõ thời điểm bắt đầu/hoàn tất restore (`restore ts: start=…`, `restore ts: done=…`) cùng `restore completed: applied=500 skipped=3` (demo mặc định).
-- `/status` và file `data/opb-recovery/restore-metrics.json` phản ánh `ttrMs ≈ 9000`, `snapshotId`, `lastChangelogOffset=1200`, `lastRestoreApplied=500`, `lastRestoreSkipped=3`.
-- `/viz/zone-data?id=RECOVERY-TEST&productId=p1&ws=<ws>`: `sumQty(after)=1501` (500 delta + 1 warmup) và `lastSeq(after) >= 1500`.
-- Nếu cần so khớp offset, dùng `bin/count_changelog -topic p1.opb-changelog` sau khi script chạy xong.
+- Log sẽ in rõ thời điểm bắt đầu/hoàn tất restore (`restore ts: start=…`, `restore ts: done=…`), `restore completed: applied=… skipped=…`.
+- `/status` phản ánh `ttrMs`, `snapshotId`, `lastChangelogOffset`, `lastRestoreApplied/Skipped`, `causalReplayTotal`, `causalInflight`.
+- `/viz/zone-data?id=RECOVERY-TEST&productId=p1&ws=<ws>`: so sánh sumQty/lastSeq trước–sau crash.
 
 Links
 - /viz/cluster, /viz/zone-data?id=RECOVERY-TEST
@@ -167,24 +164,21 @@ OpA (theo scripts/run_opa.sh)
 - -http: địa chỉ HTTP (vd :8088)
 - (tuỳ chọn test) -crash-mode: before|mid|after
 
-OpB (theo scripts/run_opb.sh)
-- --state-backend: memory|pebble (mặc định pebble)
-- --state-dir: thư mục state (vd ./data/opb)
-- --snapshot-dir: nơi lưu snapshot (vd ./snapshots)
-- --kafka-bootstrap: bootstrap servers
-- --group-id: consumer group OpB
-- --input-source: kafka
-- --topic-enriched: input (p1.orders.enriched)
-- --output-topic: output (p1.orders.output)
-- --changelog-sink: none|kafka|fs|both
-- --manifest-sink: kafka|fs|both
-- --topic-changelog: p1.opb-changelog
-- --topic-snapshots: p1.opb-snapshots
-- --window-size: giây cho cửa sổ gom
-- --snapshot-interval: chu kỳ snapshot
-- --tx-batch-size, --tx-linger-ms: tinh chỉnh giao dịch/ghi
-- --http: địa chỉ HTTP (vd :8089)
-- (tuỳ chọn) --output-tx-id nếu binary hỗ trợ
+OpB (theo scripts/run_opb.sh và demo*\*)
+- `--kafka-bootstrap`: bootstrap servers
+- `--group-id`, `--instance-id`: nhận diện consumer & replica
+- `--state-backend` (memory|pebble), `--state-dir`: nơi lưu state
+- `--snapshot-dir`, `--snapshot-format` (json|msgpack), `--snapshot-shards`: cấu hình snapshot
+- `--snapshot-interval`, `--window-size`: thông số thời gian
+- `--input-source` (sample|kafka), `--topic-enriched`, `--output-topic`
+- `--changelog-sink` (file|kafka|both|none), `--manifest-sink` (file|kafka|both)
+- `--changelog-source`, `--manifest-source` (file|kafka) + `--changelog-dir` khi dùng file-mode
+- `--topic-changelog`, `--topic-snapshots`
+- `--tx-batch-size`, `--tx-linger-ms`: tinh chỉnh transactional batching
+- `--peers`: danh sách HTTP peer (dạng `http://host:port`, lấy từ OPB_PEERS)
+- `--session-timeout-ms`, `--heartbeat-interval-ms`: tuning consumer group (demo HA)
+- `--restore-on-start`, `--restore-only`: điều khiển restore khi khởi động
+- `--http`: địa chỉ HTTP (vd :8089)
 
 Shared
 - Kafka bootstrap: 127.0.0.1:9092
@@ -215,3 +209,141 @@ Trích đoạn manifest (mẫu)
   - demo_availability_local.sh
   - demo_recovery.sh
 - Không thêm mục Troubleshooting trong lần này.
+
+
+## 8) Đo TTR với Barrier-based Non-blocking Snapshot
+Mục tiêu
+- Đo chính xác thời gian khôi phục (Time-To-Recover) của OpB khi khởi động lại, dựa trên snapshot + replay changelog.
+- Làm rõ hai góc nhìn đo: “nội bộ” (in-app) và “ngoại vi” (wall‑clock), đồng thời tránh hiểu nhầm “bypass” khi không có backlog.
+
+Khái niệm đo
+- In-app (nội bộ):
+  - Trường `ttrMs` trên `/status` đo phần cốt lõi: restore snapshot + replay changelog (nếu có backlog), đến khi hoàn tất khôi phục state.
+  - Log “restore phases” (ManifestMs, SnapshotTotalMs, ChangelogMs, MetricsMs, TotalMs) giúp soi chi tiết từng pha; `TotalMs` là tổng thời gian khối restore (bao gồm ManifestMs).
+- Wall-clock (ngoại vi):
+  - `scripts/measure_ttr.sh` đo thời gian từ khi chạy `opb --restore-only` đến khi tiến trình thoát. Bao gồm overhead start/stop tiến trình + IO log/metrics → gần với trải nghiệm restart thực tế.
+
+Barrier-based Non-blocking snapshot là gì?
+- Khi gọi `/admin/snapshot-cut`, OpB inject “barrier” vào tất cả partitions của topic input, đợi thấy barrier trên từng partition được assign, chụp snapshot qua Pebble SnapshotView (không chặn writer), rồi ghi `manifest` kèm offsets per‑partition của changelog.
+- Khôi phục: đọc `manifest.changelog.offsets` và chỉ replay phần “sau” snapshot.
+- Nếu ngay sau cut chưa có backlog (watermarks ≈ offsets), phần replay ≈ 0 → TTR nhỏ là hợp lý theo thiết kế (không phải bypass).
+
+Cách chạy benchmark TTR
+- Mặc định non‑blocking snapshot dùng `scripts/measure_ttr.sh`:
+  ```bash
+  BOOTSTRAP=127.0.0.1:9092 \
+  HTTP_ADDR=:8089 RESTORE_HTTP_ADDR=:8099 \
+  SNAPSHOT_DIR=./snapshots \
+  STATE_DIR=./data/opb RESTORE_STATE_DIR=./data/opb-restore-only \
+  PUMP_AFTER_CUT=20000 \
+  bash scripts/measure_ttr.sh
+  ```
+  - Script sẽ:
+    1) Gọi `/admin/snapshot-cut` → chờ `manifest` có `.changelog.offsets[]` (barrier ready).
+    2) “Pin” manifest để giữ mốc đo.
+    3) (Tuỳ chọn) Bơm thêm tải sau cut (`PUMP_AFTER_CUT`) → đợi backlog hình thành dựa trên watermarks vs offsets.
+    4) Chạy `opb --restore-only` và in thời gian wall‑clock; đồng thời đọc “restore phases” trong log.
+- Ép có replay rõ ràng (tuỳ chọn):
+  - Đặt `STRIP_OFFSETS=1` để xoá `.changelog` khỏi manifest pinned (replay từ đầu hoặc từ `lastChangelogOffset`), hoặc tăng `PUMP_AFTER_CUT` + `WAIT_BACKLOG_SEC`.
+
+Báo cáo nên công bố 2 con số
+- TTR‑snapshot‑only: khi không có backlog (hoặc deliberately strip offsets để tách riêng snapshot). Dựa trên `ttrMs` và `SnapshotTotalMs`/`TotalMs`; kèm wall‑clock.
+- TTR‑snapshot+replay(N): tạo backlog cỡ N; xác nhận wm.high − manifest.offsets ≥ N trước restore. Báo `ChangelogMs`, `TotalMs`, `ttrMs` và wall‑clock, kèm số bản ghi áp dụng/skipped để đối chiếu.
+
+Lưu ý để phép đo ổn định
+- Chạy nhiều lần và lấy p50/p95 (hoặc min) để giảm nhiễu IO/GC.
+- Cố định môi trường: `--snapshot-interval 0` cho tiến trình ingest, dùng `RESTORE_STATE_DIR` riêng, tránh job nền.
+- Với Kafka: tăng `WAIT_BACKLOG_SEC` nếu bơm lớn sau cut; xác thực backlog qua watermarks.
+
+Thông điệp quan trọng khi trình bày
+- TTR nhỏ khi không có backlog sau barrier là mục tiêu của kỹ thuật (không phải bypass). Để công bằng, luôn bổ sung kịch bản có backlog và công bố `ChangelogMs`/`applied`.
+
+
+## 9) Kỹ thuật Recovery & Snapshot (nâng cao) — trạng thái hiện tại
+- Barrier‑based Non‑blocking Snapshot (đã có): manifest chứa offsets per‑partition; cut không chặn writer nhờ SnapshotView + barrier marker trên từng partition.
+- Incremental Snapshots (đã có):
+  - Chính sách auto full|delta qua `--snap-max-deltas`, `--snap-max-delta-mb`.
+  - Dirty‑key tracking bằng Kafka scan giữa manifest.prev.offsets → offsets hiện tại để chỉ snapshot phần thay đổi.
+  - Manifest chain: `snapshotType=delta`, `baseSnapshotId`, `parentSnapshotId`, `deltaSequence`.
+- Beaver‑style Causal Snapshot (đã có):
+  - Ghi channel‑state (inflight) trong giai đoạn barrier propagation; file `inflight.json` được tham chiếu bởi `manifest.inflightFile` và `inflightEvents`.
+  - Khôi phục theo thứ tự: Restore snapshot → Replay inflight (nếu có) → Replay changelog Kafka nếu còn backlog beyond manifest offsets (có thể skip hoàn toàn).
+  - Web: `/viz/zone-data` hiển thị “Live Causal Cut” (id/phase/markers/inflight).
+- Skip Kafka replay khi không có backlog (đã có): kiểm tra watermark vs `manifest.changelog.offsets` để quyết định bỏ qua `ReplayChangelogKafkaParallel`.
+- Peer‑assisted State Migration (đã có bản đơn giản):
+  - B2 có thể import state từ B1 qua `/admin/state/export` (NDJSON) khi rebalance; tạm thời best‑effort cho LAN demo.
+- Snapshot GC/Retention (đã có): `/admin/snapshot-gc` + cờ `--snap-retention-*` để duy trì dung lượng.
+
+
+## 10) Admin/API/Web — quick reference
+Admin
+- POST `/admin/snapshot-cut?type=full|delta|auto`
+- POST `/admin/ingest/pause` ; POST `/admin/ingest/resume`
+- POST `/admin/snapshot-gc`
+- POST `/admin/prune-state` (body: storeId/productId/windowStartBefore/limit/dryRun)
+- GET  `/admin/state/export` (NDJSON {key,state})
+
+Data/Diag
+- POST `/api/inject-test-data`
+- GET  `/api/zone-details?id=STORE[&productId&ws]`
+- GET  `/api/debug-store-keys?storeId=STORE`
+- GET  `/api/exact?storeId&productId&ws`
+- GET  `/api/cluster`
+
+Observability
+- GET `/status` (ttrMs, restoringSnapshotId, lastChangelogOffset, lastRestoreApplied/Skipped, causalReplayTotal, causalInflight, partitions, lagTotal, …)
+- GET `/metrics` (Prometheus)
+- Web: `/viz/cluster` (Instances/Assignment + Recovery summary), `/viz/zone-data` (Store total + Exact + Live Causal Cut), `/viz/heatmap`
+
+
+## 11) Dọn repo & đẩy lên Git
+Các thư mục sau là dữ liệu sinh ra trong lúc chạy demo (KHÔNG nên commit):
+- `data/`, `logs/`, `snapshots*/`, `changelog*/`, `bin/`
+
+`.gitignore` mẫu đã thêm trong repo:
+```gitignore
+# Build outputs
+bin/
+
+# Runtime state / generated data
+data/
+logs/
+
+# Snapshots & changelogs (generated)
+snapshots/
+snapshots-*/
+snapshots-recovery/
+changelog/
+changelog-*/
+changelog-recovery/
+
+# Restore metrics artifacts
+**/restore-metrics.json
+
+# OS/editor junk
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+```
+
+Dọn & untrack nếu lỡ commit
+```bash
+# Xoá file/thư mục sinh ra tại local
+rm -rf snapshots* changelog* data logs bin || true
+
+# Bỏ theo dõi nếu đã từng commit các thư mục này
+git rm -r --cached snapshots* changelog* data logs bin 2>/dev/null || true
+
+# Stage & commit thay đổi .gitignore/README
+git add .gitignore README.md
+git add -A
+git commit -m "chore: add .gitignore; docs: update recovery/snapshot techniques; clean generated state"
+
+# Push
+# Thay <branch> bằng nhánh của bạn (main/master/dev)
+git push origin <branch>
+```
+
+Gợi ý: Các script demo sẽ tự tạo lại thư mục khi chạy nên việc xoá là an toàn. Nếu cần giữ mẫu nhỏ cho báo cáo, hãy lưu dưới `docs/examples/` (không dùng cho runtime).
