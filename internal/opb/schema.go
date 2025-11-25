@@ -7,14 +7,20 @@ import (
 
 // OrderEnriched mirrors schema v1 used by OpA output and by the generator in Phase 1.
 type OrderEnriched struct {
-	OrderID   string `json:"orderId"`
-	ProductID string `json:"productId"`
-	Price     int64  `json:"price"`
-	Qty       int64  `json:"qty"`
-	StoreID   string `json:"storeId"`
-	TS        int64  `json:"ts"`
-	Validated bool   `json:"validated"`
-	NormTS    int64  `json:"normTs"`
+	OrderID    string  `json:"orderId"`
+	ProductID  string  `json:"productId"`
+	Price      int64   `json:"price"`
+	Qty        int64   `json:"qty"`
+	StoreID    string  `json:"storeId"`
+	TS         int64   `json:"ts"`
+	Validated  bool    `json:"validated"`
+	NormTS     int64   `json:"normTs"`
+	// Optional ride-like attributes for more realistic demos
+	DistanceKm float64 `json:"distanceKm,omitempty"`
+	FareBase   int64   `json:"fareBase,omitempty"`
+	FarePerKm  int64   `json:"farePerKm,omitempty"`
+	Surge      float64 `json:"surge,omitempty"`
+	Currency   string  `json:"currency,omitempty"`
 }
 
 // OutputKey returns the composite key storeId#productId#windowStart.

@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -832,13 +834,22 @@ func run(cfg Config) error {
 			}
 			injLast[ip] = now
 			type injectJob struct {
-				StoreID   string `json:"storeId"`
-				ProductID string `json:"productId"`
-				WS        int64  `json:"ws"`
-				Mode      string `json:"mode"`
-				N         int    `json:"n"`
-				Start     int    `json:"start"`
-				Sync      bool   `json:"sync"`
+				StoreID      string  `json:"storeId"`
+				ProductID    string  `json:"productId"`
+				WS           int64   `json:"ws"`
+				Mode         string  `json:"mode"`
+				N            int     `json:"n"`
+				Start        int     `json:"start"`
+				Sync         bool    `json:"sync"`
+				// Ride-like optional fields for realistic pricing
+				DistanceKm   float64 `json:"distanceKm,omitempty"`
+				DistanceMinKm float64 `json:"distanceMinKm,omitempty"`
+				DistanceMaxKm float64 `json:"distanceMaxKm,omitempty"`
+				FareBase     int64   `json:"fareBase,omitempty"`
+				FarePerKm    int64   `json:"farePerKm,omitempty"`
+				SurgeMin     float64 `json:"surgeMin,omitempty"`
+				SurgeMax     float64 `json:"surgeMax,omitempty"`
+				Currency     string  `json:"currency,omitempty"`
 			}
 			var req []injectJob
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -867,6 +878,7 @@ func run(cfg Config) error {
 			}
 
 			producerFunc := func() {
+				rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 				var wg sync.WaitGroup
 				for _, job := range jobs {
 					job := job
@@ -888,10 +900,38 @@ func run(cfg Config) error {
 								ws = rr.WS
 								ts = rr.WS
 							}
-							payload := opb.OrderEnriched{
+							// Ride-like pricing computation (optional); fallback to default 10000
+						dKm := rr.DistanceKm
+						if dKm <= 0 {
+							if rr.DistanceMaxKm > 0 {
+								min := rr.DistanceMinKm
+								max := rr.DistanceMaxKm
+								if max < min { max = min }
+								dKm = min + rng.Float64()*(max-min+1e-9)
+							} else {
+								dKm = 1.0 + rng.Float64()*4.0
+							}
+						}
+						base := rr.FareBase
+						if base <= 0 { base = 5000 }
+						perKm := rr.FarePerKm
+						if perKm <= 0 { perKm = 3500 }
+						surgeMin := rr.SurgeMin
+						surgeMax := rr.SurgeMax
+						if surgeMin <= 0 { surgeMin = 1.0 }
+						if surgeMax <= 0 { surgeMax = surgeMin }
+						if surgeMax < surgeMin { surgeMax = surgeMin }
+						surge := surgeMin
+						if surgeMax > surgeMin { surge = surgeMin + rng.Float64()*(surgeMax-surgeMin) }
+						price := int64(math.Round((float64(base)+float64(perKm)*dKm) * surge))
+						if price <= 0 { price = 10000 }
+						currency := rr.Currency
+						if currency == "" { currency = "VND" }
+
+						payload := opb.OrderEnriched{
 								OrderID:   ordID,
 								ProductID: prod,
-								Price:     10000,
+								Price:     price,
 								Qty:       1,
 								StoreID:   store,
 								TS:        ts,
