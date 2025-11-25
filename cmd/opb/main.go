@@ -1029,7 +1029,6 @@ func run(cfg Config) error {
 			// Recovery summary panel (status-specific fields only)
 			fmt.Fprintf(w, "<div style='display:flex; gap:16px; flex-wrap:wrap'>")
 			fmt.Fprintf(w, "<div style='flex:1 1 420px; border:1px solid #2b3152; padding:12px; border-radius:8px; background:#0c1229'>")
-			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:8px'>Recovery Summary</div>")
 			fmt.Fprintf(w, "<div id='recovery-summary' class='small muted'>loading...</div>")
 			fmt.Fprintf(w, "</div>")
 			fmt.Fprintf(w, "</div>")
@@ -1119,29 +1118,16 @@ func run(cfg Config) error {
 			}
 			// Recovery + Causal + Cluster panels (data from /status and /api/cluster)
 			fmt.Fprintf(w, "<div style='display:flex; flex-wrap:wrap; gap:12px; margin:12px 0'>")
-			// Recovery Summary
-			fmt.Fprintf(w, "<div style='flex:1 1 360px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef'>")
-			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Recovery Summary</div>")
-			fmt.Fprintf(w, "<div class='small' id='rec-body'>loading...</div>")
-			fmt.Fprintf(w, "</div>")
 			// Live Causal Cut Status (hidden by default)
 			fmt.Fprintf(w, "<div id='causal-cut' style='flex:1 1 360px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef; display:none'>")
 			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Live Causal Cut</div>")
 			fmt.Fprintf(w, "<div class='small' id='causal-body'>no active cut</div>")
 			fmt.Fprintf(w, "</div>")
-			// Cluster Assignment
-			fmt.Fprintf(w, "<div style='flex:1 1 520px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef'>")
-			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Cluster Assignment</div>")
-			fmt.Fprintf(w, "<div class='small' style='margin-bottom:6px'>Instances</div>")
-			fmt.Fprintf(w, "<table style='border-collapse:collapse; width:100%%'><thead><tr><th style='text-align:left;border-bottom:1px solid #2b3152'>Instance</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Status</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Topic</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Partitions</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Lag</th></tr></thead><tbody id='inst-body'></tbody></table>")
-			fmt.Fprintf(w, "<div class='small' style='margin:8px 0 4px'>Partition -> Instance</div>")
-			fmt.Fprintf(w, "<table style='border-collapse:collapse; width:100%%'><thead><tr><th style='text-align:left;border-bottom:1px solid #2b3152'>Partition</th><th style='text-align:left;border-bottom:1px solid #2b3152'>Instance</th></tr></thead><tbody id='assign-body'></tbody></table>")
-			fmt.Fprintf(w, "</div>")
 			fmt.Fprintf(w, "</div>")
 			// Script to populate panels
-			fmt.Fprintf(w, "<script>(async function(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();var el=document.getElementById('rec-body');if(el){var ttr=(j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');var snap=(j.restoringSnapshotId||'N/A');var ap=(j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');var sk=(j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');var cr=(j.causalReplayTotal!==undefined? j.causalReplayTotal:'N/A');el.innerHTML='<div>ttrMs: <b>'+ttr+'</b></div><div>snapshotId: <span class=\"muted\">'+snap+'</span></div><div>restore applied/skipped: <span class=\"muted\">'+ap+'</span>/<span class=\"muted\">'+sk+'</span></div><div>causal replay events: <span class=\"muted\">'+cr+'</span></div>';}"+
-			"var cut=document.getElementById('causal-cut');var body=document.getElementById('causal-body');if(cut&&body){if(j.causalCutId){cut.style.display='block';var id=j.causalCutId;var phase=j.causalPhase||'tracking';var seen=j.causalMarkersSeen||0;var total=j.causalMarkersTotal||0;var infl=j.causalInflight||0;body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { cut.style.display='none'; } }}catch(e){var el=document.getElementById('rec-body');if(el)el.textContent='N/A';}"+
-			"try{const cr=await fetch('/api/cluster',{cache:'no-store'});const c=await cr.json();var inst=document.getElementById('inst-body');if(inst&&Array.isArray(c.instances)){inst.innerHTML='';for(const it of c.instances){const parts=Array.isArray(it.partitions)?it.partitions.join(', '):'';const st=(it.status||'');const row='<tr><td>'+(it.instance||'')+'</td><td>'+st+'</td><td>'+(it.topic||'')+'</td><td>'+parts+'</td><td>'+Math.round(((it.lagTotal||0)*10))/10+'</td></tr>';inst.insertAdjacentHTML('beforeend',row);}}var ab=document.getElementById('assign-body');if(ab&&c.assignment){ab.innerHTML='';const keys=Object.keys(c.assignment);keys.sort((a,b)=>parseInt(a,10)-parseInt(b,10));for(const k of keys){const row='<tr><td>'+k+'</td><td>'+c.assignment[k]+'</td></tr>';ab.insertAdjacentHTML('beforeend',row);}}}catch(e){}})();</script>")
+			fmt.Fprintf(w, "<script>(async function(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();var el=null;if(el){var ttr=(j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');var snap=(j.restoringSnapshotId||'N/A');var ap=(j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');var sk=(j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');var cr=(j.causalReplayTotal!==undefined? j.causalReplayTotal:'N/A');el.innerHTML='<div>ttrMs: <b>'+ttr+'</b></div><div>snapshotId: <span class=\"muted\">'+snap+'</span></div><div>restore applied/skipped: <span class=\"muted\">'+ap+'</span>/<span class=\"muted\">'+sk+'</span></div><div>causal replay events: <span class=\"muted\">'+cr+'</span></div>';}"+
+			"var cut=document.getElementById('causal-cut');var body=document.getElementById('causal-body');if(cut&&body){if(j.causalCutId){cut.style.display='block';var id=j.causalCutId;var phase=j.causalPhase||'tracking';var seen=j.causalMarkersSeen||0;var total=j.causalMarkersTotal||0;var infl=j.causalInflight||0;body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { cut.style.display='none'; } }}catch(e){}"+
+			"})();</script>")
 			fmt.Fprintf(w, "<hr/><div><a href='/viz/'>Back to heatmap</a></div>")
 			fmt.Fprintf(w, "</body></html>")
 		})
