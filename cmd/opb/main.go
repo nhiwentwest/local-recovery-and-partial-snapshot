@@ -381,12 +381,12 @@ func run(cfg Config) error {
 		currentCut *barrierCut
 	)
 	ingestControlEnabled := cfg.InputSource == "kafka" && cfg.KafkaBootstrap != ""
-		if rm, err := readRestoreMetrics(metricsPath); err == nil {
-			appStatus.ApplyRestoreHistory(rm.TTRMs, rm.SnapshotID, rm.LastChangelogOffset, rm.Applied, rm.Skipped)
+	if rm, err := readRestoreMetrics(metricsPath); err == nil {
+		appStatus.ApplyRestoreHistory(rm.TTRMs, rm.SnapshotID, rm.LastChangelogOffset, rm.Applied, rm.Skipped)
 		appStatus.SetCausalReplay(rm.CausalReplayEvents)
 		log.Printf("restore history: loaded snapshotId=%s applied=%d skipped=%d causalReplay=%d", rm.SnapshotID, rm.Applied, rm.Skipped, rm.CausalReplayEvents)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			log.Printf("restore history: read error: %v", err)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("restore history: read error: %v", err)
 	}
 	zoneIdx := opb.NewZoneIndex()
 	// Shared injection producer and simple rate limiter
@@ -873,21 +873,21 @@ func run(cfg Config) error {
 					wg.Add(1)
 					go func(rr injectJob) {
 						defer wg.Done()
-				defer func() { recover() }()
-				for i := 0; i < rr.N; i++ {
-					store := rr.StoreID
-					prod := rr.ProductID
-					if prod == "" {
-						prod = fmt.Sprintf("p%d", (i%100)+1)
-					}
-					idx := i + rr.Start
-					ordID := fmt.Sprintf("%s-ord-%d-%d", rr.StoreID, rr.WS, idx)
-					ts := time.Now().Unix()
-					ws := opb.WindowStart(ts, cfg.WindowSizeSec)
-					if rr.WS > 0 {
-						ws = rr.WS
-						ts = rr.WS
-					}
+						defer func() { recover() }()
+						for i := 0; i < rr.N; i++ {
+							store := rr.StoreID
+							prod := rr.ProductID
+							if prod == "" {
+								prod = fmt.Sprintf("p%d", (i%100)+1)
+							}
+							idx := i + rr.Start
+							ordID := fmt.Sprintf("%s-ord-%d-%d", rr.StoreID, rr.WS, idx)
+							ts := time.Now().Unix()
+							ws := opb.WindowStart(ts, cfg.WindowSizeSec)
+							if rr.WS > 0 {
+								ws = rr.WS
+								ts = rr.WS
+							}
 							payload := opb.OrderEnriched{
 								OrderID:   ordID,
 								ProductID: prod,
@@ -897,12 +897,12 @@ func run(cfg Config) error {
 								TS:        ts,
 								Validated: true,
 								NormTS:    ws,
-					}
-					val, _ := json.Marshal(payload)
-					key := []byte(fmt.Sprintf("%s#%s#%d", store, prod, ws))
-					headers := []ck.Header{{Key: "epoch", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))}}
-					_ = injP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicEnriched, Partition: ck.PartitionAny}, Key: key, Value: val, Headers: headers}, nil)
-				}
+							}
+							val, _ := json.Marshal(payload)
+							key := []byte(fmt.Sprintf("%s#%s#%d", store, prod, ws))
+							headers := []ck.Header{{Key: "epoch", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))}}
+							_ = injP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicEnriched, Partition: ck.PartitionAny}, Key: key, Value: val, Headers: headers}, nil)
+						}
 					}(job)
 				}
 				wg.Wait()
@@ -1119,15 +1119,16 @@ func run(cfg Config) error {
 			// Recovery + Causal + Cluster panels (data from /status and /api/cluster)
 			fmt.Fprintf(w, "<div style='display:flex; flex-wrap:wrap; gap:12px; margin:12px 0'>")
 			// Live Causal Cut Status (hidden by default)
-			fmt.Fprintf(w, "<div id='causal-cut' style='flex:1 1 360px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef; display:none'>")
+			fmt.Fprintf(w, "<div id='causal-cut' style='flex:1 1 360px; padding:10px; border:1px solid #2b3152; border-radius:6px; background:#0c1229; color:#e6e9ef'>")
 			fmt.Fprintf(w, "<div style='font-weight:600; margin-bottom:6px'>Live Causal Cut</div>")
 			fmt.Fprintf(w, "<div class='small' id='causal-body'>no active cut</div>")
 			fmt.Fprintf(w, "</div>")
 			fmt.Fprintf(w, "</div>")
 			// Script to populate panels
 			fmt.Fprintf(w, "<script>(async function(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();var el=null;if(el){var ttr=(j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');var snap=(j.restoringSnapshotId||'N/A');var ap=(j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');var sk=(j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');var cr=(j.causalReplayTotal!==undefined? j.causalReplayTotal:'N/A');el.innerHTML='<div>ttrMs: <b>'+ttr+'</b></div><div>snapshotId: <span class=\"muted\">'+snap+'</span></div><div>restore applied/skipped: <span class=\"muted\">'+ap+'</span>/<span class=\"muted\">'+sk+'</span></div><div>causal replay events: <span class=\"muted\">'+cr+'</span></div>';}"+
-			"var cut=document.getElementById('causal-cut');var body=document.getElementById('causal-body');if(cut&&body){if(j.causalCutId){cut.style.display='block';var id=j.causalCutId;var phase=j.causalPhase||'tracking';var seen=j.causalMarkersSeen||0;var total=j.causalMarkersTotal||0;var infl=j.causalInflight||0;body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { cut.style.display='none'; } }}catch(e){}"+
-			"})();</script>")
+				"var cut=document.getElementById('causal-cut');var body=document.getElementById('causal-body');if(cut&&body){if(j.causalCutId){cut.style.display='block';var id=j.causalCutId;var phase=j.causalPhase||'tracking';var seen=j.causalMarkersSeen||0;var total=j.causalMarkersTotal||0;var infl=j.causalInflight||0;try{localStorage.setItem('opbLastCausal', JSON.stringify({id, phase, seen, total, infl, ts: Date.now()}));}catch(_){/* ignore */}body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'}; } else { try{var last=JSON.parse(localStorage.getItem('opbLastCausal')||'{}');}catch(_){last={};} if(last.id){ var age=Math.floor((Date.now()-(last.ts||Date.now()))/1000); body.innerHTML='<div>last id: <b>'+last.id+'</b></div><div>phase: <span class=\"muted\">'+(last.phase||'done')+'</span></div><div>markers: <span class=\"muted\">'+(last.seen||0)+'/'+(last.total||0)+'</span></div><div>inflight events: <span class=\"muted\">'+(last.infl||0)+'</span></div><div class=\"muted\">'+age+'s ago</div>'; } else { body.textContent='no active cut'; } } }}catch(e){}"+
+				"})();</script>")
+			fmt.Fprintf(w, "<script>(function(){const cut=document.getElementById('causal-cut');const body=document.getElementById('causal-body');async function refresh(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();if(!cut||!body)return;if(j.causalCutId){cut.style.display='block';const id=j.causalCutId,phase=j.causalPhase||'tracking',seen=j.causalMarkersSeen||0,total=j.causalMarkersTotal||0,infl=j.causalInflight||0;try{localStorage.setItem('opbLastCausal',JSON.stringify({id,phase,seen,total,infl,ts:Date.now()}));}catch(_){ } body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { let last={}; try{last=JSON.parse(localStorage.getItem('opbLastCausal')||'{}');}catch(_){ } if(last.id){const age=Math.floor((Date.now()-(last.ts||Date.now()))/1000); body.innerHTML='<div>last id: <b>'+last.id+'</b></div><div>phase: <span class=\"muted\">'+(last.phase||'done')+'</span></div><div>markers: <span class=\"muted\">'+(last.seen||0)+'/'+(last.total||0)+'</span></div><div>inflight events: <span class=\"muted\">'+(last.infl||0)+'</span></div><div class=\"muted\">'+age+'s ago</div>'; } else { body.textContent='no active cut'; }} }catch(e){} } setInterval(refresh,1000);})();</script>")
 			fmt.Fprintf(w, "<hr/><div><a href='/viz/'>Back to heatmap</a></div>")
 			fmt.Fprintf(w, "</body></html>")
 		})
@@ -1307,7 +1308,7 @@ func run(cfg Config) error {
 					}
 					if shouldWrite {
 						if err := writeRestoreMetrics(metricsPath, newMetrics); err != nil {
-						log.Printf("restore history: write error: %v", err)
+							log.Printf("restore history: write error: %v", err)
 						}
 					}
 					phaseTimings.MetricsMs = time.Since(metricsStart).Milliseconds()
@@ -1966,7 +1967,7 @@ func run(cfg Config) error {
 						}
 						bc.started = true
 						cutMu.Unlock()
-							pauseMu.Lock()
+						pauseMu.Lock()
 						func(bc *barrierCut) {
 							defer pauseMu.Unlock()
 							ass, _ := c.Assignment()
@@ -2006,7 +2007,7 @@ func run(cfg Config) error {
 								sw = fixedViewWriter{snap: sw, view: bc.preView}
 							}
 							writer := snapshotWriter{snap: sw}
-								t0 := time.Now()
+							t0 := time.Now()
 							causalFn := func(snapID string) (*snapcut.CausalInfo, error) {
 								cutMu.Lock()
 								defer cutMu.Unlock()
@@ -2026,7 +2027,7 @@ func run(cfg Config) error {
 									}
 									mreg.CausalInflight.Set(float64(total))
 									appStatus.SetCausalInflight(total)
-									} else {
+								} else {
 									if opbDebug {
 										log.Printf("barrier-cut: inflight empty")
 									}
@@ -2049,27 +2050,27 @@ func run(cfg Config) error {
 							m, res, err := snapcut.PerformBarrierCut(ctx, bc.cutType, bc.prev, st, collector, scanner, writer, mani, changelogAppendedCount, causalFn, time.Now)
 							if err != nil {
 								log.Printf("barrier-cut: perform error: %v", err)
-								} else {
-									durMs := float64(time.Since(t0).Milliseconds())
-									mreg.SnapshotTimeMs.Observe(durMs)
+							} else {
+								durMs := float64(time.Since(t0).Milliseconds())
+								mreg.SnapshotTimeMs.Observe(durMs)
 								var bytes float64
 								if strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta {
 									bytes = deltaSnapshotSizeBytes(m.SnapshotID, res.Format, res.Shards)
 									log.Printf("barrier-cut: delta-metrics id=%s keys=%d bytes=%.0f durMs=%.0f", m.SnapshotID, res.Keys, bytes, durMs)
-									} else {
+								} else {
 									bytes = snapshotSizeBytes(m.SnapshotID, res.Format, res.Shards)
-									}
+								}
 								mreg.SnapshotBytes.Set(bytes)
 								log.Printf("barrier-cut: manifest published id=%s type=%s", m.SnapshotID, m.SnapshotType)
-								}
+							}
 
 							if len(ass) > 0 && !ingestPaused.Load() {
 								if opbDebug {
 									log.Printf("barrier-cut: resuming partitions id=%s", bc.id)
-							}
+								}
 								if err := c.Resume(ass); err != nil {
 									log.Printf("barrier-cut: resume error: %v", err)
-							}
+								}
 							}
 							cutMu.Lock()
 							currentCut = nil
