@@ -17,15 +17,18 @@
     .grid { display: grid; grid-template-columns: 160px 1fr; gap: 8px 12px; align-items: center; }
     .btn { padding: 6px 10px; border: 1px solid #bbb; background: #fff; cursor: pointer; }
     .small { font-size: 12px; color: #555; }
+    .prom-block { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 16px; }
+    .prom-block input { width: 220px; }
+    canvas { border: 1px solid #ddd; border-radius: 6px; margin-top: 8px; }
   </style>
 </head>
 <body>
   <h2>Zone Details</h2>
   <div class="grid">
     <label>storeId</label>
-    <input id="storeId" placeholder="A-" />
+    <input id="storeId" value="RECOVERY-TEST" />
     <label>productId</label>
-    <input id="productId" placeholder="p1 (optional)" />
+    <input id="productId" value="p1" />
     <label>windowStart</label>
     <input id="ws" placeholder="epoch seconds (optional)" />
   </div>
@@ -34,111 +37,240 @@
     <label style="width:auto;margin-left:12px;">Auto refresh</label>
     <input type="checkbox" id="auto" checked />
   </div>
-  <div class="row">
-    <button class="btn" id="injectNew">Inject New</button>
-    <button class="btn" id="injectDup" style="margin-left:8px;">Inject Duplicates</button>
-    <span class="muted" style="margin-left:12px;">uses /api/inject-test-data</span>
-  </div>
   <div class="small" id="info"></div>
   <pre id="status" class="muted">Waiting...</pre>
 
+  <h3>Prometheus Time Series</h3>
+  <div class="prom-block">
+    <label style="width:auto;">Prometheus</label>
+    <input id="promUrl" />
+    <label style="width:auto;">Query</label>
+    <input id="promQuery" />
+    <label style="width:auto;">Range (min)</label>
+    <input id="promRange" value="180" />
+    <label style="width:auto;">Step (s)</label>
+    <input id="promStep" value="30" />
+    <button class="btn" id="promLoad">Load Series</button>
+    <span class="small muted">Use {{store}} placeholder for storeId</span>
+  </div>
+  <canvas id="promChart" width="720" height="220"></canvas>
+  <div id="promNote" class="small muted"></div>
+
+  <h3>Causal Snapshot Metrics</h3>
+  <div class="prom-block">
+    <label style="width:auto;">Query (causal)</label>
+    <input id="promQueryCausal" />
+    <button class="btn" id="promLoadCausal">Load Causal</button>
+    <span class="small muted">Default: opb_causal_inflight over time</span>
+  </div>
+  <canvas id="promChartCausal" width="720" height="220"></canvas>
+  <div id="promNoteCausal" class="small muted"></div>
+
   <script>
     const $ = (id) => document.getElementById(id);
+    const DEFAULT_STORE_ID = 'RECOVERY-TEST';
 
-    function getParams() {
-      const url = new URL(window.location.href);
-      const storeId = url.searchParams.get('id') || '';
-      const productId = url.searchParams.get('productId') || '';
-      const ws = url.searchParams.get('ws') || '';
-      if (storeId) $('#storeId').value = storeId;
-      if (productId) $('#productId').value = productId;
-      if (ws) $('#ws').value = ws;
-    }
-
-    function buildEndpoint() {
-      const origin = window.location.origin;
-      const storeId = $('#storeId').value.trim();
-      const productId = $('#productId').value.trim();
-      const ws = $('#ws').value.trim();
+    // --- Main Data Loading ---
+    async function loadData() {
+      const statusEl = $('status');
+      const infoEl = $('info');
+      const storeId = $('storeId').value.trim() || DEFAULT_STORE_ID;
+      const productId = $('productId').value.trim();
+      const ws = $('ws').value.trim();
+      
       const p = new URLSearchParams();
-      if (storeId) p.set('id', storeId);
-      if (productId && ws) { p.set('productId', productId); p.set('ws', ws); }
-      return `${origin}/api/zone-details?${p.toString()}`;
-    }
-
-    async function load() {
-      const storeId = $('#storeId').value.trim();
-      const productId = $('#productId').value.trim();
-      const ws = $('#ws').value.trim();
-      if (!storeId) {
-        $('#status').textContent = 'Please enter storeId';
-        $('#status').className = 'err';
-        return;
+      p.set('id', storeId);
+      if (productId && ws) {
+        p.set('productId', productId);
+        p.set('ws', ws);
       }
-      const url = buildEndpoint();
-      $('#info').textContent = `GET ${url}`;
-      $('#status').textContent = 'Loading...';
-      $('#status').className = 'muted';
+      const url = `${window.location.origin}/api/zone-details?${p.toString()}`;
+      infoEl.textContent = `GET ${url}`;
+      
       try {
         const res = await fetch(url, { cache: 'no-store' });
         const txt = await res.text();
-        try {
-          const obj = JSON.parse(txt);
-          $('#status').textContent = JSON.stringify(obj, null, 2);
-          $('#status').className = res.ok ? 'ok' : 'err';
-        } catch (e) {
-          $('#status').textContent = `Non-JSON response (status=${res.status}):\n` + txt;
-          $('#status').className = 'err';
-        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${txt}`);
+        const obj = JSON.parse(txt);
+        statusEl.textContent = JSON.stringify(obj, null, 2);
+        statusEl.className = 'ok';
       } catch (e) {
-        $('#status').textContent = 'Fetch error: ' + e.message;
-        $('#status').className = 'err';
+        statusEl.textContent = `Fetch error: ${e.message}`;
+        statusEl.className = 'err';
       }
     }
 
-    async function inject(mode) {
-      const origin = window.location.origin;
-      const storeId = $('#storeId').value.trim() || 'A-';
-      const productId = $('#productId').value.trim();
-      const ws = $('#ws').value.trim();
-      const body = { storeId, productId, mode, n: 50 };
-      if (ws) { body.ws = parseInt(ws, 10) || 0; }
-      const injUrl = `${origin}/api/inject-test-data`;
-      $('#info').textContent = `POST ${injUrl} body=${JSON.stringify(body)}`;
+    // --- Prometheus Charting ---
+    const promUrlInput = $('promUrl');
+    const promQueryInput = $('promQuery');
+    const promRangeInput = $('promRange');
+    const promStepInput = $('promStep');
+    const promChart = $('promChart');
+    const promNote = $('promNote');
+    const promQueryCausalInput = $('promQueryCausal');
+    const promChartCausal = $('promChartCausal');
+    const promNoteCausal = $('promNoteCausal');
+    promUrlInput.value = localStorage.getItem('opbPromBase') || `${window.location.protocol}//${window.location.hostname}:9090`;
+    // Default series: overall replay/apply throughput (1st chart) + causal inflight (2nd chart)
+    promQueryInput.value = localStorage.getItem('zonePromQuery') || 'rate(opb_events_applied_total[1m])';
+    promQueryCausalInput.value = localStorage.getItem('zonePromQueryCausal') || 'opb_causal_inflight';
+    promRangeInput.value = localStorage.getItem('zonePromRangeMin') || promRangeInput.value || '60';
+    promStepInput.value = localStorage.getItem('zonePromStepSec') || promStepInput.value || '15';
+
+    function drawPromChart(values) {
+      const ctx = promChart.getContext('2d');
+      ctx.clearRect(0, 0, promChart.width, promChart.height);
+      const cleaned = (values || []).map(v => [Number(v[0]), Number(v[1])]).filter(v => Number.isFinite(v[0]) && Number.isFinite(v[1]));
+      if (cleaned.length === 0) {
+        ctx.fillStyle = '#888';
+        ctx.fillText('No data from Prometheus', 10, 20);
+        return;
+      }
+      const nums = cleaned.map(v => v[1]).filter(n => Number.isFinite(n));
+      if (nums.length === 0) {
+        ctx.fillStyle = '#888';
+        ctx.fillText('No data from Prometheus', 10, 20);
+        return;
+      }
+      const min = Math.min(...nums);
+      const max = Math.max(...nums);
+      const span = max - min || 1;
+      ctx.strokeStyle = '#4c75f2';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      cleaned.forEach((v, idx) => {
+        const x = (idx / (cleaned.length - 1 || 1)) * promChart.width;
+        const y = promChart.height - ((v[1] - min) / span) * promChart.height;
+        if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.fillStyle = '#555';
+      ctx.font = '10px sans-serif';
+      ctx.fillText(`min=${min.toFixed(2)} max=${max.toFixed(2)}`, 6, promChart.height - 6);
+    }
+
+    let lastPromValues = null;
+    async function loadPromSeries(manual = true) {
+      const base = promUrlInput.value.trim().replace(/\/$/, '');
+      const storeId = $('storeId').value.trim() || DEFAULT_STORE_ID;
+      if (!base) { if (manual) promNote.textContent = 'Prometheus URL is empty'; return; }
+      
+      const tmpl = promQueryInput.value.trim();
+      const rangeMin = parseInt((promRangeInput && promRangeInput.value) || '180', 10) || 180;
+      const stepSec = parseInt((promStepInput && promStepInput.value) || '30', 10) || 30;
+      localStorage.setItem('opbPromBase', base);
+      localStorage.setItem('zonePromQuery', tmpl);
+      localStorage.setItem('zonePromRangeMin', String(rangeMin));
+      localStorage.setItem('zonePromStepSec', String(stepSec));
+      const query = tmpl.replace(/{{store}}/g, storeId);
+      const end = Math.floor(Date.now() / 1000);
+      const start = end - rangeMin * 60;
+      const step = stepSec;
+      const url = `${base}/api/v1/query_range?${new URLSearchParams({ query, start, end, step }).toString()}`;
+      
       try {
-        const res = await fetch(injUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        const txt = await res.text();
-        try {
-          const obj = JSON.parse(txt);
-          $('#status').textContent = 'Inject response:\n' + JSON.stringify(obj, null, 2);
-          $('#status').className = res.ok ? 'ok' : 'err';
-        } catch(e) {
-          $('#status').textContent = 'Inject response (raw):\n' + txt;
-          $('#status').className = 'err';
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.status !== 'success' || !data.data.result.length) {
+          promNote.textContent = `No data (query=${query}). Keeping last chart.`;
+          promNote.classList.add('err');
+          return;
         }
-      } catch(e) {
-        $('#status').textContent = 'Inject error: ' + e.message;
-        $('#status').className = 'err';
-    }
+        const values = data.data.result[0].values || [];
+        lastPromValues = values;
+        drawPromChart(values);
+        promNote.textContent = `Prom query="${query}" points=${values.length}`;
+        promNote.classList.remove('err');
+      } catch (err) {
+        promNote.textContent = `Prom error: ${err.message}. Keeping last chart.`;
+        promNote.classList.add('err');
+      }
     }
 
-    let timer = null;
+    async function loadPromSeriesCausal(manual = true) {
+      const base = promUrlInput.value.trim().replace(/\/$/, '');
+      if (!base) { if (manual) promNoteCausal.textContent = 'Prometheus URL is empty'; return; }
+
+      const tmpl = promQueryCausalInput.value.trim();
+      const rangeMin = parseInt((promRangeInput && promRangeInput.value) || '180', 10) || 180;
+      const stepSec = parseInt((promStepInput && promStepInput.value) || '30', 10) || 30;
+      localStorage.setItem('opbPromBase', base);
+      localStorage.setItem('zonePromQueryCausal', tmpl);
+      localStorage.setItem('zonePromRangeMin', String(rangeMin));
+      localStorage.setItem('zonePromStepSec', String(stepSec));
+
+      const query = tmpl;
+      const end = Math.floor(Date.now() / 1000);
+      const start = end - rangeMin * 60;
+      const step = stepSec;
+      const url = `${base}/api/v1/query_range?${new URLSearchParams({ query, start, end, step }).toString()}`;
+
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.status !== 'success' || !data.data.result.length) {
+          promNoteCausal.textContent = `No data (query=${query}). Keeping last chart.`;
+          promNoteCausal.classList.add('err');
+          return;
+        }
+        const values = data.data.result[0].values || [];
+        const ctx = promChartCausal.getContext('2d');
+        ctx.clearRect(0, 0, promChartCausal.width, promChartCausal.height);
+        const cleaned = (values || []).map(v => [Number(v[0]), Number(v[1])]).filter(v => Number.isFinite(v[0]) && Number.isFinite(v[1]));
+        if (cleaned.length === 0) {
+          ctx.fillStyle = '#888';
+          ctx.fillText('No data from Prometheus', 10, 20);
+          return;
+        }
+        const nums = cleaned.map(v => v[1]).filter(n => Number.isFinite(n));
+        if (nums.length === 0) {
+          ctx.fillStyle = '#888';
+          ctx.fillText('No data from Prometheus', 10, 20);
+          return;
+        }
+        const min = Math.min(...nums);
+        const max = Math.max(...nums);
+        const span = max - min || 1;
+        ctx.strokeStyle = '#e11d48';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        cleaned.forEach((v, idx) => {
+          const x = (idx / (cleaned.length - 1 || 1)) * promChartCausal.width;
+          const y = promChartCausal.height - ((v[1] - min) / span) * promChartCausal.height;
+          if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.fillStyle = '#555';
+        ctx.font = '10px sans-serif';
+        ctx.fillText(`min=${min.toFixed(2)} max=${max.toFixed(2)}`, 6, promChartCausal.height - 6);
+        promNoteCausal.textContent = `Prom query="${query}" points=${values.length}`;
+        promNoteCausal.classList.remove('err');
+      } catch (err) {
+        promNoteCausal.textContent = `Prom error: ${err.message}. Keeping last chart.`;
+        promNoteCausal.classList.add('err');
+      }
+    }
+
+    // --- Initialization and Timers ---
     function tick() {
-      if ($('#auto').checked) load();
+      if ($('auto').checked) {
+        try { loadData(); } catch (e) { console.error('Error in loadData tick:', e); }
+        try { loadPromSeries(false); } catch (e) { console.error('Error in loadPromSeries tick:', e); }
+      }
     }
 
-    $('#load').onclick = load;
-    $('#auto').onchange = () => { if ($('#auto').checked) { load(); } };
-    $('#injectNew').onclick = () => inject('new');
-    $('#injectDup').onclick = () => inject('duplicate');
+    $('load').onclick = loadData;
+    $('promLoad').onclick = () => loadPromSeries(true);
+    $('promLoadCausal').onclick = () => loadPromSeriesCausal(true);
 
-    getParams();
-    load();
-    timer = setInterval(tick, 2000);
+    document.addEventListener('DOMContentLoaded', () => {
+      loadData();
+      loadPromSeries(false);
+      loadPromSeriesCausal(false);
+      setInterval(tick, 5000);
+    });
   </script>
 </body>
 </html>

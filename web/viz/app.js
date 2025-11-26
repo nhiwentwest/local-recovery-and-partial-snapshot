@@ -16,6 +16,31 @@ toggleWsSelector();
 // Ghi nhớ giá trị lần trước để hiển thị xu hướng ▲/▼ theo phút
 const prevValues = new Map();
 
+// Prometheus helpers
+const promUrlInput = document.getElementById('prom-url');
+const promSaveBtn = document.getElementById('save-prom');
+const promRefreshBtn = document.getElementById('prom-refresh');
+const promCausalStatus = document.getElementById('prom-causal-status');
+const promLagStatus = document.getElementById('prom-lag-status');
+const storedProm = localStorage.getItem('opbPromBase');
+const defaultProm = storedProm || `${window.location.protocol}//${window.location.hostname}:9090`;
+if (promUrlInput) {
+  promUrlInput.value = defaultProm;
+}
+const getPromBase = () => (promUrlInput ? promUrlInput.value.trim().replace(/\/$/, '') : '');
+if (promSaveBtn) {
+  promSaveBtn.onclick = () => {
+    const base = getPromBase();
+    if (base) {
+      localStorage.setItem('opbPromBase', base);
+      refreshPromPanels();
+    }
+  };
+}
+if (promRefreshBtn) {
+  promRefreshBtn.onclick = () => refreshPromPanels(true);
+}
+
 async function load(){
   const params = new URLSearchParams();
   params.set('metric', metricSel.value);
@@ -154,5 +179,82 @@ function render(data){
 
 load();
 setInterval(load, 2000);
+
+async function queryPromRange(query, seconds = 300) {
+  const base = getPromBase();
+  if (!base) throw new Error('Prometheus URL not set');
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - seconds;
+  const step = Math.max(1, Math.floor(seconds / 200));
+  const url = `${base}/api/v1/query_range?${new URLSearchParams({
+    query,
+    start,
+    end,
+    step,
+  }).toString()}`;
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (data.status !== 'success' || !data.data.result.length) return [];
+  return data.data.result[0].values || [];
+}
+
+function drawPromSeries(canvasId, values, color) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!values.length) {
+    ctx.fillStyle = '#999';
+    ctx.fillText('No data', 10, 20);
+    return;
+  }
+  const nums = values.map(v => Number(v[1]));
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  const span = max - min || 1;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  values.forEach((v, idx) => {
+    const x = (idx / (values.length - 1 || 1)) * canvas.width;
+    const y = canvas.height - ((Number(v[1]) - min) / span) * canvas.height;
+    if (idx === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = '#555';
+  ctx.font = '10px sans-serif';
+  ctx.fillText(`min=${min.toFixed(2)} max=${max.toFixed(2)}`, 4, canvas.height - 4);
+}
+
+async function renderPromPanel(canvasId, statusEl, query, color) {
+  if (!promUrlInput) return;
+  try {
+    const values = await queryPromRange(query);
+    drawPromSeries(canvasId, values, color);
+    if (statusEl) statusEl.textContent = values.length ? `points=${values.length}` : 'no series';
+    if (statusEl) statusEl.classList.remove('err');
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = `error: ${err.message}`;
+      statusEl.classList.add('err');
+    }
+  }
+}
+
+function refreshPromPanels(manual = false) {
+  if (!promUrlInput) return;
+  const base = getPromBase();
+  if (!base) {
+    if (manual && promCausalStatus) promCausalStatus.textContent = 'Set Prometheus URL';
+    return;
+  }
+  renderPromPanel('prom-causal', promCausalStatus, 'sum(opb_causal_inflight)', '#f39c12');
+  renderPromPanel('prom-lag', promLagStatus, 'sum(opb_changelog_lag)', '#1abc9c');
+}
+
+refreshPromPanels();
+setInterval(refreshPromPanels, 15000);
 
 

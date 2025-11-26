@@ -352,6 +352,34 @@ func run(cfg Config) error {
 
 	// Prometheus metrics registry
 	mreg := metrics.NewRegistry()
+	// Helper: seed per-store Prometheus gauges from current state (used after restore)
+	seedStoreGauges := func() {
+		if mreg.StoreSumQty == nil || mreg.StoreSumAmount == nil {
+			return
+		}
+		totals := make(map[string]struct {
+			sumA int64
+			sumQ int64
+		})
+		_ = st.Range(func(key string, rs state.RecordState) error {
+			parts := strings.Split(key, "#")
+			if len(parts) != 3 {
+				return nil
+			}
+			store := parts[0]
+			agg := totals[store]
+			agg.sumA += rs.SumAmount
+			agg.sumQ += rs.SumQty
+			totals[store] = agg
+			return nil
+		})
+		for store, agg := range totals {
+			mreg.StoreSumQty.WithLabelValues(store).Set(float64(agg.sumQ))
+			mreg.StoreSumAmount.WithLabelValues(store).Set(float64(agg.sumA))
+		}
+	}
+	// Seed once at startup in case state store already has data
+	seedStoreGauges()
 	// HTTP for health/metrics on dedicated mux to avoid handler conflicts
 	appStatus := opb.NewStatusManager(cfg.InstanceID, cfg.GroupID, cfg.WindowSizeSec)
 	metricsPath := filepath.Join(cfg.StateDir, "restore-metrics.json")
@@ -834,22 +862,22 @@ func run(cfg Config) error {
 			}
 			injLast[ip] = now
 			type injectJob struct {
-				StoreID      string  `json:"storeId"`
-				ProductID    string  `json:"productId"`
-				WS           int64   `json:"ws"`
-				Mode         string  `json:"mode"`
-				N            int     `json:"n"`
-				Start        int     `json:"start"`
-				Sync         bool    `json:"sync"`
+				StoreID   string `json:"storeId"`
+				ProductID string `json:"productId"`
+				WS        int64  `json:"ws"`
+				Mode      string `json:"mode"`
+				N         int    `json:"n"`
+				Start     int    `json:"start"`
+				Sync      bool   `json:"sync"`
 				// Ride-like optional fields for realistic pricing
-				DistanceKm   float64 `json:"distanceKm,omitempty"`
+				DistanceKm    float64 `json:"distanceKm,omitempty"`
 				DistanceMinKm float64 `json:"distanceMinKm,omitempty"`
 				DistanceMaxKm float64 `json:"distanceMaxKm,omitempty"`
-				FareBase     int64   `json:"fareBase,omitempty"`
-				FarePerKm    int64   `json:"farePerKm,omitempty"`
-				SurgeMin     float64 `json:"surgeMin,omitempty"`
-				SurgeMax     float64 `json:"surgeMax,omitempty"`
-				Currency     string  `json:"currency,omitempty"`
+				FareBase      int64   `json:"fareBase,omitempty"`
+				FarePerKm     int64   `json:"farePerKm,omitempty"`
+				SurgeMin      float64 `json:"surgeMin,omitempty"`
+				SurgeMax      float64 `json:"surgeMax,omitempty"`
+				Currency      string  `json:"currency,omitempty"`
 			}
 			var req []injectJob
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -901,34 +929,52 @@ func run(cfg Config) error {
 								ts = rr.WS
 							}
 							// Ride-like pricing computation (optional); fallback to default 10000
-						dKm := rr.DistanceKm
-						if dKm <= 0 {
-							if rr.DistanceMaxKm > 0 {
-								min := rr.DistanceMinKm
-								max := rr.DistanceMaxKm
-								if max < min { max = min }
-								dKm = min + rng.Float64()*(max-min+1e-9)
-							} else {
-								dKm = 1.0 + rng.Float64()*4.0
+							dKm := rr.DistanceKm
+							if dKm <= 0 {
+								if rr.DistanceMaxKm > 0 {
+									min := rr.DistanceMinKm
+									max := rr.DistanceMaxKm
+									if max < min {
+										max = min
+									}
+									dKm = min + rng.Float64()*(max-min+1e-9)
+								} else {
+									dKm = 1.0 + rng.Float64()*4.0
+								}
 							}
-						}
-						base := rr.FareBase
-						if base <= 0 { base = 5000 }
-						perKm := rr.FarePerKm
-						if perKm <= 0 { perKm = 3500 }
-						surgeMin := rr.SurgeMin
-						surgeMax := rr.SurgeMax
-						if surgeMin <= 0 { surgeMin = 1.0 }
-						if surgeMax <= 0 { surgeMax = surgeMin }
-						if surgeMax < surgeMin { surgeMax = surgeMin }
-						surge := surgeMin
-						if surgeMax > surgeMin { surge = surgeMin + rng.Float64()*(surgeMax-surgeMin) }
-						price := int64(math.Round((float64(base)+float64(perKm)*dKm) * surge))
-						if price <= 0 { price = 10000 }
-						currency := rr.Currency
-						if currency == "" { currency = "VND" }
+							base := rr.FareBase
+							if base <= 0 {
+								base = 5000
+							}
+							perKm := rr.FarePerKm
+							if perKm <= 0 {
+								perKm = 3500
+							}
+							surgeMin := rr.SurgeMin
+							surgeMax := rr.SurgeMax
+							if surgeMin <= 0 {
+								surgeMin = 1.0
+							}
+							if surgeMax <= 0 {
+								surgeMax = surgeMin
+							}
+							if surgeMax < surgeMin {
+								surgeMax = surgeMin
+							}
+							surge := surgeMin
+							if surgeMax > surgeMin {
+								surge = surgeMin + rng.Float64()*(surgeMax-surgeMin)
+							}
+							price := int64(math.Round((float64(base) + float64(perKm)*dKm) * surge))
+							if price <= 0 {
+								price = 10000
+							}
+							currency := rr.Currency
+							if currency == "" {
+								currency = "VND"
+							}
 
-						payload := opb.OrderEnriched{
+							payload := opb.OrderEnriched{
 								OrderID:   ordID,
 								ProductID: prod,
 								Price:     price,
@@ -1166,9 +1212,9 @@ func run(cfg Config) error {
 			fmt.Fprintf(w, "</div>")
 			// Script to populate panels
 			fmt.Fprintf(w, "<script>(async function(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();var el=null;if(el){var ttr=(j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');var snap=(j.restoringSnapshotId||'N/A');var ap=(j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');var sk=(j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');var cr=(j.causalReplayTotal!==undefined? j.causalReplayTotal:'N/A');el.innerHTML='<div>ttrMs: <b>'+ttr+'</b></div><div>snapshotId: <span class=\"muted\">'+snap+'</span></div><div>restore applied/skipped: <span class=\"muted\">'+ap+'</span>/<span class=\"muted\">'+sk+'</span></div><div>causal replay events: <span class=\"muted\">'+cr+'</span></div>';}"+
-				"var cut=document.getElementById('causal-cut');var body=document.getElementById('causal-body');if(cut&&body){if(j.causalCutId){cut.style.display='block';var id=j.causalCutId;var phase=j.causalPhase||'tracking';var seen=j.causalMarkersSeen||0;var total=j.causalMarkersTotal||0;var infl=j.causalInflight||0;try{localStorage.setItem('opbLastCausal', JSON.stringify({id, phase, seen, total, infl, ts: Date.now()}));}catch(_){/* ignore */}body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'}; } else { try{var last=JSON.parse(localStorage.getItem('opbLastCausal')||'{}');}catch(_){last={};} if(last.id){ var age=Math.floor((Date.now()-(last.ts||Date.now()))/1000); body.innerHTML='<div>last id: <b>'+last.id+'</b></div><div>phase: <span class=\"muted\">'+(last.phase||'done')+'</span></div><div>markers: <span class=\"muted\">'+(last.seen||0)+'/'+(last.total||0)+'</span></div><div>inflight events: <span class=\"muted\">'+(last.infl||0)+'</span></div><div class=\"muted\">'+age+'s ago</div>'; } else { body.textContent='no active cut'; } } }}catch(e){}"+
+				"var cut=document.getElementById('causal-cut');var body=document.getElementById('causal-body');if(cut&&body){if(j.causalCutId){cut.style.display='block';var id=j.causalCutId;var phase=j.causalPhase||'';var seen=j.causalMarkersSeen||0;var total=j.causalMarkersTotal||0;var infl=j.causalInflight||0;try{localStorage.setItem('opbLastCausal', JSON.stringify({id, phase, seen, total, infl, ts: Date.now()}));}catch(_){/* ignore */}body.innerHTML='<div>id: <b>'+id+'</b></div>'+(phase?'<div>phase: <span class=\"muted\">'+phase+'</span></div>':'')+'<div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { try{var last=JSON.parse(localStorage.getItem('opbLastCausal')||'{}');}catch(_){last={};} if(last.id){ var age=Math.floor((Date.now()-(last.ts||Date.now()))/1000); if(age>300){cut.style.display='none';}else{cut.style.display='block';body.innerHTML='<div>last id: <b>'+last.id+'</b></div>'+(last.phase?'<div>phase: <span class=\"muted\">'+last.phase+'</span></div>':'')+'<div>markers: <span class=\"muted\">'+(last.seen||0)+'/'+(last.total||0)+'</span></div><div>inflight events: <span class=\"muted\">'+(last.infl||0)+'</span></div><div class=\"muted\">'+age+'s ago</div>';} } else { cut.style.display='none'; body.textContent='no active cut'; } } }}catch(e){}"+
 				"})();</script>")
-			fmt.Fprintf(w, "<script>(function(){const cut=document.getElementById('causal-cut');const body=document.getElementById('causal-body');async function refresh(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();if(!cut||!body)return;if(j.causalCutId){cut.style.display='block';const id=j.causalCutId,phase=j.causalPhase||'tracking',seen=j.causalMarkersSeen||0,total=j.causalMarkersTotal||0,infl=j.causalInflight||0;try{localStorage.setItem('opbLastCausal',JSON.stringify({id,phase,seen,total,infl,ts:Date.now()}));}catch(_){ } body.innerHTML='<div>id: <b>'+id+'</b></div><div>phase: <span class=\"muted\">'+phase+'</span></div><div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { let last={}; try{last=JSON.parse(localStorage.getItem('opbLastCausal')||'{}');}catch(_){ } if(last.id){const age=Math.floor((Date.now()-(last.ts||Date.now()))/1000); body.innerHTML='<div>last id: <b>'+last.id+'</b></div><div>phase: <span class=\"muted\">'+(last.phase||'done')+'</span></div><div>markers: <span class=\"muted\">'+(last.seen||0)+'/'+(last.total||0)+'</span></div><div>inflight events: <span class=\"muted\">'+(last.infl||0)+'</span></div><div class=\"muted\">'+age+'s ago</div>'; } else { body.textContent='no active cut'; }} }catch(e){} } setInterval(refresh,1000);})();</script>")
+			fmt.Fprintf(w, "<script>(function(){const cut=document.getElementById('causal-cut');const body=document.getElementById('causal-body');async function refresh(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();if(!cut||!body)return;if(j.causalCutId){cut.style.display='block';const id=j.causalCutId,phase=j.causalPhase||'',seen=j.causalMarkersSeen||0,total=j.causalMarkersTotal||0,infl=j.causalInflight||0;try{localStorage.setItem('opbLastCausal',JSON.stringify({id,phase,seen,total,infl,ts:Date.now()}));}catch(_){ } body.innerHTML='<div>id: <b>'+id+'</b></div>'+(phase?'<div>phase: <span class=\"muted\">'+phase+'</span></div>':'')+'<div>markers: <span class=\"muted\">'+seen+'/'+total+'</span></div><div>inflight events: <span class=\"muted\">'+infl+'</span></div>'; } else { let last={}; try{last=JSON.parse(localStorage.getItem('opbLastCausal')||'{}');}catch(_){ } if(last.id){const age=Math.floor((Date.now()-(last.ts||Date.now()))/1000);if(age>300){cut.style.display='none';}else{cut.style.display='block';body.innerHTML='<div>last id: <b>'+last.id+'</b></div>'+(last.phase?'<div>phase: <span class=\"muted\">'+last.phase+'</span></div>':'')+'<div>markers: <span class=\"muted\">'+(last.seen||0)+'/'+(last.total||0)+'</span></div><div>inflight events: <span class=\"muted\">'+(last.infl||0)+'</span></div><div class=\"muted\">'+age+'s ago</div>';} } else { cut.style.display='none'; body.textContent='no active cut'; }} }catch(e){} } setInterval(refresh,1000);})();</script>")
 			fmt.Fprintf(w, "<hr/><div><a href='/viz/'>Back to heatmap</a></div>")
 			fmt.Fprintf(w, "</body></html>")
 		})
@@ -1321,6 +1367,8 @@ func run(cfg Config) error {
 				} else {
 					elapsed := time.Since(t0)
 					appStatus.SetRecovered(elapsed, int64(result.Applied), int64(result.Skipped))
+					// After restore, seed per-store gauges for Prometheus
+					seedStoreGauges()
 					restoreTsDone := time.Now()
 					log.Printf("restore completed: applied=%d skipped=%d elapsedMs=%.0f finishedAt=%s", result.Applied, result.Skipped, elapsed.Seconds()*1000, restoreTsDone.Format(time.RFC3339Nano))
 					log.Printf("restore ts: start=%s done=%s", restoreTsStart.Format(time.RFC3339Nano), restoreTsDone.Format(time.RFC3339Nano))
@@ -1601,7 +1649,7 @@ func run(cfg Config) error {
 					_ = injP.Produce(&ck.Message{TopicPartition: tp, Key: []byte("barrier"), Value: nil, Headers: hdrs}, nil)
 				}
 				injP.Flush(5000)
-				appStatus.SetCausalPhase("marker-propagation")
+				// Phase will be set to "marker-propagation" when first barrier is received
 				log.Printf("snapshot-cut: barrier injected id=%s parts=%v type=%s", id, parts, req.cutType)
 			}
 		}()
@@ -1721,6 +1769,7 @@ func run(cfg Config) error {
 							log.Printf("import: preparing to load %d keys into state store...", len(buf))
 							st.LoadAll(buf)
 							stateImported.Store(true)
+							seedStoreGauges()
 							log.Printf("import: finished loading %d keys from %s", len(buf), peer)
 						}()
 					})
@@ -1981,6 +2030,7 @@ func run(cfg Config) error {
 				cutMu.Lock()
 				bc := currentCut
 				if bc != nil && bc.id == bid {
+					wasFirstBarrier := len(bc.seen) == 0
 					bc.seen[msg.TopicPartition.Partition] = true
 					seenCount := 0
 					for _, ok := range bc.seen {
@@ -1989,6 +2039,13 @@ func run(cfg Config) error {
 						}
 					}
 					appStatus.SetCausalMarkers(seenCount)
+					// Set phase to "marker-propagation" when first barrier is received
+					if wasFirstBarrier {
+						appStatus.SetCausalPhase("marker-propagation")
+						if opbDebug {
+							log.Printf("barrier-cut: first barrier received id=%s part=%d", bid, msg.TopicPartition.Partition)
+						}
+					}
 					if opbDebug {
 						log.Printf("barrier-cut: ack id=%s part=%d seen=%d/%d", bid, msg.TopicPartition.Partition, seenCount, len(bc.expected))
 					}
@@ -2115,6 +2172,7 @@ func run(cfg Config) error {
 							cutMu.Lock()
 							currentCut = nil
 							cutMu.Unlock()
+							// Clear causal cut status immediately after snapshot completes
 							appStatus.ClearCausalCut()
 						}(bc)
 						continue
@@ -2173,6 +2231,12 @@ func run(cfg Config) error {
 				appStatus.IncEventsApplied(1)
 				// Update per-store aggregates index for zone details
 				zoneIdx.OnApplied(ev.StoreID, ev.Price*ev.Qty, ev.Qty, cfg.InstanceID)
+				// Update Prometheus per-store gauges so UI can query opb_store_sum_* by storeId
+				if mreg.StoreSumQty != nil && mreg.StoreSumAmount != nil {
+					sumA, sumQ, _ := zoneIdx.Snapshot(ev.StoreID)
+					mreg.StoreSumQty.WithLabelValues(ev.StoreID).Set(float64(sumQ))
+					mreg.StoreSumAmount.WithLabelValues(ev.StoreID).Set(float64(sumA))
+				}
 				dlogf("aggregate: applied key=%s seq=%d prevLast=%d", out.Key, seq, prevSt.LastSeq)
 				b, _ := json.Marshal(out)
 				if p != nil {

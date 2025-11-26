@@ -28,6 +28,14 @@ SNAPSHOT_INTERVAL=${SNAPSHOT_INTERVAL:-0} # seconds (disable periodic cuts to av
 export WINDOW_SIZE=${WINDOW_SIZE:-3600} # seconds (must match pump and WS calc)
 AUTO_Y=${AUTO_Y:-0}
 INTERACTIVE=${INTERACTIVE:-1}
+# Ride-like pricing params (optional)
+RIDE_BASE=${RIDE_BASE:-}
+RIDE_PER_KM=${RIDE_PER_KM:-}
+RIDE_DIST_MIN=${RIDE_DIST_MIN:-}
+RIDE_DIST_MAX=${RIDE_DIST_MAX:-}
+RIDE_SURGE_MIN=${RIDE_SURGE_MIN:-}
+RIDE_SURGE_MAX=${RIDE_SURGE_MAX:-}
+RIDE_CCY=${RIDE_CCY:-}
 # Shutdown/view controls
 NO_SHUTDOWN=${NO_SHUTDOWN:-0}                  # 1 = do NOT stop OpB at the end
 SLEEP_BEFORE_SHUTDOWN=${SLEEP_BEFORE_SHUTDOWN:-30} # default 30s for non-interactive runs
@@ -106,6 +114,42 @@ require_jq() {
   fi
 }
 
+# Poll /status to track causal cut progress and finalize
+wait_causal_finalized() {
+  local base=${1:-$OPB1_HTTP}
+  local timeout=${2:-60}
+  echo "[causal] waiting up to ${timeout}s..."
+  for ((i=1;i<=timeout;i++)); do
+    local j id seen tot phase
+    j=$(curl -s "$base/status" || true)
+    id=$(jq -r '.causalCutId // ""' <<<"$j")
+    seen=$(jq -r '.causalMarkersSeen // 0' <<<"$j")
+    tot=$(jq -r '.causalMarkersTotal // 0' <<<"$j")
+    phase=$(jq -r '.causalPhase // ""' <<<"$j")
+    printf "\r  [%2d] id=%s phase=%s markers=%s/%s" "$i" "${id:-nil}" "${phase:-nil}" "$seen" "$tot"
+    if [[ "$id" != "" && "$tot" -gt 0 && "$seen" -eq "$tot" ]]; then
+      echo; return 0
+    fi
+    sleep 1
+  done
+  echo; echo "[causal] WARN timeout"; return 1
+}
+
+# Parse restore phases line from logs and assert skip replay presence
+parse_restore_phases() {
+  local logf=${1:-$OPB1_LOG}
+  grep -F "restore phases:" "$logf" | tail -n1 | sed -E 's/.*restore phases: //'
+}
+
+assert_skip_replay() {
+  local logf=${1:-$OPB1_LOG}
+  if grep -q "skipping changelog replay" "$logf"; then
+    echo "[restore] ✓ skipped Kafka replay (no backlog)"
+  else
+    echo "[restore] info: Kafka replay executed (backlog existed)"
+  fi
+}
+
 post_inject() {
   local payload=$1
   local tries=${2:-8}
@@ -118,6 +162,17 @@ post_inject() {
     echo "$resp"; return 0
   done
   echo "$resp"; return 0
+}
+
+# Build optional extra pricing fields for ride-like pricing
+build_extra_fields() {
+  local extra=""
+  if [[ -n "${RIDE_BASE}" ]]; then extra+=",\"fareBase\":${RIDE_BASE}"; fi
+  if [[ -n "${RIDE_PER_KM}" ]]; then extra+=",\"farePerKm\":${RIDE_PER_KM}"; fi
+  if [[ -n "${RIDE_DIST_MIN}" && -n "${RIDE_DIST_MAX}" ]]; then extra+=",\"distanceMinKm\":${RIDE_DIST_MIN},\"distanceMaxKm\":${RIDE_DIST_MAX}"; fi
+  if [[ -n "${RIDE_SURGE_MIN}" && -n "${RIDE_SURGE_MAX}" ]]; then extra+=",\"surgeMin\":${RIDE_SURGE_MIN},\"surgeMax\":${RIDE_SURGE_MAX}"; fi
+  if [[ -n "${RIDE_CCY}" ]]; then extra+=",\"currency\":\"${RIDE_CCY}\""; fi
+  printf '%s' "$extra"
 }
 
 get_lastseq() {
@@ -182,12 +237,14 @@ inject_delta_batch() {
   local total_base=$DELTA_BASE_EVENTS
   local extra_total=0
   local json_payload="["
+  local extra_fields
+  extra_fields=$(build_extra_fields)
 
-  json_payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${DELTA_BASE_EVENTS},\"start\":1000,\"sync\":true}"
+  json_payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${DELTA_BASE_EVENTS},\"start\":1000,\"sync\":true${extra_fields}}"
 
   for store in "${DELTA_STORES[@]}"; do
     json_payload+=','
-    json_payload+="{\"storeId\":\"$store\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${DELTA_EVENTS_PER_STORE},\"start\":0}"
+    json_payload+="{\"storeId\":\"$store\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${DELTA_EVENTS_PER_STORE},\"start\":0${extra_fields}}"
     extra_total=$((extra_total + DELTA_EVENTS_PER_STORE))
   done
 
@@ -209,7 +266,9 @@ inject_post_cut_events() {
   fi
   say "Injecting $count post-cut events (after manifest) for $STORE"
   local payload="["
-  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":60000,\"sync\":true}"
+  local extra_fields
+  extra_fields=$(build_extra_fields)
+  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":60000,\"sync\":true${extra_fields}}"
   payload+="]"
   RESP=$(post_inject "$payload")
   if command -v jq >/dev/null 2>&1; then echo "$RESP" | jq .; else echo "$RESP"; fi
@@ -230,7 +289,9 @@ seed_baseline_state() {
   fi
   say "Seeding baseline state with $count events for $STORE (sync)"
   local payload="["
-  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":0,\"sync\":true}"
+  local extra_fields
+  extra_fields=$(build_extra_fields)
+  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":0,\"sync\":true${extra_fields}}"
   payload+="]"
   RESP=$(post_inject "$payload")
   if command -v jq >/dev/null 2>&1; then echo "$RESP" | jq .; else echo "$RESP"; fi
@@ -294,15 +355,26 @@ delete_topic_if_exists() {
   kadmin -cmd delete -topic "$topic" || true
 }
 
-if [[ "$AUTO_Y" != "1" && "$INTERACTIVE" != "0" && ! -t 0 && -e /dev/tty ]]; then
-  exec </dev/tty
-fi
 
 ask_continue() {
   local msg=${1:-"Press y to continue, n to abort"}
-  if [[ "$AUTO_Y" == "1" ]]; then return 0; fi
-  if [[ "$INTERACTIVE" == "0" ]]; then return 0; fi
-  local ans=""; while true; do read -r -p "${msg} [y/n]: " ans || true; case "$ans" in y|Y) return 0;; n|N) return 1;; *) echo "Please answer y or n.";; esac; done
+  # Auto-continue switches
+  if [[ "$AUTO_Y" == "1" || "$INTERACTIVE" == "0" ]]; then return 0; fi
+  # Optional timeout (seconds). If set and no input within timeout, default to 'y'
+  local timeout=${ASK_TIMEOUT:-0}
+  local ans=""
+  while true; do
+    if [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout > 0 )); then
+      read -r -t "$timeout" -p "${msg} [y/n]: " ans || { echo; echo "[demo] No input in ${timeout}s, defaulting to 'y'"; ans="y"; }
+    else
+      read -r -p "${msg} [y/n]: " ans
+    fi
+    case "$ans" in
+      y|Y) return 0 ;;
+      n|N) return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
 }
 
 wait_ready() {
@@ -326,6 +398,171 @@ wait_assignment_count() {
   done
   say "WARN: B1 partition count did not reach $expected"
   return 1
+}
+
+# --- Metrics & Visualization Helpers ---
+METRICS_LOG=${METRICS_LOG:-./logs/demo_metrics.log}
+mkdir -p "$(dirname "$METRICS_LOG")" 2>/dev/null || true
+: > "$METRICS_LOG" 2>/dev/null || true
+PROM_URL=${PROM_URL:-http://127.0.0.1:9090}
+
+log_metrics() {
+  local msg=$1
+  mkdir -p "$(dirname "$METRICS_LOG")" 2>/dev/null || true
+  printf '[metrics] %s\n' "$msg" | tee -a "$METRICS_LOG"
+}
+
+prom_query_value() {
+  local query=$1
+  # Best-effort: never fail the demo if Prometheus is absent or returns error
+  if [[ -z "${PROM_URL:-}" ]]; then
+    echo ""
+    return 0
+  fi
+  local resp
+  resp=$(curl -sG "$PROM_URL/api/v1/query" --data-urlencode "query=$query" 2>/dev/null || true)
+  if [[ -z "$resp" ]]; then
+    echo ""
+    return 0
+  fi
+  local status
+  status=$(jq -r '.status // ""' <<<"$resp" 2>/dev/null || echo "")
+  if [[ "$status" != "success" ]]; then
+    echo ""
+    return 0
+  fi
+  jq -r '.data.result[0].value[1]' <<<"$resp" 2>/dev/null || echo ""
+}
+
+log_prom_metric() {
+  local label=$1 query=$2
+  if [[ -z "${PROM_URL:-}" ]]; then
+    log_metrics "[$label] WARN PROM_URL not set; skip query=$query"
+    return
+  fi
+  local value
+  value=$(prom_query_value "$query")
+  if [[ -n "$value" && "$value" != "null" ]]; then
+    log_metrics "[$label] prom query=$query value=$value"
+  else
+    log_metrics "[$label] WARN prometheus query returned empty (query=$query)"
+  fi
+}
+
+log_status_endpoint() {
+  local label=${1:-status} base=${2:-$OPB1_HTTP}
+  local resp
+  resp=$(curl -s "$base/status" 2>/dev/null || true)
+  if [[ -z "$resp" ]]; then
+    log_metrics "[$label] WARN empty /status response from $base"
+    return
+  fi
+  if jq -e . >/dev/null 2>&1 <<<"$resp"; then
+    local summary
+    summary=$(jq -c '{status,instance,partitions:.partitions,lag:.lagTotal}' <<<"$resp" 2>/dev/null || echo "$resp")
+    log_metrics "[$label] /status => $summary"
+  else
+    log_metrics "[$label] WARN non-JSON /status response (len=${#resp})"
+  fi
+}
+
+log_causal_status() {
+  local label=${1:-causal}
+  local resp
+  resp=$(curl -s "$OPB1_HTTP/status" 2>/dev/null || true)
+  if [[ -z "$resp" ]]; then
+    log_metrics "[$label] WARN empty causal status response"
+    return
+  fi
+  if jq -e . >/dev/null 2>&1 <<<"$resp"; then
+    local summary
+    summary=$(jq -c '{cut:.causalCutId,phase:.causalPhase,seen:.causalMarkersSeen,total:.causalMarkersTotal,inflight:.causalInflight}' <<<"$resp" 2>/dev/null || echo "$resp")
+    log_metrics "[$label] causal => $summary"
+    log_prom_metric "${label}-prom-causal" "sum(opb_causal_inflight)"
+  else
+    log_metrics "[$label] WARN causal status not JSON (len=${#resp})"
+  fi
+}
+
+log_cluster_viz() {
+  local label=${1:-cluster} base=${2:-$OPB1_HTTP}
+  local resp url="${base%/}/api/cluster"
+  resp=$(curl -s "$url" 2>/dev/null || true)
+  if [[ -z "$resp" ]]; then
+    log_metrics "[$label] WARN empty /api/cluster response"
+    return
+  fi
+  if jq -e . >/dev/null 2>&1 <<<"$resp"; then
+    local summary
+    summary=$(jq -c '{instances: (.instances // [] | map({id: (.instance // "unknown"), http: .http, parts: (.partitions // []), lag: (.lagTotal // 0)})), assignment: (.assignment // {})}' <<<"$resp" 2>/dev/null || echo "$resp")
+    log_metrics "[$label] cluster => $summary"
+  else
+    log_metrics "[$label] WARN /api/cluster not JSON (len=${#resp})"
+  fi
+}
+
+log_zone_viz() {
+  local label=${1:-zone} store=${2:-$STORE}
+  local url="$OPB1_HTTP/api/zone-details?id=$store"
+  local resp
+  resp=$(curl -s "$url" 2>/dev/null || true)
+  if [[ -z "$resp" ]]; then
+    log_metrics "[$label] WARN empty zone-data response"
+    return
+  fi
+  if jq -e . >/dev/null 2>&1 <<<"$resp"; then
+    local summary
+    summary=$(jq -c '{storeId: (.storeId // .id // "'"$store"'"), sum: (.sumQty // .total // 0), cells: ((.cells // []) | length)}' <<<"$resp" 2>/dev/null || echo "$resp")
+    log_metrics "[$label] zone-data => $summary"
+  else
+    log_metrics "[$label] WARN zone-data not JSON (len=${#resp})"
+  fi
+}
+
+log_heatmap_viz() {
+  local label=${1:-heatmap}
+  local url="$OPB1_HTTP/viz/heatmap?metric=total&format=json"
+  local resp
+  resp=$(curl -s "$url" 2>/dev/null || true)
+  if [[ -z "$resp" ]]; then
+    log_metrics "[$label] WARN empty heatmap response"
+    return
+  fi
+  if jq -e . >/dev/null 2>&1 <<<"$resp"; then
+    local summary
+    summary=$(jq -c '{metric: (.metric // "total"), cells: ((.cells // []) | length)}' <<<"$resp" 2>/dev/null || echo "$resp")
+    log_metrics "[$label] heatmap => $summary"
+  else
+    log_metrics "[$label] WARN heatmap not JSON (len=${#resp})"
+  fi
+}
+
+log_snapshot_metrics() {
+  local label=${1:-snapshot} manifest=${2:-$SNAPSHOT_DIR/manifest.latest.json}
+  if [[ ! -f "$manifest" ]]; then
+    log_metrics "[$label] WARN manifest $manifest missing"
+    return
+  fi
+  local sid type shards parent deltaSeq size="unknown"
+  sid=$(jq -r '.snapshotId // ""' "$manifest" 2>/dev/null || echo "")
+  if [[ -z "$sid" || "$sid" == "null" ]]; then
+    log_metrics "[$label] WARN manifest missing snapshotId"
+    return
+  fi
+  type=$(jq -r '.snapshotType // "full"' "$manifest" 2>/dev/null || echo "full")
+  shards=$(jq -r '.shards // (.snapshotShards // 1)' "$manifest" 2>/dev/null || echo "")
+  parent=$(jq -r '.parentId // ""' "$manifest" 2>/dev/null || echo "")
+  deltaSeq=$(jq -r '.deltaSequence // ""' "$manifest" 2>/dev/null || echo "")
+  local snapDir="$SNAPSHOT_DIR/$sid"
+  if [[ -d "$snapDir" ]]; then
+    size=$(du -sh "$snapDir" 2>/dev/null | awk '{print $1}')
+  elif [[ -f "$snapDir/state.json" ]]; then
+    size=$(du -sh "$snapDir/state.json" 2>/dev/null | awk '{print $1}')
+  fi
+  local keyCount
+  keyCount=$(jq -r '.stats.keys // .keys // ""' "$manifest" 2>/dev/null || echo "")
+  log_metrics "[$label] snapshot id=$sid type=$type shards=${shards:-?} keys=${keyCount:-unknown} size=${size:-unknown} parent=${parent:-none} deltaSeq=${deltaSeq:--}"
+  log_prom_metric "${label}-prom-snapshot-bytes" "opb_snapshot_bytes"
 }
 
 start_peer_instance() {
@@ -422,7 +659,7 @@ ensure_delete_topic "p1.opb-changelog"
 
 say "Start OpB (B1) with PebbleDB and snapshot interval=${SNAPSHOT_INTERVAL}s"
 EXTRA_OPB_FLAGS="--topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog --manifest-sink both --manifest-source kafka --changelog-sink both --changelog-source kafka --injector-linger-ms 100"
-"$BIN_OPB" \
+nohup "$BIN_OPB" \
   --state-backend pebble --state-dir "$STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR" \
   --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID" \
   --input-source kafka --topic-enriched "$ENRICHED_TOPIC" \
@@ -431,11 +668,17 @@ EXTRA_OPB_FLAGS="--topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-cha
   --snapshot-shards "${SNAPSHOT_SHARDS:-4}" \
   $EXTRA_OPB_FLAGS \
   --peers "$OPB2_HTTP" \
-  --http :8089 --instance-id B1 > "$OPB1_LOG" 2>&1 &
+  --http :8089 --instance-id B1 > "$OPB1_LOG" 2>&1 < /dev/null &
 OPB_PID=$!
+disown || true
 
 if ! wait_ready "$OPB1_HTTP/healthz" 180; then echo "ERROR: B1 failed to start"; tail -n 200 "$OPB1_LOG" || true; exit 1; fi
 wait_assignment_count "$EXPECTED_PARTITIONS" 120
+
+log_status_endpoint "b1-start-status" "$OPB1_HTTP"
+log_cluster_viz "b1-start-cluster" "$OPB1_HTTP"
+log_zone_viz "baseline-zone" "$STORE"
+log_heatmap_viz "baseline-heatmap"
 
 # Trigger a barrier-based snapshot cut to create a manifest with per-partition offsets
 say "Triggering barrier-based snapshot cut..."
@@ -452,6 +695,7 @@ HEATMAP_URL="$OPB1_HTTP/viz/heatmap?metric=total"
 
 say "Barrier mode: waiting for manifest with per-partition offsets before pumping delta"
 wait_manifest_offsets "$SNAPSHOT_DIR" 45
+log_snapshot_metrics "full-snapshot" "$SNAPSHOT_DIR/manifest.latest.json"
 # Baseline before delta (optionally seed state for import demo)
 base_sq=$(get_exact_sumqty "$EXACT_URL")
 base_ls=$(get_lastseq "$EXACT_URL_WS")
@@ -481,6 +725,8 @@ if ask_continue "Start peer instance B2 to demonstrate state migration?"; then
   if [[ $import_logged -ne 1 ]]; then
     say "WARN: Did not observe 'import: finished loading' in B2 logs (check $OPB2_LOG)"
   fi
+  log_status_endpoint "b2-import-status" "$OPB2_HTTP"
+  log_cluster_viz "cluster-after-b2-import" "$OPB1_HTTP"
   say "B2 is running; open $OPB2_HTTP/viz/cluster to observe assignment."
   if ask_continue "Stop peer instance B2 now?"; then
     stop_peer_instance
@@ -493,6 +739,7 @@ else
   say "Skipping peer migration demo"
 fi
 
+log_cluster_viz "post-b2-cluster" "$OPB1_HTTP"
 say "Phase 2: Create Delta Data with Causal Snapshot Capture"
 say "=== Causal Snapshot Technique (Beaver-style) ==="
 
@@ -505,6 +752,7 @@ sleep 0.5
 
 say "Step 2: Injecting delta data to create backlog (while paused)"
 inject_delta_batch
+log_causal_status "delta-backlog-built"
 
 say "Step 3: Triggering delta snapshot to initiate barrier cut (markers appended AFTER backlog)"
 curl -s -X POST "$OPB1_HTTP/admin/snapshot-cut?type=delta" >/dev/null || true
@@ -527,6 +775,11 @@ fi
 
 say "Step 5: Resuming ingestion so backlog flows and gets captured as inflight"
 curl -s -X POST "$OPB1_HTTP/admin/ingest/resume" >/dev/null || true
+log_causal_status "delta-after-resume"
+
+# Track causal barrier progress via /status instead of grepping logs
+wait_causal_finalized "$OPB1_HTTP" 120 || true
+log_causal_status "delta-finalized"
 
 # Technical explanation:
 # 'currentCut' exists and currentCut.seen[partition]==false for all partitions.
@@ -538,6 +791,7 @@ expected_total=$(( base_sq + DELTA_TOTAL_EVENTS + POST_CUT_EVENTS ))
 # This confirms that the barrier cut completed and captured channel state
 if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
   INFLIGHT_PATH="$SNAPSHOT_DIR/${MANIFEST_SNAPSHOT_ID:-}/$MANIFEST_INFLIGHT_FILE"
+  log_snapshot_metrics "delta-snapshot" "$SNAPSHOT_DIR/manifest.latest.json"
   if [[ -f "$INFLIGHT_PATH" ]]; then
     if command -v jq >/dev/null 2>&1; then
       INFLIGHT_EVENT_COUNT=$(jq '(.events | map(length) | add) // 0' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
@@ -657,6 +911,13 @@ else
   say "WARN: Snapshot restoration log not found"
 fi
 
+# Report restore phases and whether changelog replay was skipped
+phases=$(parse_restore_phases "$OPB1_LOG" || true)
+if [[ -n "$phases" ]]; then
+  say "restore phases: $phases"
+fi
+assert_skip_replay "$OPB1_LOG"
+
 # Verify causal replay: Check for inflight events being replayed
 if grep -q "inflight replay applied" "$OPB1_LOG" 2>/dev/null; then
   REPLAY_COUNT=$(grep "inflight replay applied" "$OPB1_LOG" | tail -n1 | sed -E 's/.*events=([0-9]+).*/\1/' 2>/dev/null || echo "")
@@ -682,6 +943,11 @@ say "Stage 2: Start normally to begin consuming"
 OPB_PID2=$!
 
 if ! wait_ready "$OPB1_HTTP/healthz" 180; then echo "ERROR: B1 failed to start after restore"; tail -n 400 "$OPB1_LOG" || true; exit 1; fi
+
+log_status_endpoint "post-recovery-status" "$OPB1_HTTP"
+log_cluster_viz "post-recovery-cluster" "$OPB1_HTTP"
+log_zone_viz "post-recovery-zone" "$STORE"
+log_heatmap_viz "post-recovery-heatmap"
 
 say "Phase 4: Verification"
 if wait_for_exact "$EXACT_URL_WS" "$PRE_CRASH_LASTSEQ" $CHECK_EXACT_RETRIES; then

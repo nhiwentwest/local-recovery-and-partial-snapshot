@@ -24,6 +24,24 @@
     </label>
     <button id="refresh-ws">Refresh windows</button>
     <button id="reload">Reload</button>
+    <div class="prom-config">
+      <label>Prometheus</label>
+      <input id="prom-url" placeholder="http://127.0.0.1:9090" />
+      <button id="save-prom">Save</button>
+      <button id="prom-refresh">Refresh Prom Panels</button>
+    </div>
+  </div>
+  <div class="prom-panels">
+    <div class="prom-card">
+      <div class="prom-title">Causal inflight (last 5m)</div>
+      <canvas id="prom-causal" width="320" height="140"></canvas>
+      <div id="prom-causal-status" class="prom-status muted"></div>
+    </div>
+    <div class="prom-card">
+      <div class="prom-title">Changelog lag (last 5m)</div>
+      <canvas id="prom-lag" width="320" height="140"></canvas>
+      <div id="prom-lag-status" class="prom-status muted"></div>
+    </div>
   </div>
   <div id="legend"></div>
   <div id="grid" class="grid"></div>

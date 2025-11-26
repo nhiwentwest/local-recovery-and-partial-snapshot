@@ -36,6 +36,10 @@ type Registry struct {
 	EventsSkippedSeq    prometheus.Counter
 	CausalInflight      prometheus.Gauge
 	CausalReplay        prometheus.Counter
+
+	// Per-store live aggregates (for zone viz)
+	StoreSumQty    *prometheus.GaugeVec
+	StoreSumAmount *prometheus.GaugeVec
 }
 
 func NewRegistry() *Registry {
@@ -73,7 +77,11 @@ func NewRegistry() *Registry {
 	causalInflight := prometheus.NewGauge(prometheus.GaugeOpts{Name: "opb_causal_inflight"})
 	causalReplay := prometheus.NewCounter(prometheus.CounterOpts{Name: "opb_causal_replay_total"})
 
-	r.MustRegister(applied, skipped, ttr, replayBytes, replayRecords, lag, lastAge, snapTime, snapBytes, txProduced, txAborted, txLatency, txBatchDur, offsetsBoundLag, changelogAppended, partLag, evApplied, evSkipDedup, evSkipSeq, causalInflight, causalReplay)
+	// Per-store gauges
+	storeSumQty := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_store_sum_qty"}, []string{"storeId"})
+	storeSumAmount := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_store_sum_amount"}, []string{"storeId"})
+
+	r.MustRegister(applied, skipped, ttr, replayBytes, replayRecords, lag, lastAge, snapTime, snapBytes, txProduced, txAborted, txLatency, txBatchDur, offsetsBoundLag, changelogAppended, partLag, evApplied, evSkipDedup, evSkipSeq, causalInflight, causalReplay, storeSumQty, storeSumAmount)
 	return &Registry{
 		reg:                r,
 		Applied:            applied,
@@ -97,6 +105,8 @@ func NewRegistry() *Registry {
 		EventsSkippedSeq:   evSkipSeq,
 		CausalInflight:     causalInflight,
 		CausalReplay:       causalReplay,
+		StoreSumQty:        storeSumQty,
+		StoreSumAmount:     storeSumAmount,
 	}
 }
 

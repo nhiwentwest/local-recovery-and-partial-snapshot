@@ -128,7 +128,8 @@ func (s *StatusManager) SetCausalReplay(n int64) {
 func (s *StatusManager) BeginCausalCut(id string, total int) {
 	s.with(func(a AppStatus) AppStatus {
 		a.CausalCutID = id
-		a.CausalPhase = "tracking"
+		// Phase will be set to "marker-propagation" when first barrier is received
+		a.CausalPhase = ""
 		a.CausalMarkersOf = total
 		a.CausalMarkers = 0
 		return a
