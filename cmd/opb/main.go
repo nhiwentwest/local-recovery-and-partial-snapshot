@@ -1479,7 +1479,7 @@ func run(cfg Config) error {
 			sumA, sumQ, _ := zoneIdx.Snapshot(id)
 			fmt.Fprintf(w, "<h4>Store mode (aggregates)</h4>")
 			fmt.Fprintf(w, "<pre>{\n  \"storeId\": \"%s\",\n  \"sumAmount\": %d,\n  \"sumQty\": %d\n}</pre>", id, sumA, sumQ)
-			fmt.Fprintf(w, "<div class='small muted'>Heatmap total for this store equals sumQty=%d in the current window. Zones khác nhau do số keys và product active khác nhau.</div>", sumQ)
+			fmt.Fprintf(w, "<div class='small muted'>Heatmap total = sumQty=%d (hiện tại). sumQty được tạo bởi số product active × số events trên mỗi product.</div>", sumQ)
 			var totalSumQty, totalSumAmount int64
 			var maxLastSeq int64
 			var lastUpdatedBy string
@@ -1582,6 +1582,13 @@ func run(cfg Config) error {
 						fmt.Fprintf(w, "<div style='margin-bottom:8px;padding:6px 10px;border:1px solid #2b3152;border-radius:6px;background:#0c1229;color:#e6e9ef'>")
 						fmt.Fprintf(w, "<div class='small'>Window %d summary</div>", targetWindow)
 						fmt.Fprintf(w, "<div class='small muted'>unique products=%d · total keys=%d · sumQty=%d · avg qty/product=%.2f</div>", totalProducts, stat.Keys, stat.SumQty, avgPerProduct)
+						explain := "sumQty được tính = uniqueProducts × avgQty/product."
+						if avgPerProduct <= 1.05 {
+							explain += " Avg qty ~1 ⇒ chênh lệch giữa các zone đến từ số lượng product active."
+						} else {
+							explain += " Avg qty >1 ⇒ một số product nhận nhiều event hơn, xem bảng bucket phía dưới."
+						}
+						fmt.Fprintf(w, "<div class='small muted'>%s</div>", explain)
 						fmt.Fprintf(w, "</div>")
 						// Distribution buckets
 						buckets := [][2]int64{
