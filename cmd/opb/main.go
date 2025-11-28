@@ -1528,22 +1528,35 @@ func run(cfg Config) error {
 			fmt.Fprintf(w, "<div class='muted'>Total records=%d · windows=%d · sumQty=%d · sumAmount=%d · lastSeq=%d (by %s)</div>", totalRecords, len(windowStats), totalSumQty, totalSumAmount, maxLastSeq, lastUpdatedBy)
 
 			windowList := make([]*windowStat, 0, len(windowStats))
+			maxWindowQty := int64(0)
 			for _, ws := range windowStats {
 				windowList = append(windowList, ws)
+				if ws.SumQty > maxWindowQty {
+					maxWindowQty = ws.SumQty
+				}
 			}
 			sort.Slice(windowList, func(i, j int) bool { return windowList[i].Window > windowList[j].Window })
 			fmt.Fprintf(w, "<h4>Recent windows · windowSize=%ds</h4>", cfg.WindowSizeSec)
 			if len(windowList) == 0 {
 				fmt.Fprintf(w, "<div class='muted'>No per-window data for this store (yet).</div>")
 			} else {
-				fmt.Fprintf(w, "<table style='border-collapse:collapse'><tr><th style='text-align:left;padding:4px'>Window (epoch)</th><th style='text-align:right;padding:4px'>sumQty</th><th style='text-align:right;padding:4px'>sumAmount</th><th style='text-align:right;padding:4px'>keys</th></tr>")
+				fmt.Fprintf(w, "<div style='display:flex; flex-direction:column; gap:6px; max-width:520px'>")
 				for i, ws := range windowList {
 					if i >= 8 {
 						break
 					}
-					fmt.Fprintf(w, "<tr><td style='padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td></tr>", ws.Window, ws.SumQty, ws.SumAmount, ws.Keys)
+					width := 0.0
+					if maxWindowQty > 0 {
+						width = (float64(ws.SumQty) / float64(maxWindowQty)) * 100
+					}
+					fmt.Fprintf(w, "<div>")
+					fmt.Fprintf(w, "<div class='small muted'>%d · sumQty=%d · products=%d</div>", ws.Window, ws.SumQty, ws.Keys)
+					fmt.Fprintf(w, "<div style='height:10px;border-radius:6px;background:#1e1e2f;overflow:hidden'>")
+					fmt.Fprintf(w, "<div style='height:10px;width:%.2f%%;background:#8f5cff'></div>", width)
+					fmt.Fprintf(w, "</div>")
+					fmt.Fprintf(w, "</div>")
 				}
-				fmt.Fprintf(w, "</table>")
+				fmt.Fprintf(w, "</div>")
 			}
 
 			targetWindow := latestWindow
@@ -1560,6 +1573,46 @@ func run(cfg Config) error {
 				if len(prodMap) == 0 {
 					fmt.Fprintf(w, "<div class='muted'>No products recorded for this window.</div>")
 				} else {
+					if stat, ok := windowStats[targetWindow]; ok {
+						totalProducts := len(prodMap)
+						avgPerProduct := float64(stat.SumQty)
+						if totalProducts > 0 {
+							avgPerProduct = avgPerProduct / float64(totalProducts)
+						}
+						fmt.Fprintf(w, "<div style='margin-bottom:8px;padding:6px 10px;border:1px solid #2b3152;border-radius:6px;background:#0c1229;color:#e6e9ef'>")
+						fmt.Fprintf(w, "<div class='small'>Window %d summary</div>", targetWindow)
+						fmt.Fprintf(w, "<div class='small muted'>unique products=%d · total keys=%d · sumQty=%d · avg qty/product=%.2f</div>", totalProducts, stat.Keys, stat.SumQty, avgPerProduct)
+						fmt.Fprintf(w, "</div>")
+						// Distribution buckets
+						buckets := [][2]int64{
+							{1, 5},
+							{6, 10},
+							{11, 20},
+							{21, 50},
+							{51, math.MaxInt64},
+						}
+						bucketCounts := make([]int, len(buckets))
+						for _, ps := range prodMap {
+							for idx, b := range buckets {
+								if ps.SumQty >= b[0] && ps.SumQty <= b[1] {
+									bucketCounts[idx]++
+									break
+								}
+							}
+						}
+						fmt.Fprintf(w, "<table style='border-collapse:collapse;margin:8px 0'><tr><th style='text-align:left;padding:4px'>qty range</th><th style='text-align:right;padding:4px'>product count</th></tr>")
+						for idx, b := range buckets {
+							label := fmt.Sprintf("%d-%s", b[0], func() string {
+								if b[1] == math.MaxInt64 {
+									return "+"
+								}
+								return fmt.Sprintf("%d", b[1])
+							}())
+							fmt.Fprintf(w, "<tr><td style='padding:4px'>%s</td><td style='text-align:right;padding:4px'>%d</td></tr>", label, bucketCounts[idx])
+						}
+						fmt.Fprintf(w, "</table>")
+					}
+
 					productList := make([]*productStat, 0, len(prodMap))
 					for _, ps := range prodMap {
 						productList = append(productList, ps)
