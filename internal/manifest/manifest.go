@@ -29,6 +29,15 @@ type Manifest struct {
 	InflightFile         string            `json:"inflightFile,omitempty"`
 	InflightEvents       int               `json:"inflightEvents,omitempty"`
 	SnapshotVectorClock  map[string]uint64 `json:"vectorClock,omitempty"`
+
+	// Pebble-specific fields (experimental SSTable shipping backend).
+	// When SnapshotFormat == "pebble", these describe the exported SSTables for the snapshot.
+	PebbleSSTFiles      []string          `json:"pebbleSstFiles,omitempty"`
+	PebbleFormatVersion string            `json:"pebbleFormatVersion,omitempty"`
+	PebbleSSTChecksums  map[string]string `json:"pebbleSstChecksums,omitempty"`
+	// Phase 3: Incremental checkpoint metadata.
+	PebbleIncrementalFiles []string `json:"pebbleIncrementalFiles,omitempty"` // new files in this snapshot
+	PebbleAllFiles         []string `json:"pebbleAllFiles,omitempty"`         // all files (for reference)
 }
 
 const (

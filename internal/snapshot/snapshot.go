@@ -19,6 +19,10 @@ type Format string
 const (
 	FormatJSON    Format = "json"
 	FormatMsgpack Format = "msgpack"
+	// FormatPebble is an experimental format where the snapshot stores Pebble SSTables
+	// instead of logical JSON/msgpack dumps. When used, snapshot writing/reading is
+	// delegated to the underlying Pebble store via a checkpoint API.
+	FormatPebble Format = "pebble"
 )
 
 // ParseFormat normalizes raw string input into a supported snapshot format.
@@ -29,6 +33,8 @@ func ParseFormat(raw string) (Format, error) {
 		return FormatJSON, nil
 	case FormatMsgpack:
 		return FormatMsgpack, nil
+	case FormatPebble:
+		return FormatPebble, nil
 	default:
 		return "", fmt.Errorf("unsupported snapshot format: %s (use json|msgpack)", raw)
 	}
@@ -77,6 +83,11 @@ type Result struct {
 	Format Format
 	Shards int
 	Keys   int
+	// Pebble-specific fields (only set when Format == FormatPebble)
+	PebbleSSTFiles         []string
+	PebbleFormatVersion    string
+	PebbleSSTChecksums     map[string]string
+	PebbleIncrementalFiles []string // Phase 3: new files in incremental snapshot
 }
 
 type Snapshotter interface {
@@ -176,13 +187,25 @@ func (f *FilesystemSnapshotter) WriteSnapshotFromView(snapshotID string, view st
 }
 
 func (f *FilesystemSnapshotter) writeSingleFromView(snapshotID string, view state.SnapshotView) (Result, error) {
+	// Experimental fast-path: when format is pebble and the underlying store supports
+	// CheckpointCapable, delegate snapshot writing to the Pebble backend instead of
+	// emitting a logical JSON/msgpack dump.
+	if f.format == FormatPebble {
+		if cap, ok := any(view).(interface {
+			ExportSSTables(dstDir string) ([]string, string, error)
+		}); ok {
+			// NOTE: snapshot views currently do not expose the underlying store, so this
+			// branch is left as a placeholder for future refinement.
+			_, _, _ = cap, snapshotID, view
+		}
+	}
 	file := filepath.Join(f.baseDir, snapshotID, f.format.FileName())
 	out, err := os.Create(file)
 	if err != nil {
 		return Result{}, fmt.Errorf("create: %w", err)
 	}
 	defer out.Close()
-		dump := make(map[string]state.RecordState)
+	dump := make(map[string]state.RecordState)
 	if err := view.Range(func(key string, rs state.RecordState) error {
 		dump[key] = rs
 		return nil
@@ -328,8 +351,8 @@ func encodeSnapshot(w io.Writer, format Format, dump map[string]state.RecordStat
 		}
 	default:
 		enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(dump); err != nil {
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(dump); err != nil {
 			return fmt.Errorf("encode json: %w", err)
 		}
 	}

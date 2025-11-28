@@ -31,8 +31,10 @@ Topics mặc định (prefix p1.)
 
 ## 2) Quickstart (local)
 Prerequisites
-- Kafka tại 127.0.0.1:9092; cổng HTTP rảnh: :8088 (OpA), :8089 (OpB)
-- Go toolchain + make
+- Kafka tại 127.0.0.1:9092; khởi động nhanh bằng Homebrew  
+  `brew services start kafka`  
+  Kiểm tra: `brew services list | grep kafka`
+- Go toolchain + make (để build `bin/opb`, `bin/opbtool`, `bin/kadmin`)
 
 Build
 - make build
@@ -40,7 +42,7 @@ Build
 Chạy tối thiểu hạ tầng + pipeline
 - scripts/run_infra.sh (khởi động broker, Prom, Grafana, web viz nếu có trong repo)
 - scripts/run_opa.sh (OpA — chuẩn hoá, Exactly‑Once)
-- scripts/run_opb.sh (OpB — tổng hợp + snapshot/changelog)
+- scripts/run_opb.sh (OpB — tổng hợp + snapshot/changelog, **pebble-only**)
 - scripts/start_pipeline.sh (bơm dữ liệu mẫu nếu cần)
 
 Mở giao diện web
@@ -139,6 +141,7 @@ Verify
 - Log sẽ in rõ thời điểm bắt đầu/hoàn tất restore (`restore ts: start=…`, `restore ts: done=…`), `restore completed: applied=… skipped=…`.
 - `/status` phản ánh `ttrMs`, `snapshotId`, `lastChangelogOffset`, `lastRestoreApplied/Skipped`, `causalReplayTotal`, `causalInflight`.
 - `/viz/zone-data?id=RECOVERY-TEST&productId=p1&ws=<ws>`: so sánh sumQty/lastSeq trước–sau crash.
+- Script tự check `verify_pebble_manifest/restore/atomic_import`; có thể bổ sung `opbtool inspect snapshots/<SNAPSHOT_ID>` để xem danh sách SSTable, incremental files, checksum.
 
 Links
 - /viz/cluster, /viz/zone-data?id=RECOVERY-TEST
@@ -167,14 +170,15 @@ OpA (theo scripts/run_opa.sh)
 OpB (theo scripts/run_opb.sh và demo*\*)
 - `--kafka-bootstrap`: bootstrap servers
 - `--group-id`, `--instance-id`: nhận diện consumer & replica
-- `--state-backend` (memory|pebble), `--state-dir`: nơi lưu state
-- `--snapshot-dir`, `--snapshot-format` (json|msgpack), `--snapshot-shards`: cấu hình snapshot
+- `--state-backend` (pebble-only), `--state-dir`: nơi lưu state
+- `--snapshot-dir`, `--snapshot-shards`: cấu hình snapshot Pebble (full + incremental)
 - `--snapshot-interval`, `--window-size`: thông số thời gian
 - `--input-source` (sample|kafka), `--topic-enriched`, `--output-topic`
 - `--changelog-sink` (file|kafka|both|none), `--manifest-sink` (file|kafka|both)
 - `--changelog-source`, `--manifest-source` (file|kafka) + `--changelog-dir` khi dùng file-mode
 - `--topic-changelog`, `--topic-snapshots`
 - `--tx-batch-size`, `--tx-linger-ms`: tinh chỉnh transactional batching
+- `--enable-pebble-phase3`: bật incremental SSTable shipping (mặc định phase 2)
 - `--peers`: danh sách HTTP peer (dạng `http://host:port`, lấy từ OPB_PEERS)
 - `--session-timeout-ms`, `--heartbeat-interval-ms`: tuning consumer group (demo HA)
 - `--restore-on-start`, `--restore-only`: điều khiển restore khi khởi động
@@ -260,19 +264,16 @@ Thông điệp quan trọng khi trình bày
 
 
 ## 9) Kỹ thuật Recovery & Snapshot (nâng cao) — trạng thái hiện tại
-- Barrier‑based Non‑blocking Snapshot (đã có): manifest chứa offsets per‑partition; cut không chặn writer nhờ SnapshotView + barrier marker trên từng partition.
-- Incremental Snapshots (đã có):
-  - Chính sách auto full|delta qua `--snap-max-deltas`, `--snap-max-delta-mb`.
-  - Dirty‑key tracking bằng Kafka scan giữa manifest.prev.offsets → offsets hiện tại để chỉ snapshot phần thay đổi.
-  - Manifest chain: `snapshotType=delta`, `baseSnapshotId`, `parentSnapshotId`, `deltaSequence`.
-- Beaver‑style Causal Snapshot (đã có):
-  - Ghi channel‑state (inflight) trong giai đoạn barrier propagation; file `inflight.json` được tham chiếu bởi `manifest.inflightFile` và `inflightEvents`.
-  - Khôi phục theo thứ tự: Restore snapshot → Replay inflight (nếu có) → Replay changelog Kafka nếu còn backlog beyond manifest offsets (có thể skip hoàn toàn).
-  - Web: `/viz/zone-data` hiển thị “Live Causal Cut” (id/phase/markers/inflight).
-- Skip Kafka replay khi không có backlog (đã có): kiểm tra watermark vs `manifest.changelog.offsets` để quyết định bỏ qua `ReplayChangelogKafkaParallel`.
-- Peer‑assisted State Migration (đã có bản đơn giản):
-  - B2 có thể import state từ B1 qua `/admin/state/export` (NDJSON) khi rebalance; tạm thời best‑effort cho LAN demo.
-- Snapshot GC/Retention (đã có): `/admin/snapshot-gc` + cờ `--snap-retention-*` để duy trì dung lượng.
+- **Barrier‑based non‑blocking snapshot**: mọi manifest chứa offsets per‑partition + inflight metadata; cut dựa trên SnapshotView + barrier marker nên không nghẽn writer, vẫn đạt Exactly‑Once.
+- **Pebble SSTable shipping (Phase 2)**: full snapshot = Pebble checkpoint; delta = SSTable chứa dirty keys; manifest lưu `pebbleSstFiles`, `pebbleSstChecksums`, `pebbleFormatVersion`. Restore import trực tiếp SSTable → bỏ qua JSON hoàn toàn.
+- **Incremental checkpoint (Phase 3)**: `--enable-pebble-phase3` + `PebbleIncrementalFiles`/`PebbleAllFiles` cho phép ship “new SSTables only”, chain được GC bằng ref-count; `scripts/demo_incremental.sh` minh hoạ base + nhiều incremental cut.
+- **Causal + inflight delta**: lưu vector inflight, causal markers (Beaver-style) → áp dụng lại đúng thứ tự: snapshot → inflight → changelog.
+- **Skip Kafka replay thông minh**: nếu watermark ≤ manifest offsets → chỉ cần snapshot + inflight, giảm TTR. Có thể ép replay bằng `STRIP_OFFSETS=1` trong `measure_ttr.sh`.
+- **Peer-assisted state migration**: OpB peer có thể import state của nhau (pebble SSTable) khi rebalance; tận dụng cùng cơ chế checkpoint/import → phù hợp KIP-319/KIP-345/KIP-429 (cooperative rebalance, static membership, sticky assignor).
+- **Snapshot GC + retention aware Pebble**: `/admin/snapshot-gc` theo chain + ref-count `PebbleAllFiles`, bảo vệ file dùng chung giữa incremental cut; tích hợp metrics `opb_snapshot_incremental_*`.
+- **Tooling & verify**: `opbtool inspect <snapshotDir>` xem SSTable, checksum, sample key; `scripts/demo_recovery.sh` tự verify checksum/atomic import; `scripts/measure_ttr.sh` đo TTR wall-clock; Prometheus có gauge `opb_snapshot_incremental_bytes/files`.
+- **Exactly-Once đường đi chuẩn**: pipeline OpA → OpB tận dụng transactional producer (KIP-98), idempotent sinks, và manifest offsets để tránh double-apply.
+- **FLIP roadmap alignment**: Phase 3 incremental checkpoint lấy cảm hứng trực tiếp từ Flink FLIP-158 (Generalized Incremental Checkpoints) và các đề xuất FLIP khác cho shuffle-less/local recovery; công cụ GC/ref-count & inspect giúp chứng minh tính toàn vẹn tương tự FLIP-147/FLIP-199.
 
 
 ## 10) Admin/API/Web — quick reference

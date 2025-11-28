@@ -21,4 +21,8 @@ body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; marg
 .prom-status { font-size: 11px; margin-top: 4px; }
 .muted { color: #666; }
 .err { color: #c0392b; }
+.timeline-list { min-height: 120px; font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
+.timeline-entry { padding: 4px 0; border-bottom: 1px dashed #d0d0d0; }
+.timeline-entry:last-child { border-bottom: none; }
+.timeline-entry strong { font-size: 13px; color: #222; }
 

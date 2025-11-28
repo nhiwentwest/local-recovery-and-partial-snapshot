@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +44,6 @@ type Config struct {
 	WindowSizeSec    int
 	SnapshotInterval int
 	SnapshotDir      string
-	SnapshotFormat   string
 	SnapshotShards   int
 	StateDir         string
 	StateBackend     string // memory|pebble
@@ -64,6 +64,7 @@ type Config struct {
 	OutputTopic string
 	// HTTP
 	HTTPAddr string
+	PromURL  string
 	// EOS batching
 	TxBatchSize      int
 	TxLingerMs       int
@@ -85,9 +86,10 @@ type Config struct {
 	SnapMaxDeltas  int // after this many deltas -> cut full (<=0 disables delta)
 	SnapMaxDeltaMB int // after delta chain bytes exceed this (MB) -> cut full (0=ignore)
 	// Snapshot retention/GC
-	SnapRetentionCount int // keep last N snapshots (0=disable)
-	SnapRetentionDays  int // keep snapshots newer than N days (0=disable)
-	SnapGCIntervalSec  int // run GC every N seconds (0=disable, default 3600)
+	SnapRetentionCount int  // keep last N snapshots (0=disable)
+	SnapRetentionDays  int  // keep snapshots newer than N days (0=disable)
+	SnapGCIntervalSec  int  // run GC every N seconds (0=disable, default 3600)
+	EnablePebblePhase3 bool // gate incremental Pebble shipping (phase 3)
 }
 
 const (
@@ -98,15 +100,16 @@ const (
 )
 
 type restoreMetrics struct {
-	SnapshotID          string    `json:"snapshotId"`
-	LastChangelogOffset int64     `json:"lastChangelogOffset"`
-	Applied             int64     `json:"applied"`
-	Skipped             int64     `json:"skipped"`
-	TTRMs               int64     `json:"ttrMs"`
-	CausalReplayEvents  int64     `json:"causalReplayEvents,omitempty"`
-	InflightEvents      int       `json:"inflightEvents,omitempty"`
-	InflightChannels    int       `json:"inflightChannels,omitempty"`
-	UpdatedAt           time.Time `json:"updatedAt"`
+	SnapshotID          string              `json:"snapshotId"`
+	LastChangelogOffset int64               `json:"lastChangelogOffset"`
+	Applied             int64               `json:"applied"`
+	Skipped             int64               `json:"skipped"`
+	TTRMs               int64               `json:"ttrMs"`
+	CausalReplayEvents  int64               `json:"causalReplayEvents,omitempty"`
+	InflightEvents      int                 `json:"inflightEvents,omitempty"`
+	InflightChannels    int                 `json:"inflightChannels,omitempty"`
+	UpdatedAt           time.Time           `json:"updatedAt"`
+	Phases              restorePhaseTimings `json:"phases,omitempty"`
 }
 
 type restorePhaseTimings struct {
@@ -155,7 +158,6 @@ func readFlags() Config {
 	flag.IntVar(&cfg.WindowSizeSec, "window-size", 300, "aggregation window seconds")
 	flag.IntVar(&cfg.SnapshotInterval, "snapshot-interval", 60, "snapshot interval seconds")
 	flag.StringVar(&cfg.SnapshotDir, "snapshot-dir", "./snapshots", "snapshot directory")
-	flag.StringVar(&cfg.SnapshotFormat, "snapshot-format", "json", "snapshot format: json|msgpack")
 	flag.IntVar(&cfg.SnapshotShards, "snapshot-shards", 1, "snapshot shards per cut (>=1)")
 	flag.StringVar(&cfg.StateDir, "state-dir", "./data/opb", "state data directory")
 	flag.StringVar(&cfg.StateBackend, "state-backend", "pebble", "state backend: memory|pebble")
@@ -172,6 +174,7 @@ func readFlags() Config {
 	flag.StringVar(&cfg.TopicEnriched, "topic-enriched", "p1.orders.enriched", "kafka topic for orders.enriched input")
 	flag.StringVar(&cfg.OutputTopic, "output-topic", "p1.orders.output", "kafka topic for orders.output")
 	flag.StringVar(&cfg.HTTPAddr, "http", ":8080", "http listen address for metrics/health")
+	flag.StringVar(&cfg.PromURL, "prom-url", os.Getenv("OPB_PROM_URL"), "Prometheus base URL for viz panels (e.g. http://127.0.0.1:9090)")
 	flag.IntVar(&cfg.TxBatchSize, "tx-batch-size", 1000, "transactional batch size (messages per commit)")
 	flag.IntVar(&cfg.TxLingerMs, "tx-linger-ms", 100, "transactional linger in ms before forcing a commit")
 	flag.IntVar(&cfg.InjectorLingerMs, "injector-linger-ms", 5, "injector producer linger ms")
@@ -193,6 +196,7 @@ func readFlags() Config {
 	flag.IntVar(&cfg.SnapRetentionDays, "snap-retention-days", 0, "keep snapshots newer than N days (0=disable)")
 	flag.IntVar(&cfg.SnapGCIntervalSec, "snap-gc-interval-sec", 3600, "run GC every N seconds (0=disable)")
 	flag.StringVar(&cfg.MultiInputTopics, "multi-input-topics", "", "comma-separated input topics for multi-input runtime (Phase 3.3)")
+	flag.BoolVar(&cfg.EnablePebblePhase3, "enable-pebble-phase3", false, "enable incremental Pebble snapshot shipping (Phase 3)")
 	flag.Parse()
 	return cfg
 }
@@ -206,10 +210,10 @@ func run(cfg Config) error {
 		return runMultiInputRuntime(cfg)
 	}
 
-	snapFormat, err := snapshot.ParseFormat(cfg.SnapshotFormat)
-	if err != nil {
-		return err
+	if cfg.StateBackend != "pebble" {
+		return fmt.Errorf("state-backend must be 'pebble' (pebble-only mode)")
 	}
+	snapFormat := snapshot.FormatPebble
 	if cfg.SnapshotShards < 1 {
 		cfg.SnapshotShards = 1
 	}
@@ -284,6 +288,20 @@ func run(cfg Config) error {
 		}
 		return total
 	}
+	snapshotIncrementalBytes := func(snapshotID string, files []string) float64 {
+		if len(files) == 0 {
+			return 0
+		}
+		dir := filepath.Join(cfg.SnapshotDir, snapshotID)
+		var total float64
+		for _, f := range files {
+			fp := filepath.Join(dir, f)
+			if fi, err := os.Stat(fp); err == nil {
+				total += float64(fi.Size())
+			}
+		}
+		return total
+	}
 
 	// Init state store
 	var st state.Store
@@ -309,8 +327,31 @@ func run(cfg Config) error {
 		v.SetInstanceID(cfg.InstanceID)
 	}
 
-	// Init snapshotter and manifest (filesystem by default)
-	snap := snapshot.NewFilesystemSnapshotter(cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
+	// Init Pebble snapshotters (pebble-only mode).
+	var fullSnap snapshot.Snapshotter
+	var fullSnapView snapshotViewWriter
+	var deltaSnapView snapshotViewWriter
+	var deltaIncremental *snapshot.PebbleSnapshotter
+
+	pebbleSnapper := snapshot.NewPebbleSnapshotter(cfg.SnapshotDir)
+	fullSnap = pebbleSnapper
+
+	if cfg.EnablePebblePhase3 {
+		if _, ok := st.(state.IncrementalCheckpointCapable); ok {
+			deltaIncremental = pebbleSnapper
+			log.Printf("delta snapshots will use Pebble incremental shipping (Phase 3)")
+		} else {
+			log.Printf("warning: enable-pebble-phase3 set but store is not IncrementalCheckpointCapable; falling back to Phase 2 delta")
+		}
+	}
+	if deltaIncremental == nil {
+		if _, ok := st.(state.DeltaCheckpointCapable); ok {
+			deltaSnapView = pebbleDeltaWriter{snap: pebbleSnapper, st: st}
+		} else {
+			return fmt.Errorf("state store does not support Pebble delta snapshots")
+		}
+	}
+
 	maniFS := manifest.NewFilesystemManifest(cfg.SnapshotDir)
 	var mani manifest.Publisher = maniFS
 	var maniReader rf.Reader = rf.NewFilesystemReader(cfg.SnapshotDir)
@@ -493,6 +534,15 @@ func run(cfg Config) error {
 			}
 			return urls
 		}
+		instanceForURL := func(u string) string {
+			cc.mu.RLock()
+			defer cc.mu.RUnlock()
+			if pe := cc.m[u]; pe != nil && pe.St.Instance != "" {
+				return pe.St.Instance
+			}
+			return u
+		}
+		promHTTPClient := &http.Client{Timeout: 4 * time.Second}
 		vizInt := defaultVizPeerInterval
 		vizTmo := defaultVizPeerTimeout
 		vizTTL := defaultVizPeerTTL
@@ -1069,7 +1119,229 @@ func run(cfg Config) error {
 				h.ServeHTTP(w, r)
 			})
 		}
+
+		mux.HandleFunc("/viz/snapshot-insights", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			type timelineEntry struct {
+				SnapshotID       string `json:"snapshotId"`
+				Type             string `json:"type"`
+				BaseSnapshotID   string `json:"baseSnapshotId,omitempty"`
+				ParentSnapshotID string `json:"parentSnapshotId,omitempty"`
+				DeltaSequence    int    `json:"deltaSequence,omitempty"`
+				CreatedAtEpoch   int64  `json:"createdAt"`
+				CreatedAtISO     string `json:"createdAtIso,omitempty"`
+				IncrementalFiles int    `json:"incrementalFiles"`
+				TotalFiles       int    `json:"totalFiles"`
+			}
+			isRestorePhasesEmpty := func(ph restorePhaseTimings) bool {
+				return ph.ManifestMs == 0 &&
+					ph.SnapshotTotalMs == 0 &&
+					ph.SnapshotReadMs == 0 &&
+					ph.SnapshotDecodeMs == 0 &&
+					ph.SnapshotLoadMs == 0 &&
+					ph.ChangelogMs == 0 &&
+					ph.MetricsMs == 0 &&
+					ph.TotalMs == 0
+			}
+			isRestoreMetricsEmpty := func(rm restoreMetrics) bool {
+				return rm.SnapshotID == "" &&
+					rm.TTRMs == 0 &&
+					rm.LastChangelogOffset == 0 &&
+					rm.Applied == 0 &&
+					rm.Skipped == 0 &&
+					isRestorePhasesEmpty(rm.Phases)
+			}
+			resp := map[string]any{}
+			if latest, err := maniReader.ReadLatest(); err == nil && latest.SnapshotID != "" {
+				var timeline []timelineEntry
+				cur := latest
+				for i := 0; i < 6 && cur.SnapshotID != ""; i++ {
+					totalFiles := len(cur.PebbleAllFiles)
+					if totalFiles == 0 {
+						totalFiles = len(cur.PebbleSSTFiles)
+					}
+					var iso string
+					if cur.CreatedAtEpochSecond > 0 {
+						iso = time.Unix(cur.CreatedAtEpochSecond, 0).UTC().Format(time.RFC3339)
+					}
+					entry := timelineEntry{
+						SnapshotID:       cur.SnapshotID,
+						Type:             strings.ToLower(cur.SnapshotType),
+						BaseSnapshotID:   cur.BaseSnapshotID,
+						ParentSnapshotID: cur.ParentSnapshotID,
+						DeltaSequence:    cur.DeltaSequence,
+						CreatedAtEpoch:   cur.CreatedAtEpochSecond,
+						CreatedAtISO:     iso,
+						IncrementalFiles: len(cur.PebbleIncrementalFiles),
+						TotalFiles:       totalFiles,
+					}
+					timeline = append(timeline, entry)
+					if cur.ParentSnapshotID == "" {
+						break
+					}
+					if next, err := readSnapshotManifest(cur.ParentSnapshotID); err == nil {
+						cur = next
+					} else {
+						break
+					}
+				}
+				resp["timeline"] = timeline
+				if len(timeline) > 0 {
+					resp["latest"] = timeline[0]
+				}
+			}
+			var localRestore *restoreMetrics
+			if rm, err := readRestoreMetrics(metricsPath); err == nil {
+				res := rm
+				resp["restoreMetrics"] = res
+				resp["restoreInstance"] = cfg.InstanceID
+				resp["restoreSource"] = cfg.InstanceID
+				if !isRestorePhasesEmpty(res.Phases) {
+					resp["restorePhases"] = res.Phases
+				}
+				localRestore = &res
+			}
+			if r.URL.Query().Get("raw") == "1" {
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			}
+			restoreFleet := map[string]restoreMetrics{}
+			if localRestore != nil && !isRestoreMetricsEmpty(*localRestore) {
+				restoreFleet[cfg.InstanceID] = *localRestore
+			}
+			client := &http.Client{Timeout: 2 * time.Second}
+			for _, peer := range peersList() {
+				if peer == mkSelf() {
+					continue
+				}
+				url := strings.TrimRight(peer, "/") + "/viz/snapshot-insights?raw=1"
+				respPeer, err := client.Get(url)
+				if err != nil {
+					continue
+				}
+				var payload struct {
+					RestoreMetrics restoreMetrics `json:"restoreMetrics"`
+					RestoreSource  string         `json:"restoreSource"`
+				}
+				if err := json.NewDecoder(respPeer.Body).Decode(&payload); err != nil {
+					_ = respPeer.Body.Close()
+					continue
+				}
+				_ = respPeer.Body.Close()
+				if isRestoreMetricsEmpty(payload.RestoreMetrics) {
+					continue
+				}
+				name := payload.RestoreSource
+				if name == "" {
+					name = instanceForURL(peer)
+				}
+				restoreFleet[name] = payload.RestoreMetrics
+			}
+			if len(restoreFleet) > 0 {
+				resp["restoreFleet"] = restoreFleet
+				if _, ok := resp["restorePhases"]; !ok {
+					for inst, rm := range restoreFleet {
+						if !isRestorePhasesEmpty(rm.Phases) {
+							resp["restorePhases"] = rm.Phases
+							resp["restoreSource"] = inst
+							break
+						}
+					}
+				}
+				if _, ok := resp["restoreSource"]; !ok {
+					for inst := range restoreFleet {
+						resp["restoreSource"] = inst
+						break
+					}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		})
 		mux.Handle("/viz/", noCache(http.StripPrefix("/viz/", fs)))
+
+		mux.HandleFunc("/viz/prom-range", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			query := strings.TrimSpace(r.URL.Query().Get("query"))
+			if query == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "query required"})
+				return
+			}
+			seconds := 300
+			if v := strings.TrimSpace(r.URL.Query().Get("seconds")); v != "" {
+				if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+					if parsed > 7200 {
+						parsed = 7200
+					}
+					seconds = parsed
+				}
+			}
+			base := strings.TrimSpace(r.URL.Query().Get("base"))
+			if base == "" {
+				base = cfg.PromURL
+			}
+			if base == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "prometheus base URL not configured"})
+				return
+			}
+			if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+				base = "http://" + base
+			}
+			base = strings.TrimRight(base, "/")
+			end := time.Now().Unix()
+			start := end - int64(seconds)
+			if start < 0 {
+				start = 0
+			}
+			step := seconds / 200
+			if step < 1 {
+				step = 1
+			}
+			req, err := http.NewRequest(http.MethodGet, base+"/api/v1/query_range", nil)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			q := req.URL.Query()
+			q.Set("query", query)
+			q.Set("start", strconv.FormatInt(start, 10))
+			q.Set("end", strconv.FormatInt(end, 10))
+			q.Set("step", strconv.Itoa(step))
+			req.URL.RawQuery = q.Encode()
+			respProm, err := promHTTPClient.Do(req)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			defer respProm.Body.Close()
+			if respProm.StatusCode >= 400 {
+				w.WriteHeader(http.StatusBadGateway)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("prometheus status %d", respProm.StatusCode)})
+				return
+			}
+			var promResp struct {
+				Status string `json:"status"`
+				Data   struct {
+					Result []struct {
+						Values [][]interface{} `json:"values"`
+					} `json:"result"`
+				} `json:"data"`
+				Error string `json:"error"`
+			}
+			if err := json.NewDecoder(respProm.Body).Decode(&promResp); err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if promResp.Status != "success" || len(promResp.Data.Result) == 0 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"values": [][]interface{}{}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"values": promResp.Data.Result[0].Values})
+		})
 
 		// Helper: build cluster response from cache
 		type inst struct {
@@ -1179,6 +1451,23 @@ func run(cfg Config) error {
 			id := q.Get("id")
 			pid := q.Get("productId")
 			wsStr := q.Get("ws")
+			type windowStat struct {
+				Window    int64
+				SumQty    int64
+				SumAmount int64
+				Keys      int
+			}
+			type productStat struct {
+				Product   string
+				SumQty    int64
+				SumAmount int64
+				LastSeq   int64
+			}
+			windowStats := make(map[int64]*windowStat)
+			windowProducts := make(map[int64]map[string]*productStat)
+			var latestWindow int64
+			var totalRecords int
+
 			fmt.Fprintf(w, "<html><body style='font-family:system-ui; margin:16px'>")
 			fmt.Fprintf(w, "<h3>Zone Data</h3>")
 			fmt.Fprintf(w, "<div>id=%s productId=%s ws=%s</div>", id, pid, wsStr)
@@ -1190,6 +1479,106 @@ func run(cfg Config) error {
 			sumA, sumQ, _ := zoneIdx.Snapshot(id)
 			fmt.Fprintf(w, "<h4>Store mode (aggregates)</h4>")
 			fmt.Fprintf(w, "<pre>{\n  \"storeId\": \"%s\",\n  \"sumAmount\": %d,\n  \"sumQty\": %d\n}</pre>", id, sumA, sumQ)
+			var totalSumQty, totalSumAmount int64
+			var maxLastSeq int64
+			var lastUpdatedBy string
+			_ = st.Range(func(key string, rs state.RecordState) error {
+				parts := strings.Split(key, "#")
+				if len(parts) == 3 && parts[0] == id {
+					totalSumQty += rs.SumQty
+					totalSumAmount += rs.SumAmount
+					if rs.LastSeq > maxLastSeq {
+						maxLastSeq = rs.LastSeq
+						lastUpdatedBy = rs.LastUpdatedBy
+					}
+					wsVal, err := strconv.ParseInt(parts[2], 10, 64)
+					if err == nil {
+						stat := windowStats[wsVal]
+						if stat == nil {
+							stat = &windowStat{Window: wsVal}
+							windowStats[wsVal] = stat
+						}
+						stat.SumQty += rs.SumQty
+						stat.SumAmount += rs.SumAmount
+						stat.Keys++
+						if wsVal > latestWindow {
+							latestWindow = wsVal
+						}
+						pm := windowProducts[wsVal]
+						if pm == nil {
+							pm = make(map[string]*productStat)
+							windowProducts[wsVal] = pm
+						}
+						ps := pm[parts[1]]
+						if ps == nil {
+							ps = &productStat{Product: parts[1]}
+							pm[parts[1]] = ps
+						}
+						ps.SumQty += rs.SumQty
+						ps.SumAmount += rs.SumAmount
+						if rs.LastSeq > ps.LastSeq {
+							ps.LastSeq = rs.LastSeq
+						}
+					}
+					totalRecords++
+				}
+				return nil
+			})
+			fmt.Fprintf(w, "<div class='muted'>Total records=%d · windows=%d · sumQty=%d · sumAmount=%d · lastSeq=%d (by %s)</div>", totalRecords, len(windowStats), totalSumQty, totalSumAmount, maxLastSeq, lastUpdatedBy)
+
+			windowList := make([]*windowStat, 0, len(windowStats))
+			for _, ws := range windowStats {
+				windowList = append(windowList, ws)
+			}
+			sort.Slice(windowList, func(i, j int) bool { return windowList[i].Window > windowList[j].Window })
+			fmt.Fprintf(w, "<h4>Recent windows · windowSize=%ds</h4>", cfg.WindowSizeSec)
+			if len(windowList) == 0 {
+				fmt.Fprintf(w, "<div class='muted'>No per-window data for this store (yet).</div>")
+			} else {
+				fmt.Fprintf(w, "<table style='border-collapse:collapse'><tr><th style='text-align:left;padding:4px'>Window (epoch)</th><th style='text-align:right;padding:4px'>sumQty</th><th style='text-align:right;padding:4px'>sumAmount</th><th style='text-align:right;padding:4px'>keys</th></tr>")
+				for i, ws := range windowList {
+					if i >= 8 {
+						break
+					}
+					fmt.Fprintf(w, "<tr><td style='padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td></tr>", ws.Window, ws.SumQty, ws.SumAmount, ws.Keys)
+				}
+				fmt.Fprintf(w, "</table>")
+			}
+
+			targetWindow := latestWindow
+			if wsParsed, err := strconv.ParseInt(wsStr, 10, 64); err == nil && wsParsed > 0 {
+				targetWindow = wsParsed
+			}
+			if targetWindow > 0 {
+				headline := fmt.Sprintf("Top products in window %d", targetWindow)
+				if targetWindow == latestWindow {
+					headline += " (latest)"
+				}
+				fmt.Fprintf(w, "<h4>%s</h4>", headline)
+				prodMap := windowProducts[targetWindow]
+				if len(prodMap) == 0 {
+					fmt.Fprintf(w, "<div class='muted'>No products recorded for this window.</div>")
+				} else {
+					productList := make([]*productStat, 0, len(prodMap))
+					for _, ps := range prodMap {
+						productList = append(productList, ps)
+					}
+					sort.Slice(productList, func(i, j int) bool {
+						if productList[i].SumQty == productList[j].SumQty {
+							return productList[i].Product < productList[j].Product
+						}
+						return productList[i].SumQty > productList[j].SumQty
+					})
+					fmt.Fprintf(w, "<table style='border-collapse:collapse'><tr><th style='text-align:left;padding:4px'>productId</th><th style='text-align:right;padding:4px'>sumQty</th><th style='text-align:right;padding:4px'>sumAmount</th><th style='text-align:right;padding:4px'>lastSeq</th></tr>")
+					for i, ps := range productList {
+						if i >= 8 {
+							break
+						}
+						fmt.Fprintf(w, "<tr><td style='padding:4px'>%s</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td></tr>", ps.Product, ps.SumQty, ps.SumAmount, ps.LastSeq)
+					}
+					fmt.Fprintf(w, "</table>")
+				}
+			}
 			// Exact if pid+ws provided
 			if pid != "" && wsStr != "" {
 				if ws, err := strconv.ParseInt(wsStr, 10, 64); err == nil {
@@ -1282,7 +1671,7 @@ func run(cfg Config) error {
 			log.Printf("restore: manifest loaded snapshotId=%s lastChangelogOffset=%d", m.SnapshotID, m.LastChangelogOffset)
 			appStatus.SetRecovering(m.SnapshotID, m.LastChangelogOffset)
 			t0 := time.Now()
-			restorer := rf.NewRestorerWithOptions(st, snap, maniReader, cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
+			restorer := rf.NewRestorerWithOptions(st, fullSnap, maniReader, cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
 			restoreFormat := resolveSnapshotFormat(m.SnapshotFormat)
 			restoreShards := resolveSnapshotShards(m.SnapshotShards)
 			// Always restore snapshot before replaying changelog (supports chain)
@@ -1383,6 +1772,7 @@ func run(cfg Config) error {
 						InflightEvents:      inflightEventCount,
 						InflightChannels:    inflightChannelCount,
 						UpdatedAt:           time.Now().UTC(),
+						Phases:              phaseTimings,
 					}
 
 					shouldWrite := true
@@ -1479,7 +1869,12 @@ func run(cfg Config) error {
 					var baseID, parentID string
 					var dseq int
 					var deltaKeys []string
+					deltaClearedAll := false
 					doDelta := cutType == manifest.SnapshotTypeDelta && prev != nil && offInfo != nil
+					if doDelta && deltaSnapView == nil && deltaIncremental == nil {
+						log.Printf("periodic-cut: delta format not supported, falling back to full snapshot")
+						doDelta = false
+					}
 					if doDelta {
 						// Determine base/parent and delta sequence
 						if strings.ToLower(prev.SnapshotType) == manifest.SnapshotTypeDelta && prev.BaseSnapshotID != "" {
@@ -1490,24 +1885,33 @@ func run(cfg Config) error {
 							dseq = 1
 						}
 						parentID = prev.SnapshotID
-						// Delta: snapshot only dirty keys between prev and current offsets
-						view, verr := st.NewSnapshotView()
-						if verr != nil {
-							log.Printf("snapshot view error: %v", verr)
-							doDelta = false
-						} else {
-							keys, kerr := kafkautil.ScanDirtyKeysKafka([]string{cfg.KafkaBootstrap}, prev.Changelog.Topic, prev.Changelog.Offsets, offInfo.Offsets, 0, 1500*time.Millisecond)
-							if kerr != nil {
-								_ = view.Close()
-								log.Printf("delta dirty-keys scan error: %v", kerr)
+						if deltaIncremental != nil {
+							meta, serr = deltaIncremental.WriteIncrementalSnapshot(id, st)
+							if serr != nil {
+								log.Printf("snapshot incremental error: %v", serr)
 								doDelta = false
 							} else {
-								deltaKeys = keys
-								meta, serr = snap.WriteDeltaSnapshotFromView(id, view, keys)
-								_ = view.Close()
-								if serr != nil {
-									log.Printf("snapshot error: %v", serr)
+								deltaClearedAll = true
+							}
+						} else {
+							view, verr := st.NewSnapshotView()
+							if verr != nil {
+								log.Printf("snapshot view error: %v", verr)
+								doDelta = false
+							} else {
+								keys, kerr := kafkautil.ScanDirtyKeysKafka([]string{cfg.KafkaBootstrap}, prev.Changelog.Topic, prev.Changelog.Offsets, offInfo.Offsets, 0, 1500*time.Millisecond)
+								if kerr != nil {
+									_ = view.Close()
+									log.Printf("delta dirty-keys scan error: %v", kerr)
 									doDelta = false
+								} else {
+									deltaKeys = keys
+									meta, serr = deltaSnapView.WriteDeltaSnapshotFromView(id, view, keys)
+									_ = view.Close()
+									if serr != nil {
+										log.Printf("snapshot error: %v", serr)
+										doDelta = false
+									}
 								}
 							}
 						}
@@ -1515,7 +1919,21 @@ func run(cfg Config) error {
 					if doDelta {
 						mtype = manifest.SnapshotTypeDelta
 					} else {
-						meta, serr = snap.WriteSnapshot(id, st)
+						writeFull := func() (snapshot.Result, error) {
+							if fullSnapView != nil {
+								view, verr := st.NewSnapshotView()
+								if verr != nil {
+									return snapshot.Result{}, verr
+								}
+								defer view.Close()
+								return fullSnapView.WriteSnapshotFromView(id, view)
+							}
+							if fullSnap != nil {
+								return fullSnap.WriteSnapshot(id, st)
+							}
+							return snapshot.Result{}, fmt.Errorf("no full snapshotter configured")
+						}
+						meta, serr = writeFull()
 						mtype = manifest.SnapshotTypeFull
 						baseID = ""
 						parentID = ""
@@ -1549,6 +1967,14 @@ func run(cfg Config) error {
 						CreatedAtEpochSecond: time.Now().UTC().Unix(),
 						Changelog:            offInfo,
 					}
+					// Set Pebble-specific fields if format is pebble
+					if meta.Format == snapshot.FormatPebble {
+						m.PebbleSSTFiles = meta.PebbleSSTFiles
+						m.PebbleFormatVersion = meta.PebbleFormatVersion
+						m.PebbleSSTChecksums = meta.PebbleSSTChecksums
+						m.PebbleIncrementalFiles = meta.PebbleIncrementalFiles
+						m.PebbleAllFiles = meta.PebbleSSTFiles
+					}
 					if fp, ok := mani.(manifest.FullPublisher); ok {
 						if err := fp.Publish(m); err != nil {
 							log.Printf("manifest publish error: %v", err)
@@ -1561,13 +1987,10 @@ func run(cfg Config) error {
 						}
 					}
 					// Reset dirty keys after successful snapshot publish
-					if mtype == manifest.SnapshotTypeDelta && len(deltaKeys) > 0 {
-						switch v := st.(type) {
-						case *state.InMemoryStore:
-							v.MarkSnapshotDone(deltaKeys...)
-						case *state.PebbleStore:
-							v.MarkSnapshotDone(deltaKeys...)
-						default:
+					if mtype == manifest.SnapshotTypeDelta {
+						if deltaClearedAll {
+							st.MarkSnapshotDone()
+						} else if len(deltaKeys) > 0 {
 							st.MarkSnapshotDone(deltaKeys...)
 						}
 					}
@@ -2099,11 +2522,31 @@ func run(cfg Config) error {
 							collector := kafkaOffsetsCollector{bootstrap: cfg.KafkaBootstrap, topic: cfg.TopicChangelog}
 							scanner := kafkaDirtyScanner{bootstrap: cfg.KafkaBootstrap, timeout: 1500 * time.Millisecond}
 							// Use pre-cut snapshot view when available to ensure snapshot is pre-cut
-							var sw snapshotViewWriter = snap
+							fullWriter := fullSnapView
+							deltaWriter := deltaSnapView
 							if bc.preView != nil {
-								sw = fixedViewWriter{snap: sw, view: bc.preView}
+								if fullWriter != nil {
+									fullWriter = fixedViewWriter{snap: fullWriter, view: bc.preView}
+								}
+								if deltaWriter != nil {
+									deltaWriter = fixedViewWriter{snap: deltaWriter, view: bc.preView}
+								}
 							}
-							writer := snapshotWriter{snap: sw}
+							writer := snapshotWriter{
+								store:       st,
+								full:        fullSnap,
+								fullView:    fullWriter,
+								delta:       deltaWriter,
+								incremental: deltaIncremental,
+							}
+							if writer.full == nil && writer.fullView == nil {
+								log.Printf("barrier-cut: no full snapshot writer configured; skipping cut id=%s type=%s", bc.id, bc.cutType)
+								return
+							}
+							if bc.cutType == manifest.SnapshotTypeDelta && writer.delta == nil && writer.incremental == nil {
+								log.Printf("barrier-cut: delta snapshot format not supported; skipping cut id=%s type=%s", bc.id, bc.cutType)
+								return
+							}
 							t0 := time.Now()
 							causalFn := func(snapID string) (*snapcut.CausalInfo, error) {
 								cutMu.Lock()
@@ -2158,6 +2601,23 @@ func run(cfg Config) error {
 									bytes = snapshotSizeBytes(m.SnapshotID, res.Format, res.Shards)
 								}
 								mreg.SnapshotBytes.Set(bytes)
+								incBytes := 0.0
+								incFiles := 0
+								if len(res.PebbleIncrementalFiles) > 0 {
+									incBytes = snapshotIncrementalBytes(m.SnapshotID, res.PebbleIncrementalFiles)
+									incFiles = len(res.PebbleIncrementalFiles)
+								}
+								mreg.SnapshotIncrementalBytes.Set(incBytes)
+								mreg.SnapshotIncrementalFiles.Set(float64(incFiles))
+								if res.Format == snapshot.FormatPebble {
+									phase := "phase1"
+									if len(res.PebbleIncrementalFiles) > 0 {
+										phase = "phase3"
+									} else if strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta {
+										phase = "phase2"
+									}
+									log.Printf("snapshot: backend=pebble phase=%s type=%s id=%s files=%d newFiles=%d bytes=%.0f newBytes=%.0f", phase, m.SnapshotType, m.SnapshotID, len(res.PebbleSSTFiles), len(res.PebbleIncrementalFiles), bytes, incBytes)
+								}
 								log.Printf("barrier-cut: manifest published id=%s type=%s", m.SnapshotID, m.SnapshotType)
 							}
 
@@ -2342,7 +2802,7 @@ func run(cfg Config) error {
 	// Test restore and replay with status transitions only in non-Kafka input mode
 	if cfg.InputSource != "kafka" {
 		log.Printf("testing restore and replay...")
-		restorer := rf.NewRestorerWithOptions(st, snap, maniReader, cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
+		restorer := rf.NewRestorerWithOptions(st, fullSnap, maniReader, cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
 		// Read manifest first to expose details to status manager
 		m, mErr := maniReader.ReadLatest()
 		if mErr != nil {

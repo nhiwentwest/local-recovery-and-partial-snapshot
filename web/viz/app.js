@@ -21,7 +21,10 @@ const promUrlInput = document.getElementById('prom-url');
 const promSaveBtn = document.getElementById('save-prom');
 const promRefreshBtn = document.getElementById('prom-refresh');
 const promCausalStatus = document.getElementById('prom-causal-status');
-const promLagStatus = document.getElementById('prom-lag-status');
+const timelineEl = document.getElementById('snapshot-timeline');
+const timelineStatus = document.getElementById('snapshot-timeline-status');
+const restorePhasesStatus = document.getElementById('restore-phases-status');
+const incrementalStatus = document.getElementById('incremental-files-status');
 const storedProm = localStorage.getItem('opbPromBase');
 const defaultProm = storedProm || `${window.location.protocol}//${window.location.hostname}:9090`;
 if (promUrlInput) {
@@ -38,7 +41,20 @@ if (promSaveBtn) {
   };
 }
 if (promRefreshBtn) {
-  promRefreshBtn.onclick = () => refreshPromPanels(true);
+  promRefreshBtn.onclick = () => {
+    refreshPromPanels(true);
+    refreshSnapshotPanels(true);
+  };
+}
+
+function shortStoreId(id){
+  // Prefer numeric suffix if present, e.g. RECOVERY-0042 -> R-042
+  const m = id.match(/(?:^|-)0*(\d+)$/);
+  if (m && m[1]) return `R-${m[1].padStart(3,'0')}`;
+  // Otherwise, compact common prefix RECOVERY -> R-
+  const compact = id.replace(/^RECOVERY-?/, 'R-');
+  // Truncate very long ids to keep label readable in small cells
+  return compact.length > 8 ? compact.slice(0,8) : compact;
 }
 
 async function load(){
@@ -153,10 +169,10 @@ function render(data){
       prevValues.set(storeId, c.value);
     }
     
-    // Label storeId (luôn hiển thị)
+    // Label storeId (rút gọn để dễ đọc)
     const label = document.createElement('span');
     label.className = 'cell-label';
-    label.textContent = storeId.replace('-', '');
+    label.textContent = shortStoreId(storeId);
     el.appendChild(label);
 
     // Numerical value to chứng minh EOS (sumQty)
@@ -181,22 +197,15 @@ load();
 setInterval(load, 2000);
 
 async function queryPromRange(query, seconds = 300) {
+  const params = new URLSearchParams({ query, seconds });
   const base = getPromBase();
-  if (!base) throw new Error('Prometheus URL not set');
-  const end = Math.floor(Date.now() / 1000);
-  const start = end - seconds;
-  const step = Math.max(1, Math.floor(seconds / 200));
-  const url = `${base}/api/v1/query_range?${new URLSearchParams({
-    query,
-    start,
-    end,
-    step,
-  }).toString()}`;
-  const res = await fetch(url, { cache: 'no-store' });
+  if (base) {
+    params.set('base', base);
+  }
+  const res = await fetch(`/viz/prom-range?${params.toString()}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  if (data.status !== 'success' || !data.data.result.length) return [];
-  return data.data.result[0].values || [];
+  return data.values || [];
 }
 
 function drawPromSeries(canvasId, values, color) {
@@ -251,10 +260,235 @@ function refreshPromPanels(manual = false) {
     return;
   }
   renderPromPanel('prom-causal', promCausalStatus, 'sum(opb_causal_inflight)', '#f39c12');
-  renderPromPanel('prom-lag', promLagStatus, 'sum(opb_changelog_lag)', '#1abc9c');
 }
 
 refreshPromPanels();
 setInterval(refreshPromPanels, 15000);
 
+async function refreshSnapshotPanels(manual = false) {
+  try {
+    const res = await fetch(`/viz/snapshot-insights?_ts=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderTimeline(data.timeline || []);
+    renderRestorePhases(data.restorePhases || {}, data.restoreSource || '');
+    renderIncrementalPanel(data.latest || null);
+    if (timelineStatus) {
+      timelineStatus.textContent = data.timeline && data.timeline.length ? `entries=${data.timeline.length}` : 'no snapshots';
+      timelineStatus.classList.remove('err');
+    }
+  } catch (err) {
+    if (timelineStatus) {
+      timelineStatus.textContent = `error: ${err.message}`;
+      timelineStatus.classList.add('err');
+    }
+    if (restorePhasesStatus) {
+      restorePhasesStatus.textContent = 'restore data unavailable';
+      restorePhasesStatus.classList.add('err');
+    }
+    if (incrementalStatus) {
+      incrementalStatus.textContent = 'incremental data unavailable';
+      incrementalStatus.classList.add('err');
+    }
+  }
+}
 
+function renderTimeline(entries) {
+  if (!timelineEl) return;
+  timelineEl.innerHTML = '';
+  if (!entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'timeline-entry';
+    empty.textContent = 'no snapshots yet';
+    timelineEl.appendChild(empty);
+    return;
+  }
+  entries.forEach((entry, idx) => {
+    const div = document.createElement('div');
+    div.className = 'timeline-entry';
+    const label = entry.type || (entry.deltaSequence > 0 ? 'delta' : 'full');
+    const seq = entry.deltaSequence ? ` Δ#${entry.deltaSequence}` : '';
+    const totalFilesText = entry.totalFiles != null ? entry.totalFiles : '?';
+    const inc = entry.incrementalFiles ? `${entry.incrementalFiles} new / ${totalFilesText}` : `${totalFilesText} files`;
+    const time = entry.createdAtIso || '';
+    const title = idx === 0 ? `Latest · ${entry.snapshotId || '(unknown)'}` : (entry.snapshotId || '(unknown)');
+    div.innerHTML = `<strong>${title}</strong>
+      <div>${label}${seq}</div>
+      <div class="muted">${time}</div>
+      <div class="muted">files: ${inc}</div>`;
+    timelineEl.appendChild(div);
+  });
+}
+
+function renderRestorePhases(phases, sourceLabel = '') {
+  const canvas = document.getElementById('restore-phases');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const segments = [
+    ['manifestMs', '#74c0fc', 'Manifest'],
+    ['snapshotTotalMs', '#2ecc71', 'Snapshot'],
+    ['changelogMs', '#1abc9c', 'Changelog'],
+    ['metricsMs', '#f39c12', 'Metrics'],
+  ].map(([field, color, label]) => ({
+    field,
+    color,
+    label,
+    value: Number(phases[field] || 0),
+  })).filter(seg => seg.value > 0);
+  const total = segments.reduce((sum, seg) => sum + seg.value, 0);
+  if (!segments.length) {
+    ctx.fillStyle = '#999';
+    ctx.fillText('no restore data', 10, 20);
+    if (restorePhasesStatus) {
+      restorePhasesStatus.textContent = 'waiting for restore run';
+      restorePhasesStatus.classList.add('muted');
+    }
+    return;
+  }
+  let offset = 0;
+  segments.forEach(seg => {
+    const width = (seg.value / total) * canvas.width;
+    ctx.fillStyle = seg.color;
+    ctx.fillRect(offset, 20, width, 60);
+    ctx.fillStyle = '#fff';
+    ctx.font = '10px sans-serif';
+    ctx.fillText(`${seg.label} ${seg.value}ms`, offset + 4, 50);
+    offset += width;
+  });
+  ctx.strokeStyle = '#333';
+  ctx.strokeRect(0, 20, canvas.width, 60);
+  if (restorePhasesStatus) {
+    const summary = segments.map(seg => `${seg.label}:${seg.value}ms`).join('  ');
+    const prefix = sourceLabel ? `source=${sourceLabel} · ` : '';
+    restorePhasesStatus.textContent = `${prefix}total=${total}ms | ${summary}`;
+    restorePhasesStatus.classList.remove('err');
+    restorePhasesStatus.classList.remove('muted');
+  }
+}
+
+function renderIncrementalPanel(latest) {
+  const canvas = document.getElementById('incremental-files');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!latest || !latest.snapshotId) {
+    ctx.fillStyle = '#999';
+    ctx.fillText('no incremental snapshot yet', 10, 20);
+    if (incrementalStatus) {
+      incrementalStatus.textContent = 'waiting for incremental snapshot';
+      incrementalStatus.classList.add('muted');
+    }
+    return;
+  }
+  const incremental = latest.incrementalFiles || 0;
+  const total = latest.totalFiles || incremental;
+  const ratio = total ? incremental / total : 0;
+  ctx.fillStyle = '#e0e0e0';
+  ctx.fillRect(20, 30, canvas.width - 40, 30);
+  ctx.fillStyle = '#ff6b6b';
+  ctx.fillRect(20, 30, (canvas.width - 40) * ratio, 30);
+  ctx.strokeStyle = '#333';
+  ctx.strokeRect(20, 30, canvas.width - 40, 30);
+  ctx.fillStyle = '#333';
+  ctx.font = '12px sans-serif';
+  ctx.fillText(`Δ files: ${incremental} / ${total}`, 20, 25);
+  ctx.fillText(latest.snapshotId, 20, 80);
+  if (incrementalStatus) {
+    incrementalStatus.textContent = `snapshot=${latest.snapshotId} | incremental=${incremental} | total=${total}`;
+    incrementalStatus.classList.remove('err');
+  }
+}
+
+refreshSnapshotPanels();
+setInterval(refreshSnapshotPanels, 15000);
+
+// ---- Exact key compare (auto ws) ----
+const cmpStore = document.getElementById('cmp-store');
+const cmpProd  = document.getElementById('cmp-prod');
+const cmpWs    = document.getElementById('cmp-ws');
+const cmpLoad  = document.getElementById('cmp-load');
+const cmpMarkB = document.getElementById('cmp-mark-before');
+const cmpMarkA = document.getElementById('cmp-mark-after');
+const cmpCurEl = document.getElementById('cmp-current');
+const cmpBEl   = document.getElementById('cmp-before');
+const cmpAEl   = document.getElementById('cmp-after');
+const cmpRes   = document.getElementById('cmp-result');
+
+async function defaultWs() {
+  try {
+    const r = await fetch('/status', {cache:'no-store'});
+    const j = await r.json();
+    const win = j.windowSizeSec || 60;
+    const now = Math.floor(Date.now()/1000);
+    return Math.floor(now / win) * win;
+  } catch { return 0; }
+}
+
+function showJson(el, obj) {
+  if (!el) return;
+  el.textContent = obj ? JSON.stringify(obj, null, 2) : '';
+  el.classList.toggle('muted', !obj);
+}
+
+function parsePre(el){
+  try { return el && el.textContent ? JSON.parse(el.textContent) : null; } catch { return null; }
+}
+
+async function loadExact() {
+  if (!cmpStore || !cmpProd) return null;
+  const s = cmpStore.value.trim();
+  const p = cmpProd.value.trim();
+  let w = (cmpWs && cmpWs.value) ? Number(cmpWs.value) : 0;
+  if (!w) { w = await defaultWs(); if (cmpWs) cmpWs.value = String(w||''); }
+  if (!s || !p || !w) { showJson(cmpCurEl, {error:'missing params'}); return null; }
+  const url = `/api/exact?${new URLSearchParams({storeId:s,productId:p,ws:String(w)}).toString()}`;
+  const r = await fetch(url, {cache:'no-store'});
+  const j = await r.json();
+  showJson(cmpCurEl, j);
+  return j;
+}
+
+function saveLocal(key, obj){ try{ localStorage.setItem(key, JSON.stringify(obj)); }catch{} }
+function loadLocal(key){ try{ return JSON.parse(localStorage.getItem(key)||'null'); }catch{ return null; }}
+
+function compareExact(a,b){
+  if (!a || !b || !a.found || !b.found) return {ok:false, reason:'not-found or missing'};
+  const same = (a.sumQty===b.sumQty) && (a.sumAmount===b.sumAmount) && (a.lastSeq===b.lastSeq);
+  return {ok:same, a:{sq:a.sumQty,sa:a.sumAmount,ls:a.lastSeq}, b:{sq:b.sumQty,sa:b.sumAmount,ls:b.lastSeq}};
+}
+
+async function ensureBeforeAfterUI(){
+  const B = loadLocal('opbCmpBefore');
+  const A = loadLocal('opbCmpAfter');
+  showJson(cmpBEl, B);
+  showJson(cmpAEl, A);
+  if (B && A) {
+    const res = compareExact(B, A);
+    if (cmpRes) cmpRes.textContent = res.ok ? 'OK: BEFORE == AFTER' : `DIFF: ${JSON.stringify(res)}`;
+  } else if (cmpRes) {
+    cmpRes.textContent = '';
+  }
+}
+
+if (cmpLoad) {
+  cmpLoad.onclick = async () => { await loadExact(); };
+}
+if (cmpMarkB) {
+  cmpMarkB.onclick = async () => {
+    const cur = await loadExact();
+    if (cur) { saveLocal('opbCmpBefore', cur); await ensureBeforeAfterUI(); }
+  };
+}
+if (cmpMarkA) {
+  cmpMarkA.onclick = async () => {
+    const cur = await loadExact();
+    if (cur) { saveLocal('opbCmpAfter', cur); await ensureBeforeAfterUI(); }
+  };
+}
+
+// Prefill ws for compare panel on first load
+(async function prefillWs(){
+  if (cmpWs && !cmpWs.value) { const w = await defaultWs(); if (w) cmpWs.value = String(w); }
+  ensureBeforeAfterUI();
+})();

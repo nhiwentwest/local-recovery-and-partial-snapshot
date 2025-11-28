@@ -27,7 +27,6 @@ func main() {
 		topicSnapshots  string
 		topicChangelog  string
 		snapshotDir     string
-		snapshotFormat  string
 		snapshotShards  int
 		httpAddr        string
 		pollIntervalSec int
@@ -41,7 +40,6 @@ func main() {
 	flag.StringVar(&topicSnapshots, "topic-snapshots", "p1.opb-snapshots", "manifest topic")
 	flag.StringVar(&topicChangelog, "topic-changelog", "p1.opb-changelog", "changelog topic")
 	flag.StringVar(&snapshotDir, "snapshot-dir", "./snapshots", "snapshot dir for file mode")
-	flag.StringVar(&snapshotFormat, "snapshot-format", "json", "snapshot format to expect when manifest is missing field (json|msgpack)")
 	flag.IntVar(&snapshotShards, "snapshot-shards", 1, "snapshot shards to assume when manifest omits the field")
 	flag.StringVar(&httpAddr, "http", ":9090", "http listen for /metrics")
 	flag.IntVar(&pollIntervalSec, "poll", 10, "poll interval seconds for manifest")
@@ -72,10 +70,7 @@ func main() {
 		}
 	}
 
-	defaultFormat, err := snapshot.ParseFormat(snapshotFormat)
-	if err != nil {
-		log.Fatalf("parse snapshot-format: %v", err)
-	}
+	defaultFormat := snapshot.FormatPebble
 	if snapshotShards < 1 {
 		snapshotShards = 1
 	}

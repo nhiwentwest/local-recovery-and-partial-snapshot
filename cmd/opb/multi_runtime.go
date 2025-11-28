@@ -23,6 +23,22 @@ import (
 	"hpb/internal/state"
 )
 
+type pebbleSnapshotViewAdapter struct {
+	snap  *snapshot.PebbleSnapshotter
+	store state.Store
+}
+
+func (a pebbleSnapshotViewAdapter) WriteSnapshotFromView(id string, _ state.SnapshotView) (snapshot.Result, error) {
+	return a.snap.WriteSnapshot(id, a.store)
+}
+
+func (a pebbleSnapshotViewAdapter) WriteDeltaSnapshotFromView(id string, _ state.SnapshotView, keys []string) (snapshot.Result, error) {
+	if len(keys) == 0 {
+		return snapshot.Result{}, fmt.Errorf("pebble delta snapshot requires dirty keys")
+	}
+	return a.snap.WriteDeltaSnapshot(id, a.store, keys)
+}
+
 // runMultiInputRuntime spins up N Kafka consumers (one per topic) and coordinates
 // marker processing through opb.DynamicNInputOperator with partition-level channels.
 func runMultiInputRuntime(cfg Config) error {
@@ -49,35 +65,21 @@ func runMultiInputRuntime(cfg Config) error {
 	}{m: make(map[string]*barrierCutContext)}
 
 	// --- State store, snapshotter, manifest publisher ---
-	snapFormat, err := snapshot.ParseFormat(cfg.SnapshotFormat)
-	if err != nil {
-		return err
+	if cfg.StateBackend != "pebble" {
+		return fmt.Errorf("multi-input runtime requires --state-backend=pebble")
 	}
 	if cfg.SnapshotShards < 1 {
 		cfg.SnapshotShards = 1
 	}
-	var st state.Store
-	switch cfg.StateBackend {
-	case "pebble":
-		ps, err := state.NewPebbleStore(cfg.StateDir)
-		if err != nil {
-			return fmt.Errorf("init pebble: %w", err)
-		}
-		defer ps.Close()
-		st = ps
-	case "memory":
-		st = state.NewInMemoryStore()
-	default:
-		return fmt.Errorf("unknown state-backend: %s (use pebble|memory)", cfg.StateBackend)
+	ps, err := state.NewPebbleStore(cfg.StateDir)
+	if err != nil {
+		return fmt.Errorf("init pebble: %w", err)
 	}
+	defer ps.Close()
+	var st state.Store = ps
 	// Set transient instance-id to state store for LastUpdatedBy visibility
-	switch v := st.(type) {
-	case *state.InMemoryStore:
-		v.SetInstanceID(cfg.InstanceID)
-	case *state.PebbleStore:
-		v.SetInstanceID(cfg.InstanceID)
-	}
-	snap := snapshot.NewFilesystemSnapshotter(cfg.SnapshotDir, snapFormat, cfg.SnapshotShards)
+	ps.SetInstanceID(cfg.InstanceID)
+	snap := pebbleSnapshotViewAdapter{snap: snapshot.NewPebbleSnapshotter(cfg.SnapshotDir), store: st}
 	maniFS := manifest.NewFilesystemManifest(cfg.SnapshotDir)
 	var mani manifest.Publisher = maniFS
 	if (cfg.ManifestSink == "kafka" || cfg.ManifestSink == "both") && cfg.KafkaBootstrap != "" {
@@ -418,6 +420,14 @@ func runMultiInputRuntime(cfg Config) error {
 			Channels:             channels,
 			InflightFile:         relInflight,
 			InflightEvents:       inflightCount,
+		}
+		// Set Pebble-specific fields if format is pebble
+		if meta.Format == snapshot.FormatPebble {
+			m.PebbleSSTFiles = meta.PebbleSSTFiles
+			m.PebbleFormatVersion = meta.PebbleFormatVersion
+			m.PebbleSSTChecksums = meta.PebbleSSTChecksums
+			m.PebbleIncrementalFiles = meta.PebbleIncrementalFiles
+			m.PebbleAllFiles = meta.PebbleSSTFiles
 		}
 		// Publish manifest with one retry
 		publishOnce := func() error {

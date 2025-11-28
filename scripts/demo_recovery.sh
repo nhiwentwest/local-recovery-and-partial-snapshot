@@ -8,26 +8,50 @@ set -euo pipefail
 BOOTSTRAP=${BOOTSTRAP:-127.0.0.1:9092}
 OPB1_HTTP=${OPB1_HTTP:-http://127.0.0.1:8089}
 OPB2_HTTP=${OPB2_HTTP:-http://127.0.0.1:8090}
+OPB3_HTTP=${OPB3_HTTP:-http://127.0.0.1:8091}
 BIN_OPB=${BIN_OPB:-./bin/opb}
+BIN_OPBTOOL=${BIN_OPBTOOL:-./bin/opbtool}
 KADMIN_BIN=${KADMIN_BIN:-./bin/kadmin}
 STORE=${STORE:-RECOVERY-TEST}
 PROD=${PROD:-p1}
 STATE_DIR=./data/opb-recovery
 SNAPSHOT_DIR=./snapshots-recovery
 CHANGELOG_DIR=./changelog-recovery
+STATE_DIR_B3=${STATE_DIR_B3:-${STATE_DIR}.b3}
+CHANGELOG_DIR_B3=${CHANGELOG_DIR_B3:-${CHANGELOG_DIR}.b3}
 OPB1_LOG=./logs/recovery_b1.out
 OPB2_LOG=./logs/recovery_b2.out
+OPB3_LOG=./logs/recovery_b3.out
+OPB2_HTTP_ADDR=${OPB2_HTTP_ADDR:-:8090}
+OPB3_HTTP_ADDR=${OPB3_HTTP_ADDR:-:8091}
 MANIFEST_INFLIGHT_FILE=""
 DELTA_STORES=("RECOVERY-A" "RECOVERY-B" "RECOVERY-C" "RECOVERY-D")
 DELTA_EVENTS_PER_STORE=${DELTA_EVENTS_PER_STORE:-2500}
 DELTA_BASE_EVENTS=${DELTA_BASE_EVENTS:-5000}
 POST_CUT_EVENTS=${POST_CUT_EVENTS:-300}
-BASELINE_EVENTS=${BASELINE_EVENTS:-512}
-EXPECTED_PARTITIONS=${EXPECTED_PARTITIONS:-4}
+BASELINE_EVENTS=${BASELINE_EVENTS:-0}
+ENRICHED_PARTITIONS=${ENRICHED_PARTITIONS:-12}
+CHANGELOG_PARTITIONS=${CHANGELOG_PARTITIONS:-4}
+SNAPSHOTS_PARTITIONS=${SNAPSHOTS_PARTITIONS:-2}
+EXPECTED_PARTITIONS=${EXPECTED_PARTITIONS:-$ENRICHED_PARTITIONS}
+EXPECTED_PARTITIONS_PER_NODE=${EXPECTED_PARTITIONS_PER_NODE:-$(( ENRICHED_PARTITIONS / 3 ))}
+if (( EXPECTED_PARTITIONS_PER_NODE < 1 )); then
+  EXPECTED_PARTITIONS_PER_NODE=1
+fi
 SNAPSHOT_INTERVAL=${SNAPSHOT_INTERVAL:-0} # seconds (disable periodic cuts to avoid race with barrier-cut)
 export WINDOW_SIZE=${WINDOW_SIZE:-3600} # seconds (must match pump and WS calc)
 AUTO_Y=${AUTO_Y:-0}
 INTERACTIVE=${INTERACTIVE:-1}
+ENABLE_PEBBLE_PHASE3=${ENABLE_PEBBLE_PHASE3:-1}
+SNAPSHOT_FORMAT=${SNAPSHOT_FORMAT:-pebble}
+if [[ "$SNAPSHOT_FORMAT" != "pebble" ]]; then
+  echo "demo_recovery: pebble-only mode; set SNAPSHOT_FORMAT=pebble" >&2
+  exit 1
+fi
+PEBBLE_PHASE3_FLAG=""
+if [[ "$ENABLE_PEBBLE_PHASE3" == "1" ]]; then
+  PEBBLE_PHASE3_FLAG="--enable-pebble-phase3"
+fi
 # Ride-like pricing params (optional)
 RIDE_BASE=${RIDE_BASE:-}
 RIDE_PER_KM=${RIDE_PER_KM:-}
@@ -42,27 +66,63 @@ SLEEP_BEFORE_SHUTDOWN=${SLEEP_BEFORE_SHUTDOWN:-30} # default 30s for non-interac
 VIEW_WAIT_SEC=${VIEW_WAIT_SEC:-0}              # extra seconds to wait after restart before proceeding
 # Retries
 CHECK_EXACT_RETRIES=${CHECK_EXACT_RETRIES:-30}  # seconds to wait for Exact mode to show up (reduced)
+MANIFEST_OFFSETS_TIMEOUT=${MANIFEST_OFFSETS_TIMEOUT:-180}  # seconds to wait for manifest with offsets (barrier cut)
+PRE_CUT_PRIME=${PRE_CUT_PRIME:-1}  # 1=prime small data before first full cut to ensure polling across partitions
 
 wait_manifest_offsets() {
   local dir=${1:-$SNAPSHOT_DIR}
-  local timeout=${2:-45}
+  local timeout=${2:-$MANIFEST_OFFSETS_TIMEOUT} # Default from env var, or 180s
   say "Waiting up to ${timeout}s for manifest with per-partition offsets (barrier cut)..."
   for ((i=1;i<=timeout;i++)); do
+    # Check for manifest file
     if [[ -f "$dir/manifest.latest.json" ]]; then
-      local has
-      has=$(jq -r '.changelog | if . != null and (.offsets|length) > 0 then "yes" else "no" end' "$dir/manifest.latest.json" 2>/dev/null || echo "no")
-      if [[ "$has" == "yes" ]]; then
+      # Check if it has the required offsets
+      if jq -e '.changelog | if . != null and (.offsets|length) > 0 then true else false end' "$dir/manifest.latest.json" >/dev/null 2>&1; then
         local parts offs
         parts=$(jq -r '.changelog.partitions' "$dir/manifest.latest.json" 2>/dev/null || echo 0)
         offs=$(jq -c '.changelog.offsets' "$dir/manifest.latest.json" 2>/dev/null || echo [])
+        printf "\n"
         say "✓ Manifest ready with per-partition offsets (parts=${parts})"
         echo "Offsets: ${offs}"
-      return 0
+        return 0
+      fi
+      # If manifest exists but no offsets, show diagnostic info
+      if (( i % 10 == 0 )); then
+        local has_changelog has_offsets
+        has_changelog=$(jq -r '.changelog != null' "$dir/manifest.latest.json" 2>/dev/null || echo "false")
+        has_offsets=$(jq -r '.changelog.offsets | length' "$dir/manifest.latest.json" 2>/dev/null || echo "0")
+        say "  [diagnostic] manifest exists but changelog.offsets.length=$has_offsets (changelog exists=$has_changelog)"
       fi
     fi
+    # Print diagnostic info from /status endpoint
+    local j id seen tot phase
+    j=$(curl -s "$OPB1_HTTP/status" || true)
+    id=$(jq -r '.causalCutId // ""' <<<"$j")
+    seen=$(jq -r '.causalMarkersSeen // 0' <<<"$j")
+    tot=$(jq -r '.causalMarkersTotal // 0' <<<"$j")
+    phase=$(jq -r '.causalPhase // ""' <<<"$j")
+    printf "\r  [%3d/%d] waiting... (causal cut id=%s phase=%s markers=%s/%s)" "$i" "$timeout" "${id:-none}" "${phase:-none}" "$seen" "$tot"
     sleep 1
   done
-  say "WARN: manifest with offsets not observed within timeout"
+  printf "\n"
+  say "WARN: manifest with offsets not observed within timeout (${timeout}s)"
+  # Show final diagnostic info
+  if [[ -f "$dir/manifest.latest.json" ]]; then
+    say "  Final manifest state:"
+    jq '{snapshotId, snapshotType, changelog: (.changelog // null)}' "$dir/manifest.latest.json" 2>/dev/null || cat "$dir/manifest.latest.json"
+  else
+    say "  Manifest file not found at: $dir/manifest.latest.json"
+  fi
+  local final_status
+  final_status=$(curl -s "$OPB1_HTTP/status" || echo "{}")
+  say "  Final /status causal state:"
+  jq '{causalCutId, causalPhase, causalMarkersSeen, causalMarkersTotal}' <<<"$final_status" 2>/dev/null || echo "$final_status"
+  # Check logs for barrier-cut errors
+  if [[ -f "${OPB1_LOG:-}" ]]; then
+    say "  Recent barrier-cut logs (last 20 lines):"
+    grep -i "barrier\|snapshot-cut\|manifest" "${OPB1_LOG}" | tail -n 20 || say "    (no barrier-related logs found)"
+  fi
+  say "  Tip: Increase timeout with MANIFEST_OFFSETS_TIMEOUT=<seconds> or check OpB logs for errors"
   return 1
 }
 
@@ -105,6 +165,20 @@ require_kadmin() {
 }
 kadmin() {
   "$KADMIN_BIN" -bootstrap "$BOOTSTRAP" "$@"
+}
+
+require_opbtool() {
+  if [ ! -x "$BIN_OPBTOOL" ]; then
+    say "Building opbtool helper..."
+    go build -o "$BIN_OPBTOOL" ./cmd/opbtool
+  fi
+}
+
+require_opb() {
+  if [ ! -x "$BIN_OPB" ]; then
+    say "Building opb binary..."
+    go build -o "$BIN_OPB" ./cmd/opb || { say "ERROR: build opb failed"; exit 1; }
+  fi
 }
 
 require_jq() {
@@ -240,7 +314,7 @@ inject_delta_batch() {
   local extra_fields
   extra_fields=$(build_extra_fields)
 
-  json_payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${DELTA_BASE_EVENTS},\"start\":1000,\"sync\":true${extra_fields}}"
+  json_payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${DELTA_BASE_EVENTS},\"start\":1000,\"sync\":false${extra_fields}}"
 
   for store in "${DELTA_STORES[@]}"; do
     json_payload+=','
@@ -268,7 +342,7 @@ inject_post_cut_events() {
   local payload="["
   local extra_fields
   extra_fields=$(build_extra_fields)
-  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":60000,\"sync\":true${extra_fields}}"
+  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":60000,\"sync\":false${extra_fields}}"
   payload+="]"
   RESP=$(post_inject "$payload")
   if command -v jq >/dev/null 2>&1; then echo "$RESP" | jq .; else echo "$RESP"; fi
@@ -291,7 +365,7 @@ seed_baseline_state() {
   local payload="["
   local extra_fields
   extra_fields=$(build_extra_fields)
-  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":0,\"sync\":true${extra_fields}}"
+  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":0,\"sync\":false${extra_fields}}"
   payload+="]"
   RESP=$(post_inject "$payload")
   if command -v jq >/dev/null 2>&1; then echo "$RESP" | jq .; else echo "$RESP"; fi
@@ -400,11 +474,31 @@ wait_assignment_count() {
   return 1
 }
 
+wait_assignment_count_instance() {
+  local name=${1:-B1}
+  local base=${2:-$OPB1_HTTP}
+  local expected=${3:-$EXPECTED_PARTITIONS_PER_INSTANCE}
+  local timeout=${4:-120}
+  say "Waiting for $name to hold $expected partitions (up to ${timeout}s)..."
+  for ((i=1;i<=timeout;i++)); do
+    local cnt
+    cnt=$(curl -s "$base/status" | jq '.partitions | length' 2>/dev/null || echo 0)
+    if [[ "$cnt" =~ ^[0-9]+$ ]] && (( cnt >= expected )); then
+      say "✓ $name partitions: $cnt (>= $expected)"
+      return 0
+    fi
+    sleep 1
+  done
+  say "WARN: $name partition count did not reach $expected"
+  return 1
+}
+
 # --- Metrics & Visualization Helpers ---
 METRICS_LOG=${METRICS_LOG:-./logs/demo_metrics.log}
 mkdir -p "$(dirname "$METRICS_LOG")" 2>/dev/null || true
 : > "$METRICS_LOG" 2>/dev/null || true
 PROM_URL=${PROM_URL:-http://127.0.0.1:9090}
+PROM_CHECK_TIMEOUT=${PROM_CHECK_TIMEOUT:-10}
 
 log_metrics() {
   local msg=$1
@@ -447,6 +541,25 @@ log_prom_metric() {
   else
     log_metrics "[$label] WARN prometheus query returned empty (query=$query)"
   fi
+}
+
+check_prometheus_ready() {
+  if [[ -z "${PROM_URL:-}" ]]; then
+    say "WARN: PROM_URL is not set. Viz panel 'Causal inflight (last 5m)' will show errors; set PROM_URL or enter URL in the UI."
+    return 0
+  fi
+  local health="${PROM_URL%/}/api/v1/status/config"
+  say "Checking Prometheus availability at $PROM_URL ..."
+  for ((i=1;i<=PROM_CHECK_TIMEOUT;i++)); do
+    if curl -fsS "$health" >/dev/null 2>&1; then
+      say "✓ Prometheus reachable (checked $PROM_URL)"
+      return 0
+    fi
+    sleep 1
+  done
+  say "ERROR: Prometheus at $PROM_URL is not reachable after ${PROM_CHECK_TIMEOUT}s."
+  say "  → Start Prometheus (or update PROM_URL) before re-running the recovery demo."
+  return 1
 }
 
 log_status_endpoint() {
@@ -565,18 +678,190 @@ log_snapshot_metrics() {
   log_prom_metric "${label}-prom-snapshot-bytes" "opb_snapshot_bytes"
 }
 
+# Verify Pebble manifest contains checksums for all SSTables
+verify_pebble_manifest() {
+  local manifest=${1:-$SNAPSHOT_DIR/manifest.latest.json}
+  if [[ ! -f "$manifest" ]]; then
+    say "WARN: manifest not found: $manifest"
+    return 1
+  fi
+  local fmt
+  fmt=$(jq -r '.snapshotFormat // ""' "$manifest" 2>/dev/null || echo "")
+  if [[ "$fmt" != "pebble" ]]; then
+    # Not a Pebble snapshot, skip verification
+    return 0
+  fi
+  local files_count checksums_count
+  files_count=$(jq -r '.pebbleSstFiles // [] | length' "$manifest" 2>/dev/null || echo 0)
+  checksums_count=$(jq -r '.pebbleSstChecksums // {} | length' "$manifest" 2>/dev/null || echo 0)
+  if [[ "$files_count" -eq 0 ]]; then
+    say "WARN: Pebble manifest has no SSTable files listed"
+    return 1
+  fi
+  if [[ "$checksums_count" -eq 0 ]]; then
+    say "ERROR: Pebble manifest missing checksums (files=$files_count, checksums=0)"
+    say "  → Checksums are required for integrity validation during restore"
+    return 1
+  fi
+  if [[ "$checksums_count" -ne "$files_count" ]]; then
+    say "WARN: Pebble manifest checksum count mismatch (files=$files_count, checksums=$checksums_count)"
+    return 1
+  fi
+  say "✓ Pebble manifest verified: $files_count SSTables with $checksums_count checksums"
+  # Show sample checksum for first file
+  local first_file first_checksum
+  first_file=$(jq -r '.pebbleSstFiles[0] // ""' "$manifest" 2>/dev/null || echo "")
+  first_checksum=$(jq -r ".pebbleSstChecksums[\"$first_file\"] // \"\"" "$manifest" 2>/dev/null || echo "")
+  if [[ -n "$first_file" && -n "$first_checksum" ]]; then
+    say "  → Sample: $first_file → ${first_checksum:0:16}..."
+  fi
+  return 0
+}
+
+# Verify restore used Pebble shipping (not JSON load)
+verify_pebble_restore() {
+  local logf=${1:-$OPB1_LOG}
+  if [[ "$SNAPSHOT_FORMAT" != "pebble" ]]; then
+    return 0
+  fi
+  if grep -q "restore: restored Pebble snapshot" "$logf" 2>/dev/null; then
+    local pebble_restore_line
+    pebble_restore_line=$(grep "restore: restored Pebble snapshot" "$logf" | tail -n1)
+    say "✓ Pebble SSTable shipping confirmed: $pebble_restore_line"
+    local files_count sid
+    files_count=$(echo "$pebble_restore_line" | sed -E 's/.*files=([0-9]+).*/\1/' || echo "")
+    sid=$(echo "$pebble_restore_line" | sed -E 's/.*restored Pebble snapshot ([^ ]+).*/\1/' || echo "")
+    if [[ -n "$files_count" && "$files_count" =~ ^[0-9]+$ ]]; then
+      say "  → Imported $files_count SSTable files via atomic copy to STATE_DIR"
+    fi
+    if [[ -n "$sid" ]]; then
+      say "  → Snapshot ID: $sid"
+    fi
+  elif grep -q "restore: snapshot restored" "$logf" 2>/dev/null; then
+    local generic_line
+    generic_line=$(grep "restore: snapshot restored" "$logf" | tail -n1)
+    say "✓ Pebble snapshot restored: $generic_line"
+    local sid
+    sid=$(echo "$generic_line" | sed -E 's/.*snapshotId=([^ ]+).*/\1/' || echo "")
+    if [[ -n "$sid" ]]; then
+      say "  → Snapshot ID: $sid"
+    fi
+  else
+    say "ERROR: Pebble restore not detected in logs"
+    say "  Expected: 'restore: restored Pebble snapshot ...' or 'restore: snapshot restored ...'"
+    say "  Check $logf for restore errors"
+    return 1
+  fi
+  # Verify it did NOT use JSON load path
+  if grep -q "restore: loaded.*keys from snapshot" "$logf" 2>/dev/null; then
+    say "WARN: Both Pebble and JSON restore paths detected (unexpected)"
+    return 1
+  fi
+  return 0
+}
+
+# Verify atomic import: STATE_DIR contains Pebble files (not snapshot dir)
+verify_pebble_atomic_import() {
+  if [[ "$SNAPSHOT_FORMAT" != "pebble" ]]; then
+    return 0
+  fi
+  if [[ ! -d "$STATE_DIR" ]]; then
+    say "WARN: STATE_DIR not found: $STATE_DIR"
+    return 1
+  fi
+  # Check for Pebble files in STATE_DIR (not snapshot dir)
+  local sst_count manifest_count current_log lock_file wal_count
+  sst_count=$(find "$STATE_DIR" -maxdepth 1 -name "*.sst" 2>/dev/null | wc -l | tr -d ' ')
+  manifest_count=$(find "$STATE_DIR" -maxdepth 1 -name "MANIFEST*" 2>/dev/null | wc -l | tr -d ' ')
+  current_log=$(find "$STATE_DIR" -maxdepth 1 -name "CURRENT" 2>/dev/null | wc -l | tr -d ' ')
+  lock_file=$(find "$STATE_DIR" -maxdepth 1 -name "LOCK" 2>/dev/null | wc -l | tr -d ' ')
+  wal_count=$(find "$STATE_DIR" -maxdepth 1 -name "*.log" 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$manifest_count" -gt 0 && "$current_log" -gt 0 && ( "$sst_count" -gt 0 || "$wal_count" -gt 0 ) ]]; then
+    say "✓ Atomic import verified: STATE_DIR contains Pebble DB files"
+    say "  → SSTables: $sst_count, WAL logs: $wal_count, MANIFEST files: $manifest_count, CURRENT: $current_log"
+    if [[ "$sst_count" -eq 0 ]]; then
+      say "  → Note: SSTable count is 0 (small demo may reside entirely in WAL); manifest + WAL still prove import"
+    fi
+    say "  → Pebble DB opened at $STATE_DIR (not snapshot dir)"
+    local state_size
+    state_size=$(du -sh "$STATE_DIR" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    say "  → STATE_DIR size: $state_size"
+    return 0
+  fi
+  say "WARN: Pebble files incomplete in STATE_DIR"
+  say "  → SSTables: $sst_count (expected >0)"
+  say "  → WAL logs: $wal_count (expected >=0)"
+  say "  → MANIFEST: $manifest_count (expected >0)"
+  say "  → CURRENT: $current_log (expected >0)"
+  say "  → LOCK: $lock_file"
+  return 1
+}
+
+verify_pebble_incremental() {
+  local manifest=${1:-$SNAPSHOT_DIR/manifest.latest.json}
+  if [[ "$ENABLE_PEBBLE_PHASE3" != "1" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$manifest" ]]; then
+    say "WARN: incremental manifest not found: $manifest"
+    return 1
+  fi
+  local inc_count all_count sid
+  inc_count=$(jq -r '.pebbleIncrementalFiles // [] | length' "$manifest" 2>/dev/null || echo 0)
+  all_count=$(jq -r '.pebbleAllFiles // [] | length' "$manifest" 2>/dev/null || echo 0)
+  sid=$(jq -r '.snapshotId // ""' "$manifest" 2>/dev/null || echo "")
+  if [[ "$inc_count" -le 0 ]]; then
+    say "WARN: manifest $sid has no pebbleIncrementalFiles (Phase 3 expected)"
+    return 1
+  fi
+  say "✓ Pebble incremental snapshot verified: $inc_count incremental SSTables referenced (total files=$all_count)"
+  local first_inc
+  first_inc=$(jq -r '.pebbleIncrementalFiles[0] // ""' "$manifest" 2>/dev/null || echo "")
+  if [[ -n "$first_inc" && "$first_inc" != "null" ]]; then
+    say "  → Sample incremental file: $first_inc"
+  fi
+  return 0
+}
+
+inspect_snapshot_with_opbtool() {
+  local snapshot_id=$1
+  if [[ -z "$snapshot_id" ]]; then
+    say "WARN: snapshot ID missing for opbtool inspect"
+    return 1
+  fi
+  require_opbtool
+  mkdir -p ./logs 2>/dev/null || true
+  local log_file="./logs/opbtool_${snapshot_id}.log"
+  say "Inspecting snapshot $snapshot_id with opbtool (Phase 3 evidence)..."
+  if "$BIN_OPBTOOL" -mode inspect -snapshot-dir "$SNAPSHOT_DIR" -snapshot-id "$snapshot_id" -keys "${OPBTOOL_KEYS:-5}" | tee "$log_file"; then
+    say "✓ opbtool inspect complete (log: $log_file)"
+  else
+    say "WARN: opbtool inspect failed (see $log_file)"
+    return 1
+  fi
+}
+
 start_peer_instance() {
   say "Starting OpB peer (B2) for state migration test..."
-  "$BIN_OPB" \
-    --state-backend pebble --state-dir "${STATE_DIR}.b2" --snapshot-dir "$SNAPSHOT_DIR" \
-    --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID" \
-    --input-source kafka --topic-enriched "$ENRICHED_TOPIC" \
-    --changelog-dir "${CHANGELOG_DIR}.b2" \
-    --rebalance-import-state=true --peers "$OPB1_HTTP" \
-    --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE" \
-    --topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog \
-    --manifest-sink both --manifest-source kafka --changelog-sink both --changelog-source kafka \
-    --http :8090 --instance-id B2 > "$OPB2_LOG" 2>&1 &
+  local peer_cmd=(
+    "$BIN_OPB"
+    --state-backend pebble --state-dir "${STATE_DIR}.b2" --snapshot-dir "$SNAPSHOT_DIR"
+    --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID"
+    --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
+    --changelog-dir "${CHANGELOG_DIR}.b2"
+  --rebalance-import-state=true --peers "$OPB1_HTTP,$OPB3_HTTP"
+    --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE"
+    --topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog
+    --manifest-sink both --manifest-source kafka --changelog-sink both --changelog-source kafka
+  )
+  if [[ -n "$PEBBLE_PHASE3_FLAG" ]]; then
+    peer_cmd+=("$PEBBLE_PHASE3_FLAG")
+  fi
+  if [[ -n "${PROM_URL:-}" ]]; then
+    peer_cmd+=( --prom-url "$PROM_URL" )
+  fi
+  peer_cmd+=( --http :8090 --instance-id B2 )
+  "${peer_cmd[@]}" > "$OPB2_LOG" 2>&1 &
   OPB2_PID=$!
   if ! wait_ready "$OPB2_HTTP/healthz" 120; then
     say "ERROR: B2 failed to start"; tail -n 200 "$OPB2_LOG" || true; exit 1
@@ -589,6 +874,42 @@ stop_peer_instance() {
     kill "$OPB2_PID" 2>/dev/null || true
     for i in {1..50}; do if ! kill -0 "$OPB2_PID" >/dev/null 2>&1; then break; fi; sleep 0.2; done
     unset OPB2_PID
+  fi
+}
+
+start_third_instance() {
+  say "Starting OpB peer (B3) for failure/recovery scenario..."
+  local peer_cmd=(
+    "$BIN_OPB"
+    --state-backend pebble --state-dir "$STATE_DIR_B3" --snapshot-dir "$SNAPSHOT_DIR"
+    --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID"
+    --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
+    --changelog-dir "$CHANGELOG_DIR_B3"
+  --rebalance-import-state=true --peers "$OPB1_HTTP,$OPB2_HTTP"
+    --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE"
+    --topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog
+    --manifest-sink both --manifest-source kafka --changelog-sink both --changelog-source kafka
+  )
+  if [[ -n "$PEBBLE_PHASE3_FLAG" ]]; then
+    peer_cmd+=("$PEBBLE_PHASE3_FLAG")
+  fi
+  if [[ -n "${PROM_URL:-}" ]]; then
+    peer_cmd+=( --prom-url "$PROM_URL" )
+  fi
+  peer_cmd+=( --http "$OPB3_HTTP_ADDR" --instance-id B3 )
+  "${peer_cmd[@]}" > "$OPB3_LOG" 2>&1 &
+  OPB3_PID=$!
+  if ! wait_ready "$OPB3_HTTP/healthz" 180; then
+    say "ERROR: B3 failed to start"; tail -n 200 "$OPB3_LOG" || true; exit 1
+  fi
+}
+
+stop_third_instance() {
+  if [[ -n "${OPB3_PID:-}" ]]; then
+    say "Stopping peer B3 (PID=${OPB3_PID})"
+    kill "$OPB3_PID" 2>/dev/null || true
+    for i in {1..50}; do if ! kill -0 "$OPB3_PID" >/dev/null 2>&1; then break; fi; sleep 0.2; done
+    unset OPB3_PID
   fi
 }
 
@@ -612,17 +933,21 @@ pkill -f opb >/dev/null 2>&1 || true
 sleep 2
 ensure_port_free 8089
 ensure_port_free 8090
+ensure_port_free 8091
 
 # --- Main Demo Logic ---
 
 require_kadmin
 require_jq
 
+# Build opb binary if missing
+require_opb
+
 say "Phase 1: Setup & Create Snapshot"
 
 say "Clean up old state, snapshots, and logs"
-rm -rf "$STATE_DIR" "$SNAPSHOT_DIR" "$CHANGELOG_DIR" "${STATE_DIR}.b2" "${CHANGELOG_DIR}.b2"
-mkdir -p "$STATE_DIR" "$SNAPSHOT_DIR" "$CHANGELOG_DIR" "${STATE_DIR}.b2" "${CHANGELOG_DIR}.b2" ./logs
+rm -rf "$STATE_DIR" "$SNAPSHOT_DIR" "$CHANGELOG_DIR" "${STATE_DIR}.b2" "${CHANGELOG_DIR}.b2" "$STATE_DIR_B3" "$CHANGELOG_DIR_B3"
+mkdir -p "$STATE_DIR" "$SNAPSHOT_DIR" "$CHANGELOG_DIR" "${STATE_DIR}.b2" "${CHANGELOG_DIR}.b2" "$STATE_DIR_B3" "$CHANGELOG_DIR_B3" ./logs
 
 say "Reset Kafka topics for clean demo"
 delete_topic_if_exists "p1.opb-snapshots"
@@ -637,38 +962,51 @@ delete_topic_if_exists "$ENRICHED_TOPIC"
 ensure_enriched_topic() {
   local topic=$1
   say "Ensuring enriched topic exists: ${topic}"
-  kadmin -cmd create -topic "$topic" -partitions 4 -rf 1 >/dev/null 2>&1 || true
+  kadmin -cmd create -topic "$topic" -partitions "$ENRICHED_PARTITIONS" -rf 1 >/dev/null 2>&1 || true
 }
 ensure_enriched_topic "$ENRICHED_TOPIC"
 reset_group_offsets "$GROUP_ID"
+
+if ! check_prometheus_ready; then
+  say "Stopping demo because Prometheus is required for viz panel coverage."
+  exit 1
+fi
 
 # Ensure compacted topics exist for manifest and changelog (Kafka-mode)
 ensure_compacted_topic() {
   local topic=$1
   say "Ensuring compacted topic exists: ${topic}"
-  kadmin -cmd create -topic "$topic" -partitions 1 -rf 1 -config "cleanup.policy=compact" >/dev/null 2>&1 || true
+  kadmin -cmd create -topic "$topic" -partitions "$SNAPSHOTS_PARTITIONS" -rf 1 -config "cleanup.policy=compact" >/dev/null 2>&1 || true
 }
 ensure_compacted_topic "p1.opb-snapshots"
 # Changelog should NOT be compacted for delta replay; keep full history
 ensure_delete_topic() {
   local topic=$1
   say "Ensuring delete-policy topic exists: ${topic}"
-  kadmin -cmd create -topic "$topic" -partitions 1 -rf 1 -config "cleanup.policy=delete" >/dev/null 2>&1 || true
+  kadmin -cmd create -topic "$topic" -partitions "$CHANGELOG_PARTITIONS" -rf 1 -config "cleanup.policy=delete" >/dev/null 2>&1 || true
 }
 ensure_delete_topic "p1.opb-changelog"
 
 say "Start OpB (B1) with PebbleDB and snapshot interval=${SNAPSHOT_INTERVAL}s"
-EXTRA_OPB_FLAGS="--topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog --manifest-sink both --manifest-source kafka --changelog-sink both --changelog-source kafka --injector-linger-ms 100"
-nohup "$BIN_OPB" \
-  --state-backend pebble --state-dir "$STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR" \
-  --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID" \
-  --input-source kafka --topic-enriched "$ENRICHED_TOPIC" \
-  --changelog-dir "$CHANGELOG_DIR" \
-  --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE" \
-  --snapshot-shards "${SNAPSHOT_SHARDS:-4}" \
-  $EXTRA_OPB_FLAGS \
-  --peers "$OPB2_HTTP" \
-  --http :8089 --instance-id B1 > "$OPB1_LOG" 2>&1 < /dev/null &
+EXTRA_OPB_FLAGS=(--topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog --manifest-sink both --manifest-source kafka --changelog-sink both --changelog-source kafka --injector-linger-ms ${INJECTOR_LINGER_MS:-10})
+if [[ -n "$PEBBLE_PHASE3_FLAG" ]]; then
+  EXTRA_OPB_FLAGS+=("$PEBBLE_PHASE3_FLAG")
+fi
+if [[ -n "${PROM_URL:-}" ]]; then
+  EXTRA_OPB_FLAGS+=( --prom-url "$PROM_URL" )
+fi
+OPB_CMD=(
+  "$BIN_OPB"
+  --state-backend pebble --state-dir "$STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR"
+  --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID"
+  --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
+  --changelog-dir "$CHANGELOG_DIR"
+  --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE"
+  --snapshot-shards "${SNAPSHOT_SHARDS:-4}"
+)
+OPB_CMD+=( "${EXTRA_OPB_FLAGS[@]}" )
+OPB_CMD+=( --peers "$OPB2_HTTP,$OPB3_HTTP" --http :8089 --instance-id B1 )
+nohup "${OPB_CMD[@]}" > "$OPB1_LOG" 2>&1 < /dev/null &
 OPB_PID=$!
 disown || true
 
@@ -680,9 +1018,133 @@ log_cluster_viz "b1-start-cluster" "$OPB1_HTTP"
 log_zone_viz "baseline-zone" "$STORE"
 log_heatmap_viz "baseline-heatmap"
 
-# Trigger a barrier-based snapshot cut to create a manifest with per-partition offsets
+# Start B2 upfront to split partitions before heavy ingestion
+say "Phase 1b: Start secondary OpB instance (B2) để chia partition"
+start_peer_instance
+wait_assignment_count_instance "B2" "$OPB2_HTTP" "$EXPECTED_PARTITIONS_PER_NODE" 180 || true
+log_status_endpoint "b2-start-status" "$OPB2_HTTP"
+log_cluster_viz "cluster-with-b2" "$OPB1_HTTP"
+
+# Start B3 so cả cụm 3 node sẵn sàng trước seeding
+say "Phase 1c: Start tertiary OpB instance (B3) để tăng throughput"
+start_third_instance
+say "Waiting for import logs from B3..."
+import_b3=0
+for ((i=1;i<=180;i++)); do
+  if grep -q "import: finished loading" "$OPB3_LOG" 2>/dev/null; then
+    say "✓ B3 import completed (see $OPB3_LOG)"
+    import_b3=1
+    break
+  fi
+  if grep -q "import: no data" "$OPB3_LOG" 2>/dev/null || grep -q "opb: ready" "$OPB3_LOG" 2>/dev/null; then
+    say "✓ B3 has no state to import (ready)"
+    import_b3=1
+    break
+  fi
+  sleep 1
+done
+if [[ $import_b3 -ne 1 ]]; then
+  say "WARN: Did not observe 'import: finished loading' in B3 logs (check $OPB3_LOG)"
+fi
+wait_assignment_count_instance "B3" "$OPB3_HTTP" "$EXPECTED_PARTITIONS_PER_NODE" 180 || true
+log_status_endpoint "b3-start-status" "$OPB3_HTTP"
+log_cluster_viz "cluster-with-b3" "$OPB1_HTTP"
+say "B2 và B3 đã nhận partition (~${EXPECTED_PARTITIONS_PER_NODE} mỗi node). B1 vẫn giữ phần còn lại; bắt đầu seeding."
+
+# Optional: seed via genorders Kafka mode (fast path, no HTTP rate limit)
+# Always run GENORDERS_SEED unless explicitly disabled
+if [[ "${GENORDERS_SEED:-1}" == "1" ]]; then
+  say "GENORDERS_SEED: producing Kafka events via bin/genorders"
+  if [ ! -x "./bin/genorders" ]; then
+    say "Building genorders helper..."
+    go build -o ./bin/genorders ./cmd/genorders || { say "ERROR: build genorders failed"; exit 1; }
+  fi
+  GEN_BOOT=${GEN_BOOTSTRAP:-$BOOTSTRAP}
+  GEN_TOPIC=${GEN_TOPIC:-$ENRICHED_TOPIC}
+  GEN_STORES=${GEN_STORES:-600}
+  GEN_PRODUCTS=${GEN_PRODUCTS:-1500}
+  GEN_N=${GEN_N_PER_KEY:-1}
+  GEN_WINDOW=${GEN_WINDOW_SIZE:-$WINDOW_SIZE}
+  GEN_LINGER=${GEN_LINGER_MS:-10}
+  ./bin/genorders --mode kafka \
+    --bootstrap "$GEN_BOOT" --topic "$GEN_TOPIC" \
+    --stores "$GEN_STORES" --products "$GEN_PRODUCTS" \
+    --n-per-key "$GEN_N" --window-size "$GEN_WINDOW" --linger-ms "$GEN_LINGER"
+  # Wait for lag to drain (default 120s)
+  GEN_WAIT=${GEN_WAIT_LAG_SEC:-120}
+  for ((i=1;i<=GEN_WAIT;i++)); do
+    lag=$(get_lag_total)
+    printf "\r[GENORDERS_SEED] waiting lag=%s (%d/%d)" "$lag" "$i" "$GEN_WAIT"
+    if [[ "$lag" =~ ^[0-9]+$ ]] && (( lag <= 1 )); then printf "\n"; break; fi
+    sleep 1
+  done
+
+fi
+
+# Optionally prime small data before the first full cut to ensure consumer polls all partitions
+if [[ "${PRE_CUT_PRIME:-0}" == "1" ]]; then
+  say "PRE_CUT_PRIME: producing a tiny amount of data to prime all partitions"
+  if [ ! -x "./bin/genorders" ]; then
+    say "Building genorders helper..."
+    go build -o ./bin/genorders ./cmd/genorders || { say "ERROR: build genorders failed"; exit 1; }
+  fi
+  GEN_BOOT=${GEN_BOOTSTRAP:-$BOOTSTRAP}
+  GEN_TOPIC=${GEN_TOPIC:-$ENRICHED_TOPIC}
+  PRIME_STORES=${PRE_CUT_PRIME_STORES:-32}
+  PRIME_PRODUCTS=${PRE_CUT_PRIME_PRODUCTS:-4}
+  PRIME_N=${PRE_CUT_PRIME_N:-1}
+  GEN_WINDOW=${GEN_WINDOW_SIZE:-$WINDOW_SIZE}
+  GEN_LINGER=${GEN_LINGER_MS:-5}
+  ./bin/genorders --mode kafka \
+    --bootstrap "$GEN_BOOT" --topic "$GEN_TOPIC" \
+    --stores "$PRIME_STORES" --products "$PRIME_PRODUCTS" \
+    --n-per-key "$PRIME_N" --window-size "$GEN_WINDOW" --linger-ms "$GEN_LINGER"
+  # Wait briefly for lag to drain and assignments to stabilize
+  for ((i=1;i<=20;i++)); do
+    lag=$(get_lag_total)
+    printf "\r[PRE_CUT_PRIME] waiting lag=%s (%d/%d)" "$lag" "$i" 20
+    if [[ "$lag" =~ ^[0-9]+$ ]] && (( lag <= 1 )); then printf "\n"; break; fi
+    sleep 1
+  done
+fi
+
+# If backlog is very high after optional seeding, wait (bounded) before full cut to avoid 0/N markers for minutes
+CUT_WAIT_LAG_THRESHOLD=${CUT_WAIT_LAG_THRESHOLD:-2000}
+CUT_WAIT_LAG_SEC=${CUT_WAIT_LAG_SEC:-90}
+lag=$(get_lag_total)
+if [[ "$lag" =~ ^[0-9]+$ ]] && (( lag > CUT_WAIT_LAG_THRESHOLD )); then
+  say "Backlog is high (lag=$lag) — waiting up to ${CUT_WAIT_LAG_SEC}s for lag <= ${CUT_WAIT_LAG_THRESHOLD} before full cut"
+  for ((i=1;i<=CUT_WAIT_LAG_SEC;i++)); do
+    lag=$(get_lag_total)
+    printf "\r  [pre-cut wait %3d/%d] lag=%s (threshold=%s)" "$i" "$CUT_WAIT_LAG_SEC" "$lag" "$CUT_WAIT_LAG_THRESHOLD"
+    if [[ "$lag" =~ ^[0-9]+$ ]] && (( lag <= CUT_WAIT_LAG_THRESHOLD )); then printf "\n"; break; fi
+    sleep 1
+  done
+  printf "\n"
+fi
+
+# Always trigger a barrier-based snapshot cut. This happens after the optional heavy seed and prime.
 say "Triggering barrier-based snapshot cut..."
 curl -s -X POST "$OPB1_HTTP/admin/snapshot-cut" | jq '.' || true
+# If markers are stuck at 0/N shortly after cut, nudge consumer with tiny events
+sleep 3
+if command -v jq >/dev/null 2>&1; then
+  SEEN=$(curl -s "$OPB1_HTTP/status" | jq -r '.causalMarkersSeen // 0')
+  TOT=$(curl -s "$OPB1_HTTP/status" | jq -r '.causalMarkersTotal // 0')
+else
+  SEEN=0; TOT=0
+fi
+if [[ "$TOT" =~ ^[0-9]+$ ]] && [[ "$SEEN" =~ ^[0-9]+$ ]] && (( TOT > 0 )) && (( SEEN == 0 )); then
+  say "Markers are 0/$TOT soon after cut; nudging consumer with tiny genorders batch"
+  if [ ! -x "./bin/genorders" ]; then
+    say "Building genorders helper..."
+    go build -o ./bin/genorders ./cmd/genorders || { say "ERROR: build genorders failed"; exit 1; }
+  fi
+  ./bin/genorders --mode kafka --bootstrap "${GEN_BOOTSTRAP:-$BOOTSTRAP}" --topic "${GEN_TOPIC:-$ENRICHED_TOPIC}" \
+    --stores "${NUDGE_STORES:-32}" --products "${NUDGE_PRODUCTS:-8}" --n-per-key "${NUDGE_N:-1}" \
+    --window-size "${GEN_WINDOW_SIZE:-$WINDOW_SIZE}" --linger-ms "${NUDGE_LINGER_MS:-5}"
+  sleep 2
+fi
 
 NOW=$(date +%s)
 WS=$(( (NOW/ WINDOW_SIZE) * WINDOW_SIZE ))
@@ -694,8 +1156,9 @@ EXACT_URL_WS="$OPB1_HTTP/api/zone-details?id=$STORE&productId=$PROD&ws=$WS"
 HEATMAP_URL="$OPB1_HTTP/viz/heatmap?metric=total"
 
 say "Barrier mode: waiting for manifest with per-partition offsets before pumping delta"
-wait_manifest_offsets "$SNAPSHOT_DIR" 45
+wait_manifest_offsets "$SNAPSHOT_DIR" # Timeout: ${MANIFEST_OFFSETS_TIMEOUT}s (set MANIFEST_OFFSETS_TIMEOUT to override)
 log_snapshot_metrics "full-snapshot" "$SNAPSHOT_DIR/manifest.latest.json"
+verify_pebble_manifest "$SNAPSHOT_DIR/manifest.latest.json"
 # Baseline before delta (optionally seed state for import demo)
 base_sq=$(get_exact_sumqty "$EXACT_URL")
 base_ls=$(get_lastseq "$EXACT_URL_WS")
@@ -709,37 +1172,29 @@ echo "Exact URL (store-total): $EXACT_URL"
 echo "Exact URL (window): $EXACT_URL_WS"
 echo "Exact sumQty (total)=$base_sq lastSeq=$base_ls"
 
-say "Phase 2: State migration (rebalance import)"
-if ask_continue "Start peer instance B2 to demonstrate state migration?"; then
-  start_peer_instance
-  say "Waiting for import logs from B2..."
-  import_logged=0
-  for ((i=1;i<=60;i++)); do
-    if grep -q "import: finished loading" "$OPB2_LOG" 2>/dev/null; then
-      say "✓ Peer import completed (see $OPB2_LOG)"
-      import_logged=1
-      break
-    fi
-    sleep 1
-  done
-  if [[ $import_logged -ne 1 ]]; then
-    say "WARN: Did not observe 'import: finished loading' in B2 logs (check $OPB2_LOG)"
+say "Phase 2: Validate peer instance B2 import"
+say "Waiting for import logs from B2..."
+import_logged=0
+for ((i=1;i<=120;i++)); do
+  if grep -q "import: finished loading" "$OPB2_LOG" 2>/dev/null; then
+    say "✓ Peer import completed (see $OPB2_LOG)"
+    import_logged=1
+    break
   fi
-  log_status_endpoint "b2-import-status" "$OPB2_HTTP"
-  log_cluster_viz "cluster-after-b2-import" "$OPB1_HTTP"
-  say "B2 is running; open $OPB2_HTTP/viz/cluster to observe assignment."
-  if ask_continue "Stop peer instance B2 now?"; then
-    stop_peer_instance
-  else
-    say "Keeping B2 running (remember to stop it manually after the demo)."
+  if grep -q "import: no data" "$OPB2_LOG" 2>/dev/null || grep -q "opb: ready" "$OPB2_LOG" 2>/dev/null; then
+    say "✓ Peer has no state to import (ready)"
+    import_logged=1
+    break
   fi
-  sleep 5
-  wait_assignment_count "$EXPECTED_PARTITIONS" 60
-else
-  say "Skipping peer migration demo"
+  sleep 1
+done
+if [[ $import_logged -ne 1 ]]; then
+  say "WARN: Did not observe 'import: finished loading' in B2 logs (check $OPB2_LOG)"
 fi
+log_status_endpoint "b2-import-status" "$OPB2_HTTP"
+log_cluster_viz "cluster-after-b2-import" "$OPB1_HTTP"
+say "B2 will remain online through heavy seeding to increase throughput."
 
-log_cluster_viz "post-b2-cluster" "$OPB1_HTTP"
 say "Phase 2: Create Delta Data with Causal Snapshot Capture"
 say "=== Causal Snapshot Technique (Beaver-style) ==="
 
@@ -792,24 +1247,60 @@ expected_total=$(( base_sq + DELTA_TOTAL_EVENTS + POST_CUT_EVENTS ))
 if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
   INFLIGHT_PATH="$SNAPSHOT_DIR/${MANIFEST_SNAPSHOT_ID:-}/$MANIFEST_INFLIGHT_FILE"
   log_snapshot_metrics "delta-snapshot" "$SNAPSHOT_DIR/manifest.latest.json"
-  if [[ -f "$INFLIGHT_PATH" ]]; then
-    if command -v jq >/dev/null 2>&1; then
-      INFLIGHT_EVENT_COUNT=$(jq '(.events | map(length) | add) // 0' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
-      INFLIGHT_CHANNELS=$(jq -r '.channels | length' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+  verify_pebble_manifest "$SNAPSHOT_DIR/manifest.latest.json"
+  verify_pebble_incremental "$SNAPSHOT_DIR/manifest.latest.json" || true
+  if [[ -n "${MANIFEST_SNAPSHOT_ID:-}" ]]; then
+    inspect_snapshot_with_opbtool "$MANIFEST_SNAPSHOT_ID"
+  fi
+  # Wait up to 15s for inflight.json to be materialized on disk (manifest may be published first)
+  for ((i=1;i<=15;i++)); do
+    if [[ -f "$INFLIGHT_PATH" ]]; then break; fi
+    sleep 1
+  done
+    if [[ -f "$INFLIGHT_PATH" ]]; then
+      if command -v jq >/dev/null 2>&1; then
+        INFLIGHT_EVENT_COUNT=$(jq '(.events | map(length) | add) // 0' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+        INFLIGHT_CHANNELS=$(jq -r '.channels | length' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+        INFLIGHT_FOR_KEY=$(jq -r --arg k "${STORE}#${PROD}#${WS}" '
+          (.events // {})
+          | to_entries
+          | map(.value | map(select(.key == $k)) | length)
+          | add // 0
+        ' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+      else
+        INFLIGHT_EVENT_COUNT=$(grep -c '"key"' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+        INFLIGHT_CHANNELS=0
+        INFLIGHT_FOR_KEY=0
+      fi
+      say "✓ Causal snapshot captured: $INFLIGHT_EVENT_COUNT inflight events across $INFLIGHT_CHANNELS channels"
+      say "  File: $MANIFEST_INFLIGHT_FILE"
+      say "  Inflight for key ${STORE}#${PROD}#${WS}: $INFLIGHT_FOR_KEY events"
+      if [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
+        say "  ✓ Channel state successfully captured - causal recovery will replay these events"
+      else
+        say "  WARN: Inflight file exists but contains 0 events"
+        say "  This may indicate all messages were processed before barriers arrived"
+      fi
     else
-      INFLIGHT_EVENT_COUNT=$(grep -c '"key"' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
-      INFLIGHT_CHANNELS=0
-    fi
-    say "✓ Causal snapshot captured: $INFLIGHT_EVENT_COUNT inflight events across $INFLIGHT_CHANNELS channels"
-    say "  File: $MANIFEST_INFLIGHT_FILE"
-    if [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
-      say "  ✓ Channel state successfully captured - causal recovery will replay these events"
-    else
-      say "  WARN: Inflight file exists but contains 0 events"
-      say "  This may indicate all messages were processed before barriers arrived"
-    fi
-  else
     say "WARN: inflight file $INFLIGHT_PATH not found (manifest references it but file missing)"
+    # Best-effort diagnostics and fallback search
+    say "  Listing snapshot dir: $SNAPSHOT_DIR/${MANIFEST_SNAPSHOT_ID:-}"
+    ls -la "$SNAPSHOT_DIR/${MANIFEST_SNAPSHOT_ID:-}" 2>/dev/null || true
+    alt_inflight=$(find "$SNAPSHOT_DIR" -maxdepth 2 -name "inflight.json" 2>/dev/null | head -n1 || true)
+    if [[ -n "$alt_inflight" && -f "$alt_inflight" ]]; then
+      say "  Found inflight.json at alternative path: $alt_inflight"
+      INFLIGHT_PATH="$alt_inflight"
+      if command -v jq >/dev/null 2>&1; then
+        INFLIGHT_EVENT_COUNT=$(jq '(.events | map(length) | add) // 0' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+        INFLIGHT_CHANNELS=$(jq -r '.channels | length' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+      else
+        INFLIGHT_EVENT_COUNT=$(grep -c '"key"' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+        INFLIGHT_CHANNELS=0
+      fi
+      say "✓ Causal snapshot captured (fallback): $INFLIGHT_EVENT_COUNT inflight events across $INFLIGHT_CHANNELS channels"
+    else
+      say "  inflight.json not found anywhere under $SNAPSHOT_DIR (will rely on changelog replay if needed)"
+    fi
   fi
 else
   say "WARN: inflightFile not observed in manifest within timeout"
@@ -853,30 +1344,54 @@ wait_manifest_published() {
 }
 wait_manifest_published 45
 
-ask_continue "Ready to crash the instance?" || { echo Aborted; exit 1; }
+say "Phase 3: Crash & Recovery (B3)"
+if ! ask_continue "Phase 3: Ready to crash B3 now?"; then
+  say "User chose to abort before crash — stopping demo."
+  exit 0
+fi
+say "Inducing fault on B3 (kill -9)"
+kill -9 "$OPB3_PID" || true
+say "Waiting for process $OPB3_PID to fully exit..."
+for i in {1..100}; do if ! kill -0 "$OPB3_PID" >/dev/null 2>&1; then break; fi; sleep 0.1; printf "."; done; echo
+unset OPB3_PID
 
-say "Phase 3: Crash & Recovery"
-say "Inducing fault (kill -9)"
-kill -9 "$OPB_PID" || true
-say "Waiting for process $OPB_PID to fully exit..."
-for i in {1..100}; do if ! kill -0 "$OPB_PID" >/dev/null 2>&1; then break; fi; sleep 0.1; printf "."; done; echo
+CRASH_STATE_DIR="$STATE_DIR_B3"
+CRASH_CHANGELOG_DIR="$CHANGELOG_DIR_B3"
+CRASH_LOG="$OPB3_LOG"
+CRASH_HTTP="$OPB3_HTTP"
+CRASH_HTTP_ADDR="$OPB3_HTTP_ADDR"
+CRASH_INSTANCE_ID="B3"
 
 # Verify snapshot exists before recovery
 say "Verifying snapshot exists before recovery..."
 SNAPSHOT_ID=$(grep -o '"snapshotId":"[^"]*"' "$OPB1_LOG" 2>/dev/null | tail -n1 | sed 's/.*"snapshotId":"\([^"]*\)".*/\1/' || true)
 if [[ -n "$SNAPSHOT_ID" ]]; then
+  if [[ "$SNAPSHOT_FORMAT" == "pebble" ]]; then
+    # Pebble snapshot: check for SSTable directory
+    SNAPSHOT_DIR_PEBBLE="$SNAPSHOT_DIR/$SNAPSHOT_ID"
+    if [[ -d "$SNAPSHOT_DIR_PEBBLE" ]]; then
+      local sst_files
+      sst_files=$(find "$SNAPSHOT_DIR_PEBBLE" -name "*.sst" 2>/dev/null | wc -l | tr -d ' ')
+      SNAPSHOT_SIZE=$(du -sh "$SNAPSHOT_DIR_PEBBLE" 2>/dev/null | awk '{print $1}' || echo "unknown")
+      say "Pebble snapshot found: $SNAPSHOT_ID ($sst_files SSTables, size: $SNAPSHOT_SIZE)"
+    else
+      say "WARN: Pebble snapshot directory not found: $SNAPSHOT_DIR_PEBBLE"
+    fi
+  else
+    # JSON/msgpack snapshot: check for state.json
   SNAPSHOT_FILE="$SNAPSHOT_DIR/$SNAPSHOT_ID/state.json"
   if [[ -f "$SNAPSHOT_FILE" ]]; then
     SNAPSHOT_SIZE=$(stat -f%z "$SNAPSHOT_FILE" 2>/dev/null || stat -c%s "$SNAPSHOT_FILE" 2>/dev/null || echo "unknown")
     say "Snapshot found: $SNAPSHOT_ID (size: $SNAPSHOT_SIZE bytes)"
+    else
+      say "WARN: Snapshot file not found at $SNAPSHOT_FILE"
+    fi
+  fi
     if [[ -n "$MANIFEST_INFLIGHT_FILE" ]]; then
       INFLIGHT_PATH="$SNAPSHOT_DIR/$MANIFEST_INFLIGHT_FILE"
       if [[ -f "$INFLIGHT_PATH" ]]; then
         say "Inflight file located at $INFLIGHT_PATH"
       fi
-    fi
-  else
-    say "WARN: Snapshot file not found at $SNAPSHOT_FILE"
   fi
 else
   say "WARN: Could not extract snapshotId from logs"
@@ -884,73 +1399,91 @@ fi
 
 say "Restarting B1 in two stages..."
 
-say "Stage 1: Restore-only to rebuild state and exit"
-rm -f "$STATE_DIR/LOCK" 2>/dev/null || true # Clean lock before restore
-"$BIN_OPB" \
-  --state-backend pebble --state-dir "$STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR" \
-  --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID" \
-  --input-source kafka --topic-enriched "$ENRICHED_TOPIC" \
-  $EXTRA_OPB_FLAGS \
-  --window-size "$WINDOW_SIZE" \
-  --http :8089 --instance-id B1 \
-  --restore-on-start --restore-only >> "$OPB1_LOG" 2>&1
+say "Stage 1: Restore-only to rebuild state and exit (B3)"
+rm -f "$CRASH_STATE_DIR/LOCK" 2>/dev/null || true # Clean lock before restore
+RESTORE_CMD=(
+  "$BIN_OPB"
+  --state-backend pebble --state-dir "$CRASH_STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR"
+  --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID"
+  --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
+)
+RESTORE_CMD+=( "${EXTRA_OPB_FLAGS[@]}" )
+RESTORE_CMD+=( --window-size "$WINDOW_SIZE" --http :8092 --instance-id "$CRASH_INSTANCE_ID" --restore-on-start --restore-only )
+if ! "${RESTORE_CMD[@]}" >> "$CRASH_LOG" 2>&1; then
+  say "ERROR: restore-only failed — last 120 lines:"
+  tail -n 120 "$CRASH_LOG" || true
+  exit 1
+fi
 
 # Verify snapshot was restored
 say "Verifying snapshot restoration..."
-if grep -q "restore: snapshot restored" "$OPB1_LOG" 2>/dev/null; then
-  RESTORED_SNAPSHOT=$(grep "restore: snapshot restored" "$OPB1_LOG" | tail -n1 | sed -E 's/.*snapshotId=([^ ]+).*/\1/' || echo "")
+if [[ "$SNAPSHOT_FORMAT" == "pebble" ]]; then
+  # Pebble backend: verify SSTable shipping was used
+  verify_pebble_restore "$CRASH_LOG"
+  # Verify atomic import into STATE_DIR
+  ORIG_STATE_DIR="$STATE_DIR"
+  STATE_DIR="$CRASH_STATE_DIR"
+  verify_pebble_atomic_import
+  STATE_DIR="$ORIG_STATE_DIR"
+else
+  # JSON/msgpack backend: verify logical load
+  if grep -q "restore: snapshot restored\|restore: loaded.*keys from snapshot" "$CRASH_LOG" 2>/dev/null; then
+  RESTORED_SNAPSHOT=$(grep "restore: snapshot restored" "$CRASH_LOG" | tail -n1 | sed -E 's/.*snapshotId=([^ ]+).*/\1/' || echo "")
   if [[ -n "$RESTORED_SNAPSHOT" ]]; then
     say "✓ Snapshot restored successfully: $RESTORED_SNAPSHOT"
   fi
   # Extract number of keys loaded from snapshot (format: "restore: loaded X keys from snapshot Y")
-  KEYS_LOADED=$(grep "restore: loaded.*keys from snapshot" "$OPB1_LOG" | tail -n1 | sed -E 's/.*loaded ([0-9]+) keys.*/\1/' || echo "")
+  KEYS_LOADED=$(grep "restore: loaded.*keys from snapshot" "$CRASH_LOG" | tail -n1 | sed -E 's/.*loaded ([0-9]+) keys.*/\1/' || echo "")
   if [[ -n "$KEYS_LOADED" && "$KEYS_LOADED" =~ ^[0-9]+$ ]]; then
     say "✓ Loaded $KEYS_LOADED keys from snapshot"
   fi
 else
   say "WARN: Snapshot restoration log not found"
 fi
+fi
 
 # Report restore phases and whether changelog replay was skipped
-phases=$(parse_restore_phases "$OPB1_LOG" || true)
+phases=$(parse_restore_phases "$CRASH_LOG" || true)
 if [[ -n "$phases" ]]; then
   say "restore phases: $phases"
 fi
-assert_skip_replay "$OPB1_LOG"
+assert_skip_replay "$CRASH_LOG"
 
 # Verify causal replay: Check for inflight events being replayed
-if grep -q "inflight replay applied" "$OPB1_LOG" 2>/dev/null; then
-  REPLAY_COUNT=$(grep "inflight replay applied" "$OPB1_LOG" | tail -n1 | sed -E 's/.*events=([0-9]+).*/\1/' 2>/dev/null || echo "")
+if grep -q "inflight replay applied" "$CRASH_LOG" 2>/dev/null; then
+  REPLAY_COUNT=$(grep "inflight replay applied" "$CRASH_LOG" | tail -n1 | sed -E 's/.*events=([0-9]+).*/\1/' 2>/dev/null || echo "")
   if [[ -n "$REPLAY_COUNT" && "$REPLAY_COUNT" =~ ^[0-9]+$ ]]; then
     say "✓ Causal inflight replay applied: $REPLAY_COUNT events replayed"
   else
     say "✓ Causal inflight replay detected in logs"
   fi
 else
-  say "WARN: Causal replay log not detected (check $OPB1_LOG for 'inflight replay')"
+  say "WARN: Causal replay log not detected (check $CRASH_LOG for 'inflight replay')"
   say "  If inflightFile was captured, this indicates a problem with causal recovery"
 fi
 
-say "Stage 2: Start normally to begin consuming"
-"$BIN_OPB" \
-  --state-backend pebble --state-dir "$STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR" \
-  --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID" \
-  --input-source kafka --topic-enriched "$ENRICHED_TOPIC" \
-  $EXTRA_OPB_FLAGS \
-  --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE" \
-  --restore-on-start \
-  --http :8089 --instance-id B1 >> "$OPB1_LOG" 2>&1 &
-OPB_PID2=$!
+say "Stage 2: Restart B3 to rejoin cluster"
+RESTART_CMD=(
+  "$BIN_OPB"
+  --state-backend pebble --state-dir "$CRASH_STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR"
+  --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID"
+  --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
+)
+RESTART_CMD+=( "${EXTRA_OPB_FLAGS[@]}" )
+RESTART_CMD+=( --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE" --restore-on-start --http "$CRASH_HTTP_ADDR" --instance-id "$CRASH_INSTANCE_ID" )
+"${RESTART_CMD[@]}" >> "$CRASH_LOG" 2>&1 &
+OPB3_PID2=$!
 
-if ! wait_ready "$OPB1_HTTP/healthz" 180; then echo "ERROR: B1 failed to start after restore"; tail -n 400 "$OPB1_LOG" || true; exit 1; fi
+if ! wait_ready "$CRASH_HTTP/healthz" 180; then echo "ERROR: $CRASH_INSTANCE_ID failed to start after restore"; tail -n 400 "$CRASH_LOG" || true; exit 1; fi
 
-log_status_endpoint "post-recovery-status" "$OPB1_HTTP"
-log_cluster_viz "post-recovery-cluster" "$OPB1_HTTP"
+log_status_endpoint "post-recovery-status-b3" "$OPB3_HTTP"
 log_zone_viz "post-recovery-zone" "$STORE"
 log_heatmap_viz "post-recovery-heatmap"
 
 say "Phase 4: Verification"
-if wait_for_exact "$EXACT_URL_WS" "$PRE_CRASH_LASTSEQ" $CHECK_EXACT_RETRIES; then
+EXPECTED_AFTER_SQ=$(( PRE_CRASH_SUM + ${INFLIGHT_FOR_KEY:-0} ))
+EXPECTED_AFTER_LS=$(( PRE_CRASH_LASTSEQ + ${INFLIGHT_FOR_KEY:-0} ))
+if wait_for_exact "$EXACT_URL_WS" "$EXPECTED_AFTER_LS" $CHECK_EXACT_RETRIES; then
   after_ls=$(get_lastseq "$EXACT_URL_WS"); after_sq=$(get_exact_sumqty "$EXACT_URL")
 else
   after_ls=$(get_lastseq "$EXACT_URL_WS"); after_sq=$(get_exact_sumqty "$EXACT_URL")
@@ -958,25 +1491,22 @@ fi
 say "Checkpoint 3: State AFTER recovery"
 echo "Exact URL (store-total): $EXACT_URL"
 echo "Exact URL (window): $EXACT_URL_WS"
-echo "Exact sumQty (total, after)=$after_sq lastSeq(after)=$after_ls (expected lastSeq>=$cur_ls and sumQty==$cur_sq)"
-# Wait for heatmap to reflect recovered state (should match pre-crash value)
+# Derive expected per-key state using captured inflight-for-key
+echo "Exact sumQty (total, after)=$after_sq lastSeq(after)=$after_ls"
+echo "Expected (per-key): sumQty=$EXPECTED_AFTER_SQ lastSeq=$EXPECTED_AFTER_LS (PRE=$PRE_CRASH_SUM, inflightForKey=${INFLIGHT_FOR_KEY:-0})"
+# Wait for heatmap to reflect recovered state for STORE
 wait_heatmap_value "$HEATMAP_URL" "$STORE" "$after_sq" 30
 heatmap_val3=$(get_heatmap_total "$HEATMAP_URL" "$STORE")
-say "✓ Heatmap Checkpoint 3: $heatmap_val3 (expected ~$after_sq, should match pre-crash ~$PRE_CRASH_SUM)"
+say "✓ Heatmap Checkpoint 3: $heatmap_val3 (should reflect after-recovery total=$after_sq)"
 
-# Verify causal consistency: SumQty should match pre-crash value
-# This proves that inflight events were correctly replayed during recovery
+# Per-key exactness: after should equal pre-crash + inflightForKey
 if [[ -n "${PRE_CRASH_SUM:-}" ]]; then
-  if [[ "$after_sq" -eq "$PRE_CRASH_SUM" ]]; then
-    say "✓ Causal consistency verified: SumQty after recovery ($after_sq) matches pre-crash ($PRE_CRASH_SUM)"
-    say "  This confirms that inflight events were correctly replayed"
+  if [[ "$after_sq" -eq "$EXPECTED_AFTER_SQ" && "$after_ls" -eq "$EXPECTED_AFTER_LS" ]]; then
+    say "✓ Per-key exactness verified: (sumQty,lastSeq) after=($after_sq,$after_ls) equals pre-crash+inflightForKey=($EXPECTED_AFTER_SQ,$EXPECTED_AFTER_LS)"
   else
-    say "WARN: SumQty mismatch - after recovery ($after_sq) vs pre-crash ($PRE_CRASH_SUM)"
-    say "  Difference: $(( after_sq - PRE_CRASH_SUM ))"
-    say "  This may indicate:"
-    say "    - Inflight events were not captured (check inflightFile in manifest)"
-    say "    - Inflight events were not replayed (check logs for 'inflight replay')"
-    say "    - Some events were processed after barrier but before crash"
+    say "WARN: Per-key mismatch — after=($after_sq,$after_ls) vs expected=($EXPECTED_AFTER_SQ,$EXPECTED_AFTER_LS)"
+    say "  Details: pre-crash=($PRE_CRASH_SUM,$PRE_CRASH_LASTSEQ) inflightForKey=${INFLIGHT_FOR_KEY:-0}"
+    say "  Check inflight.json for key ${STORE}#${PROD}#${WS} and restore logs"
   fi
 fi
 
@@ -999,19 +1529,28 @@ curl -s "$OPB1_HTTP/status" | sed -n '1,200p' || true
 say "Recovery demo completed."
 
 if [[ "$NO_SHUTDOWN" == "1" ]]; then
-  say "NO_SHUTDOWN=1 set: leaving OpB running (PID1=${OPB_PID}, PID2=${OPB_PID2})."; exit 0
+  say "NO_SHUTDOWN=1 set: leaving OpB running (B1 PID=${OPB_PID}, B2 PID=${OPB2_PID:-N/A}, B3 PID=${OPB3_PID2:-N/A})."; exit 0
 fi
 
 if [[ "$INTERACTIVE" == "1" ]]; then
-  read -r -p "Press Enter to stop OpB and finish demo..." _ || true
+  if ask_continue "Demo complete — stop all OpB processes now?"; then
+    say "Stopping cluster per user confirmation..."
+  else
+    say "User chose to keep OpB running. Exiting without shutdown."
+    exit 0
+  fi
 else
   if [[ "$SLEEP_BEFORE_SHUTDOWN" =~ ^[0-9]+$ ]] && [[ "$SLEEP_BEFORE_SHUTDOWN" -gt 0 ]]; then
     say "Sleeping ${SLEEP_BEFORE_SHUTDOWN}s before shutdown (SLEEP_BEFORE_SHUTDOWN)"; sleep "$SLEEP_BEFORE_SHUTDOWN"
   fi
 fi
 
-say "Stopping OpB (PID=${OPB_PID2})..."; kill "${OPB_PID2}" 2>/dev/null || true
-for i in {1..50}; do if ! kill -0 "${OPB_PID2}" >/dev/null 2>&1; then break; fi; sleep 0.1; done
-say "Stopping OpB (PID=${OPB_PID})..."; kill "${OPB_PID}" 2>/dev/null || true
+if [[ -n "${OPB3_PID2:-}" ]]; then
+  say "Stopping OpB B3 (PID=${OPB3_PID2})..."
+  kill "${OPB3_PID2}" 2>/dev/null || true
+  for i in {1..50}; do if ! kill -0 "${OPB3_PID2}" >/dev/null 2>&1; then break; fi; sleep 0.1; done
+fi
+stop_peer_instance
+say "Stopping OpB B1 (PID=${OPB_PID})..."; kill "${OPB_PID}" 2>/dev/null || true
 for i in {1..50}; do if ! kill -0 "${OPB_PID}" >/dev/null 2>&1; then break; fi; sleep 0.1; done
 say "Done."

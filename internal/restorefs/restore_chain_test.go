@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"hpb/internal/manifest"
 	"hpb/internal/snapshot"
@@ -15,7 +16,9 @@ import (
 func writeManifest(t *testing.T, baseDir, id string, m manifest.Manifest) {
 	t.Helper()
 	dir := filepath.Join(baseDir, id)
-	if err := os.MkdirAll(dir, 0o755); err != nil { t.Fatalf("mkdir: %v", err) }
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), b, 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
@@ -25,7 +28,9 @@ func writeManifest(t *testing.T, baseDir, id string, m manifest.Manifest) {
 func writeFullSnapshotJSON(t *testing.T, baseDir, id string, dump map[string]state.RecordState) {
 	t.Helper()
 	dir := filepath.Join(baseDir, id)
-	if err := os.MkdirAll(dir, 0o755); err != nil { t.Fatalf("mkdir: %v", err) }
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 	b, _ := json.MarshalIndent(dump, "", "  ")
 	if err := os.WriteFile(filepath.Join(dir, "state.json"), b, 0o644); err != nil {
 		t.Fatalf("write full snapshot: %v", err)
@@ -35,7 +40,9 @@ func writeFullSnapshotJSON(t *testing.T, baseDir, id string, dump map[string]sta
 func writeDeltaSnapshotJSON(t *testing.T, baseDir, id string, dump map[string]state.RecordState) {
 	t.Helper()
 	dir := filepath.Join(baseDir, id)
-	if err := os.MkdirAll(dir, 0o755); err != nil { t.Fatalf("mkdir: %v", err) }
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 	b, _ := json.MarshalIndent(dump, "", "  ")
 	if err := os.WriteFile(filepath.Join(dir, "state.delta.json"), b, 0o644); err != nil {
 		t.Fatalf("write delta snapshot: %v", err)
@@ -328,3 +335,70 @@ func TestRestoreChain_ValidateChainFalse(t *testing.T) {
 	}
 }
 
+func TestRestoreChain_PebbleBaseWithDelta(t *testing.T) {
+	snapDir := t.TempDir()
+	baseStateDir := t.TempDir()
+	baseStore, err := state.NewPebbleStore(baseStateDir)
+	if err != nil {
+		t.Fatalf("pebble store: %v", err)
+	}
+	defer baseStore.Close()
+	if _, _, err := baseStore.Apply("k1", 100, 1, 1); err != nil {
+		t.Fatalf("apply k1: %v", err)
+	}
+	if _, _, err := baseStore.Apply("k2", 200, 2, 2); err != nil {
+		t.Fatalf("apply k2: %v", err)
+	}
+	pebSnap := snapshot.NewPebbleSnapshotter(snapDir)
+	res, err := pebSnap.WriteSnapshot("B", baseStore)
+	if err != nil {
+		t.Fatalf("write pebble snapshot: %v", err)
+	}
+	writeManifest(t, snapDir, "B", manifest.Manifest{
+		SnapshotID:           "B",
+		SnapshotType:         manifest.SnapshotTypeFull,
+		SnapshotFormat:       res.Format.String(),
+		PebbleSSTFiles:       append([]string(nil), res.PebbleSSTFiles...),
+		PebbleSSTChecksums:   res.PebbleSSTChecksums,
+		PebbleFormatVersion:  res.PebbleFormatVersion,
+		CreatedAtEpochSecond: time.Now().Unix(),
+	})
+	writeDeltaSnapshotJSON(t, snapDir, "D1", map[string]state.RecordState{
+		"k2": {SumAmount: 500, SumQty: 5, LastSeq: 5},
+		"k3": {SumAmount: 50, SumQty: 1, LastSeq: 1},
+	})
+	writeManifest(t, snapDir, "D1", manifest.Manifest{
+		SnapshotID:       "D1",
+		SnapshotType:     manifest.SnapshotTypeDelta,
+		ParentSnapshotID: "B",
+		BaseSnapshotID:   "B",
+		DeltaSequence:    1,
+		SnapshotFormat:   "json",
+	})
+
+	restoreStateDir := t.TempDir()
+	restoreStore, err := state.NewPebbleStore(restoreStateDir)
+	if err != nil {
+		t.Fatalf("restore pebble store: %v", err)
+	}
+	defer restoreStore.Close()
+	r := NewRestorerWithOptions(restoreStore, nil, manifest.NewFilesystemManifest(snapDir), snapDir, snapshot.FormatJSON, 1)
+	latest := manifest.Manifest{
+		SnapshotID:       "D1",
+		SnapshotType:     manifest.SnapshotTypeDelta,
+		ParentSnapshotID: "B",
+		BaseSnapshotID:   "B",
+	}
+	if err := r.RestoreChainFromLatestWithOptions(latest, RestoreOptions{Parallelism: 0, ValidateChain: true}); err != nil {
+		t.Fatalf("restore chain pebble+delta: %v", err)
+	}
+	if v, ok := restoreStore.Get("k1"); !ok || v.SumAmount != 100 || v.SumQty != 1 {
+		t.Fatalf("k1 mismatch after restore: %+v ok=%v", v, ok)
+	}
+	if v, ok := restoreStore.Get("k2"); !ok || v.SumAmount != 500 || v.SumQty != 5 {
+		t.Fatalf("k2 mismatch after restore: %+v ok=%v", v, ok)
+	}
+	if v, ok := restoreStore.Get("k3"); !ok || v.SumAmount != 50 || v.SumQty != 1 {
+		t.Fatalf("k3 mismatch after restore: %+v ok=%v", v, ok)
+	}
+}

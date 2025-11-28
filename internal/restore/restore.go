@@ -2,6 +2,8 @@ package restore
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -130,6 +132,32 @@ func (r *Restorer) RestoreFromSnapshotWithFormat(snapshotID string, format snaps
 		shards = 1
 	}
 	baseDir := filepath.Join(r.snapshotBaseDir, snapshotID)
+
+	// Pebble-specific restore path is handled via restorePebbleFromManifest when using
+	// RestoreAndReplay, since it has access to manifest metadata (SST files + checksums).
+	// For direct calls, we keep the legacy behavior of delegating to CheckpointCapable
+	// without checksum validation for backward compatibility.
+	if format == snapshot.FormatPebble {
+		if cap, ok := r.stateStore.(state.CheckpointCapable); ok {
+			if err := cap.ImportSSTables(baseDir); err != nil {
+				return fmt.Errorf("restore pebble snapshot: %w", err)
+			}
+			// We don't have precise key stats without scanning; record minimal stats.
+			r.setSnapshotStats(SnapshotStats{
+				Shards:     1,
+				Keys:       0,
+				ReadNs:     0,
+				DecodeNs:   0,
+				LoadNs:     0,
+				Format:     format,
+				SnapshotID: snapshotID,
+			})
+			log.Printf("restore: restored Pebble snapshot %s from %s", snapshotID, baseDir)
+			return nil
+		}
+		// Fallback: if store is not checkpoint-capable, treat as JSON backend.
+		format = snapshot.FormatJSON
+	}
 	if shards <= 1 {
 		path := filepath.Join(baseDir, format.FileName())
 		readStart := time.Now()
@@ -228,6 +256,59 @@ func (r *Restorer) ReplayChangelog(changelogPath string, fromOffset int64) Resto
 // fromOffset here is interpreted as message index (dev simplification).
 // Kafka replay moved to integration build (see restore_kafka.go).
 
+func (r *Restorer) restorePebbleFromManifest(m manifest.Manifest) error {
+	baseDir := filepath.Join(r.snapshotBaseDir, m.SnapshotID)
+	// Validate presence and checksums for all declared SSTables when checksums are available.
+	for _, f := range m.PebbleSSTFiles {
+		full := filepath.Join(baseDir, f)
+		if _, err := os.Stat(full); err != nil {
+			return fmt.Errorf("restore pebble: missing sstable %s: %w", f, err)
+		}
+		if m.PebbleSSTChecksums == nil {
+			continue
+		}
+		want, ok := m.PebbleSSTChecksums[f]
+		if !ok || want == "" {
+			continue
+		}
+		fd, err := os.Open(full)
+		if err != nil {
+			return fmt.Errorf("restore pebble: open sstable %s: %w", f, err)
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, fd); err != nil {
+			fd.Close()
+			return fmt.Errorf("restore pebble: checksum sstable %s: %w", f, err)
+		}
+		if err := fd.Close(); err != nil {
+			return fmt.Errorf("restore pebble: close sstable %s: %w", f, err)
+		}
+		got := hex.EncodeToString(h.Sum(nil))
+		if got != want {
+			return fmt.Errorf("restore pebble: checksum mismatch for %s: have=%s want=%s", f, got, want)
+		}
+	}
+	cap, ok := r.stateStore.(state.CheckpointCapable)
+	if !ok {
+		return fmt.Errorf("restore pebble: state store is not checkpoint-capable")
+	}
+	if err := cap.ImportSSTables(baseDir); err != nil {
+		return fmt.Errorf("restore pebble snapshot: %w", err)
+	}
+	// We don't have precise key stats without scanning; record minimal stats.
+	r.setSnapshotStats(SnapshotStats{
+		Shards:     1,
+		Keys:       0,
+		ReadNs:     0,
+		DecodeNs:   0,
+		LoadNs:     0,
+		Format:     snapshot.FormatPebble,
+		SnapshotID: m.SnapshotID,
+	})
+	log.Printf("restore: restored Pebble snapshot %s from %s (files=%d)", m.SnapshotID, baseDir, len(m.PebbleSSTFiles))
+	return nil
+}
+
 func (r *Restorer) RestoreAndReplay() (RestoreResult, error) {
 	// Read latest manifest
 	m, err := r.manifestReader.ReadLatest()
@@ -244,12 +325,18 @@ func (r *Restorer) RestoreAndReplay() (RestoreResult, error) {
 			log.Printf("restore: unknown snapshot format %s, defaulting to %s", m.SnapshotFormat, format)
 		}
 	}
-	shards := m.SnapshotShards
-	if shards == 0 {
-		shards = r.defaultShards
-	}
-	if err := r.RestoreFromSnapshotWithFormat(m.SnapshotID, format, shards, m.SnapshotKeys); err != nil {
-		return RestoreResult{}, fmt.Errorf("restore snapshot: %w", err)
+	if format == snapshot.FormatPebble {
+		if err := r.restorePebbleFromManifest(m); err != nil {
+			return RestoreResult{}, err
+		}
+	} else {
+		shards := m.SnapshotShards
+		if shards == 0 {
+			shards = r.defaultShards
+		}
+		if err := r.RestoreFromSnapshotWithFormat(m.SnapshotID, format, shards, m.SnapshotKeys); err != nil {
+			return RestoreResult{}, fmt.Errorf("restore snapshot: %w", err)
+		}
 	}
 
 	// By default use file-based replay (callers can invoke Kafka variant directly if needed)

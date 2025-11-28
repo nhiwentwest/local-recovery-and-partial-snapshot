@@ -52,6 +52,46 @@ type Store interface {
 	MarkSnapshotDone(keys ...string)
 }
 
+// CheckpointCapable is implemented by stores that can export/import their on-disk
+// representation (e.g., Pebble SSTables) for fast snapshot shipping. This is
+// optional and only used when snapshot format is set to "pebble".
+type CheckpointCapable interface {
+	// ExportSSTables writes a consistent set of SSTable files representing the
+	// current state into dstDir. It returns the relative file names and a
+	// backend-specific format version for manifest bookkeeping.
+	ExportSSTables(dstDir string) (files []string, formatVersion string, err error)
+	// ImportSSTables replaces the current store contents with the SSTables found
+	// in srcDir. Implementations should ensure atomicity from the caller's POV.
+	ImportSSTables(srcDir string) error
+}
+
+// DeltaCheckpointCapable extends CheckpointCapable with delta SSTable export/ingest.
+// Phase 2: instead of exporting the entire DB, export only dirty keys as a delta SSTable.
+type DeltaCheckpointCapable interface {
+	CheckpointCapable
+	// ExportDeltaSSTables exports only the specified dirty keys as a new SSTable.
+	ExportDeltaSSTables(dstDir string, dirtyKeys []string) (files []string, formatVersion string, err error)
+	// IngestDeltaSSTables ingests delta SSTables into the existing DB without full replacement.
+	IngestDeltaSSTables(srcDir string, files []string) error
+}
+
+// IncrementalCheckpointCapable extends DeltaCheckpointCapable with incremental file-level export.
+// Phase 3: export only new SSTable files created since the last checkpoint.
+type IncrementalCheckpointCapable interface {
+	DeltaCheckpointCapable
+	// ExportIncrementalSSTables exports only new SSTable files since the last checkpoint.
+	// Returns (newFiles, allFiles, formatVersion, error).
+	ExportIncrementalSSTables(dstDir string) (newFiles []string, allFiles []string, formatVersion string, err error)
+	// IngestIncrementalFiles ingests incremental SSTable files into the existing DB.
+	IngestIncrementalFiles(srcDir string, files []string) error
+}
+
+// PartialLoader is implemented by stores that can apply a subset of records
+// without replacing the entire state (used for delta restore).
+type PartialLoader interface {
+	LoadPartial(partial map[string]RecordState)
+}
+
 // InMemoryStore is a simple thread-safe map store.
 type InMemoryStore struct {
 	mu         sync.RWMutex
@@ -94,6 +134,19 @@ func (s *InMemoryStore) LoadAll(all map[string]RecordState) {
 		s.data[k] = v
 	}
 	s.dirty = make(map[string]struct{}) // Reset dirty map after loading
+}
+
+// LoadPartial applies the provided state without clearing the entire store.
+func (s *InMemoryStore) LoadPartial(partial map[string]RecordState) {
+	if len(partial) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, v := range partial {
+		s.data[k] = v
+		delete(s.dirty, k)
+	}
 }
 
 func (s *InMemoryStore) Delete(key string) error {
@@ -195,7 +248,7 @@ func (s *InMemoryStore) MarkSnapshotDone(keys ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(keys) == 0 {
-	s.dirty = make(map[string]struct{}) // Reset dirty map
+		s.dirty = make(map[string]struct{}) // Reset dirty map
 		return
 	}
 	for _, k := range keys {

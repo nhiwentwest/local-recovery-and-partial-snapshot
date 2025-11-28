@@ -15,11 +15,15 @@ import (
 
 // GarbageCollector is responsible for identifying and removing obsolete snapshots.
 // It requires a manifest.Reader to determine the latest snapshot chain.
+// Phase 3: also tracks SSTable file references for incremental snapshots.
 type GarbageCollector struct {
 	baseDir        string
 	retentionCount int
 	retentionDays  int
 	manifestReader manifest.Reader
+	// Phase 3: Track SSTable file references across snapshots.
+	// fileRefs[fileName] = []snapshotID
+	fileRefs map[string][]string
 }
 
 // NewGarbageCollector creates a new GC instance.
@@ -29,6 +33,7 @@ func NewGarbageCollector(baseDir string, retentionCount, retentionDays int, mr m
 		retentionCount: retentionCount,
 		retentionDays:  retentionDays,
 		manifestReader: mr,
+		fileRefs:       make(map[string][]string),
 	}
 }
 
@@ -54,19 +59,74 @@ func (gc *GarbageCollector) Collect() ([]string, error) {
 	// 3. Identify snapshots to delete.
 	toDelete := gc.identifyForDeletion(allSnapshots, protected)
 
+	// Phase 3: Build file reference map before deletion.
+	if err := gc.buildFileRefs(allSnapshots); err != nil {
+		return nil, fmt.Errorf("build file refs: %w", err)
+	}
+
 	// 4. Delete the identified snapshots.
 	var deletedIDs []string
 	for _, m := range toDelete {
 		log.Printf("gc: deleting snapshot %s (created at %s)", m.SnapshotID, time.Unix(m.CreatedAtEpochSecond, 0).UTC())
-		dir := filepath.Join(gc.baseDir, m.SnapshotID)
-		if err := os.RemoveAll(dir); err != nil {
-			log.Printf("gc: error deleting snapshot directory %s: %v", dir, err)
-			continue // Log error but continue with others
+		// Phase 3: Only delete files that are not referenced by other snapshots.
+		if err := gc.deleteSnapshotWithRefCheck(m); err != nil {
+			log.Printf("gc: error deleting snapshot %s: %v", m.SnapshotID, err)
+			continue
 		}
 		deletedIDs = append(deletedIDs, m.SnapshotID)
 	}
 
 	return deletedIDs, nil
+}
+
+// buildFileRefs builds a map of SSTable file references across all snapshots.
+// Phase 3: needed for incremental snapshot GC.
+func (gc *GarbageCollector) buildFileRefs(allSnapshots []manifest.Manifest) error {
+	gc.fileRefs = make(map[string][]string)
+	for _, m := range allSnapshots {
+		if m.SnapshotFormat != "pebble" {
+			continue
+		}
+		for _, f := range m.PebbleSSTFiles {
+			gc.fileRefs[f] = append(gc.fileRefs[f], m.SnapshotID)
+		}
+	}
+	return nil
+}
+
+// deleteSnapshotWithRefCheck deletes a snapshot directory, but only removes
+// SSTable files that are not referenced by other snapshots.
+// Phase 3: reference-counted SSTable deletion.
+func (gc *GarbageCollector) deleteSnapshotWithRefCheck(m manifest.Manifest) error {
+	dir := filepath.Join(gc.baseDir, m.SnapshotID)
+	if m.SnapshotFormat != "pebble" || len(m.PebbleSSTFiles) == 0 {
+		// Non-Pebble snapshot: delete entire directory.
+		return os.RemoveAll(dir)
+	}
+	// Pebble snapshot: check file references before deletion.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("readdir: %w", err)
+	}
+	for _, e := range entries {
+		filePath := filepath.Join(dir, e.Name())
+		// Check if this file is referenced by other snapshots.
+		refs := gc.fileRefs[e.Name()]
+		if len(refs) > 1 {
+			// File is referenced by other snapshots; skip deletion.
+			log.Printf("gc: skipping file %s (referenced by %d snapshots)", e.Name(), len(refs))
+			continue
+		}
+		if err := os.Remove(filePath); err != nil {
+			log.Printf("gc: warning: could not delete file %s: %v", filePath, err)
+		}
+	}
+	// Remove the directory itself (will only succeed if empty or all files deleted).
+	if err := os.Remove(dir); err != nil {
+		// Directory might not be empty if some files were skipped; that's okay.
+		log.Printf("gc: warning: could not remove directory %s: %v", dir, err)
+	}
+	return nil
 }
 
 // buildProtectedSet walks the chain from the latest manifest to find all snapshots that must be kept.
@@ -170,4 +230,3 @@ func (gc *GarbageCollector) identifyForDeletion(all []manifest.Manifest, protect
 
 	return toDelete
 }
-

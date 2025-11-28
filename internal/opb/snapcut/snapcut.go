@@ -68,13 +68,6 @@ func PerformBarrierCut(
 	}
 	id := now().UTC().Format(time.RFC3339)
 	var causal *CausalInfo
-	if causalFn != nil {
-		var cerr error
-		causal, cerr = causalFn(id)
-		if cerr != nil {
-			return zero, zeroRes, fmt.Errorf("causal metadata: %w", cerr)
-		}
-	}
 	view, verr := st.NewSnapshotView()
 	if verr != nil {
 		return zero, zeroRes, fmt.Errorf("snapshot view: %w", verr)
@@ -121,6 +114,14 @@ func PerformBarrierCut(
 		}
 		st.MarkSnapshotDone()
 	}
+	// Write causal inflight AFTER snapshot files are materialized to avoid being overwritten by snapshot export
+	if causalFn != nil {
+		c, cerr := causalFn(id)
+		if cerr != nil {
+			return zero, zeroRes, fmt.Errorf("causal metadata: %w", cerr)
+		}
+		causal = c
+	}
 	m := manifest.Manifest{
 		SnapshotID:           id,
 		SnapshotFormat:       meta.Format.String(),
@@ -133,6 +134,14 @@ func PerformBarrierCut(
 		LastChangelogOffset:  changelogAppendedCount,
 		CreatedAtEpochSecond: now().UTC().Unix(),
 		Changelog:            offInfo,
+	}
+	// Set Pebble-specific fields if format is pebble
+	if meta.Format == snapshot.FormatPebble {
+		m.PebbleSSTFiles = meta.PebbleSSTFiles
+		m.PebbleFormatVersion = meta.PebbleFormatVersion
+		m.PebbleSSTChecksums = meta.PebbleSSTChecksums
+		m.PebbleIncrementalFiles = meta.PebbleIncrementalFiles
+		m.PebbleAllFiles = meta.PebbleSSTFiles // allFiles stored in PebbleSSTFiles
 	}
 	if causal != nil {
 		if len(causal.Channels) > 0 {

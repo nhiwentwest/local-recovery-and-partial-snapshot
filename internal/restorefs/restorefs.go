@@ -149,9 +149,9 @@ func (r *Restorer) RestoreFromSnapshotWithFormatParallel(snapshotID string, form
 	if shards <= 1 {
 		path := filepath.Join(baseDir, format.FileName())
 		readStart := time.Now()
-	data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path)
 		readDur := time.Since(readStart)
-	if err != nil {
+		if err != nil {
 			if os.IsNotExist(err) && format == snapshot.FormatMsgpack {
 				// Fallback to JSON for backward compatibility with old snapshots.
 				format = snapshot.FormatJSON
@@ -160,12 +160,12 @@ func (r *Restorer) RestoreFromSnapshotWithFormatParallel(snapshotID string, form
 				data, err = os.ReadFile(path)
 				readDur = time.Since(readStart)
 			}
-		if os.IsNotExist(err) {
-			log.Printf("restore: snapshot not found at %s, skipping", path)
-			return nil
+			if os.IsNotExist(err) {
+				log.Printf("restore: snapshot not found at %s, skipping", path)
+				return nil
+			}
+			return fmt.Errorf("read snapshot: %w", err)
 		}
-		return fmt.Errorf("read snapshot: %w", err)
-	}
 		decodeStart := time.Now()
 		dump, err := snapshot.DecodeSnapshot(data, format)
 		decodeDur := time.Since(decodeStart)
@@ -173,7 +173,7 @@ func (r *Restorer) RestoreFromSnapshotWithFormatParallel(snapshotID string, form
 			return err
 		}
 		loadStart := time.Now()
-	r.stateStore.LoadAll(dump)
+		r.stateStore.LoadAll(dump)
 		loadDur := time.Since(loadStart)
 		r.setSnapshotStats(SnapshotStats{
 			Shards:     1,
@@ -184,7 +184,7 @@ func (r *Restorer) RestoreFromSnapshotWithFormatParallel(snapshotID string, form
 			Format:     format,
 			SnapshotID: snapshotID,
 		})
-	log.Printf("restore: loaded %d keys from snapshot %s", len(dump), snapshotID)
+		log.Printf("restore: loaded %d keys from snapshot %s", len(dump), snapshotID)
 		return nil
 	}
 	firstShard := filepath.Join(baseDir, format.FileNameForShard(0, shards))
@@ -464,6 +464,22 @@ func (r *Restorer) validateSnapshotFiles(m manifest.Manifest) error {
 	if _, err := os.Stat(filepath.Join(baseDir, "manifest.json")); err != nil {
 		return &ChainValidationError{SnapshotID: m.SnapshotID, Reason: "manifest.json missing", Err: err}
 	}
+	if format == snapshot.FormatPebble {
+		if len(m.PebbleSSTFiles) == 0 {
+			return &ChainValidationError{SnapshotID: m.SnapshotID, Reason: "pebble snapshot missing SST file list"}
+		}
+		missing := []string{}
+		for _, f := range m.PebbleSSTFiles {
+			fp := filepath.Join(baseDir, f)
+			if _, err := os.Stat(fp); err != nil {
+				missing = append(missing, fp)
+			}
+		}
+		if len(missing) > 0 {
+			return &ChainValidationError{SnapshotID: m.SnapshotID, Reason: "pebble SST files missing: " + strings.Join(missing, ", ")}
+		}
+		return nil
+	}
 	isDelta := strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta
 	if !isDelta {
 		// full snapshot files
@@ -560,31 +576,76 @@ func (r *Restorer) readSnapshotToMap(id string, format snapshot.Format, shards i
 		// fall back to single file
 		return r.readSnapshotToMap(id, format, 1, 0)
 	}
-	if parallelism <= 0 { parallelism = shards; if parallelism > 8 { parallelism = 8 } }
+	if parallelism <= 0 {
+		parallelism = shards
+		if parallelism > 8 {
+			parallelism = 8
+		}
+	}
 	jobs := make(chan int, shards)
-	outs := make(chan struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }, shards)
+	outs := make(chan struct {
+		idx           int
+		data          map[string]state.RecordState
+		readNs, decNs int64
+		err           error
+	}, shards)
 	var wg sync.WaitGroup
 	worker := func() {
 		defer wg.Done()
 		for i := range jobs {
 			fp := filepath.Join(baseDir, format.FileNameForShard(i, shards))
-			st := time.Now(); by, err := os.ReadFile(fp); rns := time.Since(st).Nanoseconds()
-			if err != nil { outs <- struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }{idx:i, err:fmt.Errorf("read shard %d: %w", i, err)}; continue }
-			ds := time.Now(); mm, derr := snapshot.DecodeSnapshot(by, format); dns := time.Since(ds).Nanoseconds()
-			if derr != nil { outs <- struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }{idx:i, err:fmt.Errorf("decode shard %d: %w", i, derr)}; continue }
-			outs <- struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }{idx:i, data:mm, readNs:rns, decNs:dns}
+			st := time.Now()
+			by, err := os.ReadFile(fp)
+			rns := time.Since(st).Nanoseconds()
+			if err != nil {
+				outs <- struct {
+					idx           int
+					data          map[string]state.RecordState
+					readNs, decNs int64
+					err           error
+				}{idx: i, err: fmt.Errorf("read shard %d: %w", i, err)}
+				continue
+			}
+			ds := time.Now()
+			mm, derr := snapshot.DecodeSnapshot(by, format)
+			dns := time.Since(ds).Nanoseconds()
+			if derr != nil {
+				outs <- struct {
+					idx           int
+					data          map[string]state.RecordState
+					readNs, decNs int64
+					err           error
+				}{idx: i, err: fmt.Errorf("decode shard %d: %w", i, derr)}
+				continue
+			}
+			outs <- struct {
+				idx           int
+				data          map[string]state.RecordState
+				readNs, decNs int64
+				err           error
+			}{idx: i, data: mm, readNs: rns, decNs: dns}
 		}
 	}
-	for w:=0; w<parallelism; w++ { wg.Add(1); go worker() }
-	for i:=0; i<shards; i++ { jobs <- i }
+	for w := 0; w < parallelism; w++ {
+		wg.Add(1)
+		go worker()
+	}
+	for i := 0; i < shards; i++ {
+		jobs <- i
+	}
 	close(jobs)
-	go func(){ wg.Wait(); close(outs) }()
+	go func() { wg.Wait(); close(outs) }()
 	merged := make(map[string]state.RecordState)
 	var readNs, decNs int64
 	for out := range outs {
-		if out.err != nil { return nil, SnapshotStats{}, out.err }
-		readNs += out.readNs; decNs += out.decNs
-		for k,v := range out.data { merged[k] = v }
+		if out.err != nil {
+			return nil, SnapshotStats{}, out.err
+		}
+		readNs += out.readNs
+		decNs += out.decNs
+		for k, v := range out.data {
+			merged[k] = v
+		}
 	}
 	return merged, SnapshotStats{Shards: shards, Keys: len(merged), ReadNs: readNs, DecodeNs: decNs, Format: format, SnapshotID: id}, nil
 }
@@ -594,50 +655,103 @@ func (r *Restorer) readDeltaToMap(id string, format snapshot.Format, shards int,
 	baseDir := filepath.Join(r.snapshotBaseDir, id)
 	if shards <= 1 {
 		fp := filepath.Join(baseDir, format.FileNameDelta())
-		st := time.Now(); by, err := os.ReadFile(fp); rns := time.Since(st)
-		if err != nil { return nil, SnapshotStats{}, err }
-		ds := time.Now(); mm, derr := snapshot.DecodeSnapshot(by, format); dns := time.Since(ds)
-		if derr != nil { return nil, SnapshotStats{}, derr }
-		return mm, SnapshotStats{Shards:1, Keys:len(mm), ReadNs:rns.Nanoseconds(), DecodeNs:dns.Nanoseconds(), Format:format, SnapshotID:id}, nil
+		st := time.Now()
+		by, err := os.ReadFile(fp)
+		rns := time.Since(st)
+		if err != nil {
+			return nil, SnapshotStats{}, err
+		}
+		ds := time.Now()
+		mm, derr := snapshot.DecodeSnapshot(by, format)
+		dns := time.Since(ds)
+		if derr != nil {
+			return nil, SnapshotStats{}, derr
+		}
+		return mm, SnapshotStats{Shards: 1, Keys: len(mm), ReadNs: rns.Nanoseconds(), DecodeNs: dns.Nanoseconds(), Format: format, SnapshotID: id}, nil
 	}
 	firstShard := filepath.Join(baseDir, format.FileNameDeltaForShard(0, shards))
 	if _, err := os.Stat(firstShard); os.IsNotExist(err) {
 		// fallback: single delta file
 		return r.readDeltaToMap(id, format, 1, 0)
 	}
-	if parallelism <= 0 { parallelism = shards; if parallelism > 8 { parallelism = 8 } }
+	if parallelism <= 0 {
+		parallelism = shards
+		if parallelism > 8 {
+			parallelism = 8
+		}
+	}
 	jobs := make(chan int, shards)
-	outs := make(chan struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }, shards)
+	outs := make(chan struct {
+		idx           int
+		data          map[string]state.RecordState
+		readNs, decNs int64
+		err           error
+	}, shards)
 	var wg sync.WaitGroup
 	worker := func() {
 		defer wg.Done()
 		for i := range jobs {
 			fp := filepath.Join(baseDir, format.FileNameDeltaForShard(i, shards))
-			st := time.Now(); by, err := os.ReadFile(fp); rns := time.Since(st).Nanoseconds()
-			if err != nil { outs <- struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }{idx:i, err:fmt.Errorf("read delta shard %d: %w", i, err)}; continue }
-			ds := time.Now(); mm, derr := snapshot.DecodeSnapshot(by, format); dns := time.Since(ds).Nanoseconds()
-			if derr != nil { outs <- struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }{idx:i, err:fmt.Errorf("decode delta shard %d: %w", i, derr)}; continue }
-			outs <- struct{ idx int; data map[string]state.RecordState; readNs, decNs int64; err error }{idx:i, data:mm, readNs:rns, decNs:dns}
+			st := time.Now()
+			by, err := os.ReadFile(fp)
+			rns := time.Since(st).Nanoseconds()
+			if err != nil {
+				outs <- struct {
+					idx           int
+					data          map[string]state.RecordState
+					readNs, decNs int64
+					err           error
+				}{idx: i, err: fmt.Errorf("read delta shard %d: %w", i, err)}
+				continue
+			}
+			ds := time.Now()
+			mm, derr := snapshot.DecodeSnapshot(by, format)
+			dns := time.Since(ds).Nanoseconds()
+			if derr != nil {
+				outs <- struct {
+					idx           int
+					data          map[string]state.RecordState
+					readNs, decNs int64
+					err           error
+				}{idx: i, err: fmt.Errorf("decode delta shard %d: %w", i, derr)}
+				continue
+			}
+			outs <- struct {
+				idx           int
+				data          map[string]state.RecordState
+				readNs, decNs int64
+				err           error
+			}{idx: i, data: mm, readNs: rns, decNs: dns}
 		}
 	}
-	for w:=0; w<parallelism; w++ { wg.Add(1); go worker() }
-	for i:=0; i<shards; i++ { jobs <- i }
+	for w := 0; w < parallelism; w++ {
+		wg.Add(1)
+		go worker()
+	}
+	for i := 0; i < shards; i++ {
+		jobs <- i
+	}
 	close(jobs)
-	go func(){ wg.Wait(); close(outs) }()
+	go func() { wg.Wait(); close(outs) }()
 	merged := make(map[string]state.RecordState)
 	var readNs, decNs int64
 	for out := range outs {
-		if out.err != nil { return nil, SnapshotStats{}, out.err }
-		readNs += out.readNs; decNs += out.decNs
-		for k,v := range out.data { merged[k] = v }
+		if out.err != nil {
+			return nil, SnapshotStats{}, out.err
+		}
+		readNs += out.readNs
+		decNs += out.decNs
+		for k, v := range out.data {
+			merged[k] = v
+		}
 	}
 	return merged, SnapshotStats{Shards: shards, Keys: len(merged), ReadNs: readNs, DecodeNs: decNs, Format: format, SnapshotID: id}, nil
 }
 
 type RestoreOptions struct {
-	Parallelism     int
+	Parallelism      int
 	SkipMissingDelta bool
-	ValidateChain   bool // default true
+	ValidateChain    bool // default true
 }
 
 // RestoreChainFromLatest loads base full and applies all deltas up to `latest` into memory, then LoadAll.
@@ -701,15 +815,95 @@ func (r *Restorer) RestoreChainFromLatestWithOptions(latest manifest.Manifest, o
 	}
 	// Log chain summary
 	var ids []string
-	for _, m := range ordered { ids = append(ids, m.SnapshotID) }
+	for _, m := range ordered {
+		ids = append(ids, m.SnapshotID)
+	}
 	log.Printf("restore: chain length=%d base=%s deltas=%d ids=%s", len(ordered), base.SnapshotID, len(ordered)-1, strings.Join(ids, ","))
-	// Read base
+	// Pebble checkpoint path: import base and apply deltas directly.
+	if fmtBase == snapshot.FormatPebble {
+		capStore, ok := r.stateStore.(state.CheckpointCapable)
+		if !ok {
+			return fmt.Errorf("state store does not support checkpoint import required for pebble snapshots")
+		}
+		baseDir := filepath.Join(r.snapshotBaseDir, base.SnapshotID)
+		if err := capStore.ImportSSTables(baseDir); err != nil {
+			return fmt.Errorf("import pebble snapshot %s: %w", base.SnapshotID, err)
+		}
+		r.setSnapshotStats(SnapshotStats{Shards: 1, Keys: 0, ReadNs: 0, DecodeNs: 0, LoadNs: 0, Format: snapshot.FormatPebble, SnapshotID: base.SnapshotID})
+		if len(ordered) == 1 {
+			log.Printf("restore: chain applied base=%s (pebble) with no deltas", base.SnapshotID)
+			return nil
+		}
+		pl, ok := r.stateStore.(state.PartialLoader)
+		if !ok {
+			return fmt.Errorf("state store does not support partial load required for applying deltas on pebble base")
+		}
+		for i := 1; i < len(ordered); i++ {
+			d := ordered[i]
+			fmtD := snapshot.FormatJSON
+			if d.SnapshotFormat != "" {
+				if pf, e2 := snapshot.ParseFormat(d.SnapshotFormat); e2 == nil {
+					fmtD = pf
+				}
+			}
+			// Phase 2/3: support Pebble delta SSTable ingestion (incremental or full delta).
+			if fmtD == snapshot.FormatPebble {
+				// Phase 3: if PebbleIncrementalFiles is set, use incremental ingestion.
+				if len(d.PebbleIncrementalFiles) > 0 {
+					incCapable, ok := r.stateStore.(state.IncrementalCheckpointCapable)
+					if !ok {
+						return fmt.Errorf("delta snapshot %s has incremental pebble files but store does not support IncrementalCheckpointCapable", d.SnapshotID)
+					}
+					deltaDir := filepath.Join(r.snapshotBaseDir, d.SnapshotID)
+					if err := incCapable.IngestIncrementalFiles(deltaDir, d.PebbleIncrementalFiles); err != nil {
+						if opts.SkipMissingDelta {
+							log.Printf("restore: warning: skipping pebble incremental delta %s due to ingest error: %v", d.SnapshotID, err)
+							continue
+						}
+						return fmt.Errorf("ingest pebble incremental delta %s: %w", d.SnapshotID, err)
+					}
+					log.Printf("restore: ingested pebble incremental delta %s (new files=%d)", d.SnapshotID, len(d.PebbleIncrementalFiles))
+					continue
+				}
+				// Phase 2: full delta SSTable ingestion.
+				deltaCapable, ok := r.stateStore.(state.DeltaCheckpointCapable)
+				if !ok {
+					return fmt.Errorf("delta snapshot %s has format 'pebble' but store does not support DeltaCheckpointCapable", d.SnapshotID)
+				}
+				deltaDir := filepath.Join(r.snapshotBaseDir, d.SnapshotID)
+				if err := deltaCapable.IngestDeltaSSTables(deltaDir, d.PebbleSSTFiles); err != nil {
+					if opts.SkipMissingDelta {
+						log.Printf("restore: warning: skipping pebble delta %s due to ingest error: %v", d.SnapshotID, err)
+						continue
+					}
+					return fmt.Errorf("ingest pebble delta %s: %w", d.SnapshotID, err)
+				}
+				log.Printf("restore: ingested pebble delta %s (files=%d)", d.SnapshotID, len(d.PebbleSSTFiles))
+				continue
+			}
+			shardsD := d.SnapshotShards
+			if shardsD == 0 {
+				shardsD = r.defaultShards
+			}
+			mm, _, err := r.readDeltaToMap(d.SnapshotID, fmtD, shardsD, opts.Parallelism)
+			if err != nil {
+				if opts.SkipMissingDelta {
+					log.Printf("restore: warning: skipping delta %s due to read error: %v", d.SnapshotID, err)
+					continue
+				}
+				return fmt.Errorf("read delta %s: %w", d.SnapshotID, err)
+			}
+			pl.LoadPartial(mm)
+		}
+		log.Printf("restore: chain applied pebble base=%s deltas=%d", base.SnapshotID, len(ordered)-1)
+		return nil
+	}
+	// Read base into memory (JSON/msgpack path).
 	parallelism := opts.Parallelism
 	merged, _, err := r.readSnapshotToMap(base.SnapshotID, fmtBase, shardsBase, parallelism)
 	if err != nil {
 		return fmt.Errorf("read base snapshot %s: %w", base.SnapshotID, err)
 	}
-	// Apply deltas in order
 	for i := 1; i < len(ordered); i++ {
 		d := ordered[i]
 		fmtD := fmtBase
@@ -740,7 +934,6 @@ func (r *Restorer) RestoreChainFromLatestWithOptions(latest manifest.Manifest, o
 			merged[k] = v
 		}
 	}
-	// Load merged into store
 	start := time.Now()
 	r.stateStore.LoadAll(merged)
 	loadDur := time.Since(start)

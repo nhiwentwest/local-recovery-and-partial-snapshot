@@ -34,6 +34,20 @@ func (w fixedViewWriter) WriteDeltaSnapshotFromView(id string, _ state.SnapshotV
 	return w.snap.WriteDeltaSnapshotFromView(id, w.view, keys)
 }
 
+// pebbleDeltaWriter wraps PebbleSnapshotter to call WriteDeltaSnapshot with dirty keys.
+type pebbleDeltaWriter struct {
+	snap *snapshot.PebbleSnapshotter
+	st   state.Store
+}
+
+func (w pebbleDeltaWriter) WriteSnapshotFromView(id string, _ state.SnapshotView) (snapshot.Result, error) {
+	return w.snap.WriteSnapshot(id, w.st)
+}
+
+func (w pebbleDeltaWriter) WriteDeltaSnapshotFromView(id string, _ state.SnapshotView, keys []string) (snapshot.Result, error) {
+	return w.snap.WriteDeltaSnapshot(id, w.st, keys)
+}
+
 type kafkaOffsetsCollector struct {
 	bootstrap string
 	topic     string
@@ -89,19 +103,29 @@ type snapshotViewWriter interface {
 }
 
 type snapshotWriter struct {
-	snap snapshotViewWriter
+	store       state.Store
+	full        snapshot.Snapshotter
+	fullView    snapshotViewWriter
+	delta       snapshotViewWriter
+	incremental *snapshot.PebbleSnapshotter
 }
 
 func (w snapshotWriter) WriteFull(id string, view state.SnapshotView) (snapshot.Result, error) {
-	if w.snap == nil {
-		return snapshot.Result{}, fmt.Errorf("snapshot writer not initialized")
+	if w.fullView != nil {
+		return w.fullView.WriteSnapshotFromView(id, view)
 	}
-	return w.snap.WriteSnapshotFromView(id, view)
+	if w.full != nil {
+		return w.full.WriteSnapshot(id, w.store)
+	}
+	return snapshot.Result{}, fmt.Errorf("snapshot writer not initialized for full snapshots")
 }
 
 func (w snapshotWriter) WriteDelta(id string, view state.SnapshotView, keys []string) (snapshot.Result, error) {
-	if w.snap == nil {
-		return snapshot.Result{}, fmt.Errorf("snapshot writer not initialized")
+	if w.incremental != nil {
+		return w.incremental.WriteIncrementalSnapshot(id, w.store)
 	}
-	return w.snap.WriteDeltaSnapshotFromView(id, view, keys)
+	if w.delta == nil {
+		return snapshot.Result{}, fmt.Errorf("snapshot writer not initialized for delta snapshots")
+	}
+	return w.delta.WriteDeltaSnapshotFromView(id, view, keys)
 }

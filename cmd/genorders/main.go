@@ -9,22 +9,56 @@ import (
 	"os"
 	"time"
 
+	ck "github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"hpb/internal/opb"
 )
 
 func main() {
-	var count int
-	var outputFile string
-	flag.IntVar(&count, "count", 100, "number of orders to generate")
-	flag.StringVar(&outputFile, "output", "p1.orders.enriched.jsonl", "output file")
+	// Backward-compatible defaults
+	var (
+		mode        string
+		count       int
+		outputFile  string
+		bootstrap   string
+		topic       string
+		stores      int
+		products    int
+		nPerKey     int
+		windowSize  int
+		lingerMs    int
+	)
+
+	flag.StringVar(&mode, "mode", "kafka", "output mode: kafka|file")
+	flag.IntVar(&count, "count", 100, "number of orders to generate (file mode)")
+	flag.StringVar(&outputFile, "output", "p1.orders.enriched.jsonl", "output file (file mode)")
+	flag.StringVar(&bootstrap, "bootstrap", "127.0.0.1:9092", "Kafka bootstrap (kafka mode)")
+	flag.StringVar(&topic, "topic", "p1.orders.enriched", "Kafka topic (kafka mode)")
+	flag.IntVar(&stores, "stores", 200, "number of stores (kafka mode)")
+	flag.IntVar(&products, "products", 1000, "number of products per store (kafka mode)")
+	flag.IntVar(&nPerKey, "n-per-key", 1, "events per (store,product,ws) key (kafka mode)")
+	flag.IntVar(&windowSize, "window-size", 3600, "window size seconds for NormTS (kafka mode)")
+	flag.IntVar(&lingerMs, "linger-ms", 10, "producer linger.ms (kafka mode)")
 	flag.Parse()
 
-	if err := generateOrders(count, outputFile); err != nil {
+	switch mode {
+	case "file":
+		if err := generateFile(count, outputFile); err != nil {
 		log.Fatalf("generation failed: %v", err)
+	}
+		log.Printf("generated %d orders to %s", count, outputFile)
+		return
+	case "kafka":
+		if err := generateKafka(bootstrap, topic, stores, products, nPerKey, windowSize, lingerMs); err != nil {
+			log.Fatalf("kafka publish failed: %v", err)
+		}
+		return
+	default:
+		log.Fatalf("unknown mode: %s (use kafka|file)", mode)
 	}
 }
 
-func generateOrders(count int, outputFile string) error {
+// generateFile keeps legacy behavior: write NDJSON of OrderEnriched values only.
+func generateFile(count int, outputFile string) error {
 	file, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
@@ -42,10 +76,10 @@ func generateOrders(count int, outputFile string) error {
 		order := opb.OrderEnriched{
 			OrderID:   fmt.Sprintf("o%d", i+1),
 			ProductID: products[rand.Intn(len(products))],
-			Price:     int64(1000 + rand.Intn(9000)), // 1000-9999
-			Qty:       int64(1 + rand.Intn(5)),       // 1-5
+			Price:     int64(1000 + rand.Intn(9000)),
+			Qty:       int64(1 + rand.Intn(5)),
 			StoreID:   stores[rand.Intn(len(stores))],
-			TS:        baseTime + int64(i*10), // 10s intervals
+			TS:        baseTime + int64(i*10),
 			Validated: true,
 			NormTS:    baseTime + int64(i*10),
 		}
@@ -53,7 +87,72 @@ func generateOrders(count int, outputFile string) error {
 			return fmt.Errorf("encode order %d: %w", i+1, err)
 		}
 	}
+	return nil
+}
 
-	log.Printf("generated %d orders to %s", count, outputFile)
+// generateKafka publishes high-cardinality OrderEnriched events directly to Kafka.
+func generateKafka(bootstrap, topic string, stores, products, nPerKey, windowSize, lingerMs int) error {
+	if stores <= 0 || products <= 0 || nPerKey <= 0 {
+		return fmt.Errorf("invalid params: stores, products, n-per-key must be > 0")
+	}
+	if windowSize <= 0 {
+		windowSize = 3600
+	}
+	cfg := &ck.ConfigMap{
+		"bootstrap.servers": bootstrap,
+		"linger.ms":        lingerMs,
+		"compression.type": "lz4",
+		"acks":             "1",
+	}
+	p, err := ck.NewProducer(cfg)
+	if err != nil {
+		return fmt.Errorf("producer init: %w", err)
+	}
+	defer p.Close()
+
+	// Delivery reporter (non-blocking)
+	go func() {
+		for e := range p.Events() {
+			switch ev := e.(type) {
+			case *ck.Message:
+				if ev.TopicPartition.Error != nil {
+					log.Printf("deliver error: %v", ev.TopicPartition.Error)
+				}
+			}
+		}
+	}()
+
+	now := time.Now().Unix()
+	ws := (now / int64(windowSize)) * int64(windowSize)
+
+	total := 0
+	start := time.Now()
+	for i := 1; i <= stores; i++ {
+		storeID := fmt.Sprintf("RECOVERY-%04d", i)
+		for j := 1; j <= products; j++ {
+			prodID := fmt.Sprintf("p%04d", j)
+			key := fmt.Sprintf("%s#%s#%d", storeID, prodID, ws)
+			for n := 0; n < nPerKey; n++ {
+				ord := opb.OrderEnriched{
+					OrderID:   fmt.Sprintf("%s-%s-%d-%d", storeID, prodID, ws, n),
+					ProductID: prodID,
+					Price:     10000,
+					Qty:       1,
+					StoreID:   storeID,
+					TS:        ws,
+					Validated: true,
+					NormTS:    ws,
+				}
+				val, _ := json.Marshal(ord)
+				msg := &ck.Message{TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny}, Key: []byte(key), Value: val}
+				if err := p.Produce(msg, nil); err != nil {
+					return fmt.Errorf("produce: %w", err)
+				}
+				total++
+			}
+		}
+	}
+	p.Flush(60_000)
+	log.Printf("published %d events to %s (stores=%d products=%d nPerKey=%d) in %s", total, topic, stores, products, nPerKey, time.Since(start))
 	return nil
 }
