@@ -1479,6 +1479,7 @@ func run(cfg Config) error {
 			sumA, sumQ, _ := zoneIdx.Snapshot(id)
 			fmt.Fprintf(w, "<h4>Store mode (aggregates)</h4>")
 			fmt.Fprintf(w, "<pre>{\n  \"storeId\": \"%s\",\n  \"sumAmount\": %d,\n  \"sumQty\": %d\n}</pre>", id, sumA, sumQ)
+			fmt.Fprintf(w, "<div class='small muted'>Heatmap total for this store equals sumQty=%d in the current window. Zones khác nhau do số keys và product active khác nhau.</div>", sumQ)
 			var totalSumQty, totalSumAmount int64
 			var maxLastSeq int64
 			var lastUpdatedBy string
@@ -1577,6 +1578,14 @@ func run(cfg Config) error {
 						fmt.Fprintf(w, "<tr><td style='padding:4px'>%s</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td><td style='text-align:right;padding:4px'>%d</td></tr>", ps.Product, ps.SumQty, ps.SumAmount, ps.LastSeq)
 					}
 					fmt.Fprintf(w, "</table>")
+					if stat, ok := windowStats[targetWindow]; ok {
+						totalProducts := len(prodMap)
+						avgPerProduct := float64(stat.SumQty)
+						if totalProducts > 0 {
+							avgPerProduct = avgPerProduct / float64(totalProducts)
+						}
+						fmt.Fprintf(w, "<div class='small muted'>Window %d summary: sumQty=%d, sumAmount=%d, keys=%d, uniqueProducts=%d, avgQtyPerProduct=%.2f</div>", targetWindow, stat.SumQty, stat.SumAmount, stat.Keys, totalProducts, avgPerProduct)
+					}
 				}
 			}
 			// Exact if pid+ws provided
