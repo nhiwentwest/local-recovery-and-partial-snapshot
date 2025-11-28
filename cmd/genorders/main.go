@@ -16,16 +16,16 @@ import (
 func main() {
 	// Backward-compatible defaults
 	var (
-		mode        string
-		count       int
-		outputFile  string
-		bootstrap   string
-		topic       string
-		stores      int
-		products    int
-		nPerKey     int
-		windowSize  int
-		lingerMs    int
+		mode       string
+		count      int
+		outputFile string
+		bootstrap  string
+		topic      string
+		stores     int
+		products   int
+		nPerKey    int
+		windowSize int
+		lingerMs   int
 	)
 
 	flag.StringVar(&mode, "mode", "kafka", "output mode: kafka|file")
@@ -43,8 +43,8 @@ func main() {
 	switch mode {
 	case "file":
 		if err := generateFile(count, outputFile); err != nil {
-		log.Fatalf("generation failed: %v", err)
-	}
+			log.Fatalf("generation failed: %v", err)
+		}
 		log.Printf("generated %d orders to %s", count, outputFile)
 		return
 	case "kafka":
@@ -99,10 +99,13 @@ func generateKafka(bootstrap, topic string, stores, products, nPerKey, windowSiz
 		windowSize = 3600
 	}
 	cfg := &ck.ConfigMap{
-		"bootstrap.servers": bootstrap,
-		"linger.ms":        lingerMs,
-		"compression.type": "lz4",
-		"acks":             "1",
+		"bootstrap.servers":            bootstrap,
+		"linger.ms":                    lingerMs,
+		"compression.type":             "lz4",
+		"acks":                         "1",
+		"queue.buffering.max.messages": 500000,
+		"queue.buffering.max.kbytes":   524288, // 512MB
+		"queue.buffering.max.ms":       1000,
 	}
 	p, err := ck.NewProducer(cfg)
 	if err != nil {
@@ -145,14 +148,24 @@ func generateKafka(bootstrap, topic string, stores, products, nPerKey, windowSiz
 				}
 				val, _ := json.Marshal(ord)
 				msg := &ck.Message{TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny}, Key: []byte(key), Value: val}
-				if err := p.Produce(msg, nil); err != nil {
-					return fmt.Errorf("produce: %w", err)
+				for {
+					if err := p.Produce(msg, nil); err != nil {
+						if ke, ok := err.(ck.Error); ok && ke.Code() == ck.ErrQueueFull {
+							log.Printf("producer queue full after %d events, flushing...", total)
+							p.Flush(10_000)
+							continue
+						}
+						return fmt.Errorf("produce: %w", err)
+					}
+					break
 				}
 				total++
 			}
 		}
 	}
-	p.Flush(60_000)
+	if remaining := p.Flush(60_000); remaining > 0 {
+		return fmt.Errorf("producer flush timeout: %d message(s) still pending", remaining)
+	}
 	log.Printf("published %d events to %s (stores=%d products=%d nPerKey=%d) in %s", total, topic, stores, products, nPerKey, time.Since(start))
 	return nil
 }
