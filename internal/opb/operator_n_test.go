@@ -57,4 +57,3 @@ func TestNInputOperator_ThreeInputs_OrderVaried(t *testing.T) {
 		t.Fatalf("state not reset: %v", op.cutID)
 	}
 }
-

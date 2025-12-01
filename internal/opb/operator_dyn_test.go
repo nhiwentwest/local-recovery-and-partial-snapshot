@@ -78,19 +78,25 @@ func TestDynamicNIO_ExpectedAndCompleteInflight(t *testing.T) {
 	}
 	// Validate inflight captured only for expected channels and only the correct items
 	wantKeys := map[string][]string{
-		"t1#0": {},                    // first-marker channel has no inflight
-		"t1#1": {"k-11-a"},           // only before its marker
-		"t2#0": {"k-20-a"},           // only before its marker
+		"t1#0": {},         // first-marker channel has no inflight
+		"t1#1": {"k-11-a"}, // only before its marker
+		"t2#0": {"k-20-a"}, // only before its marker
 	}
 	if len(got) != len(wantKeys) {
 		t.Fatalf("inflight size mismatch: got %d want %d", len(got), len(wantKeys))
 	}
 	for ch, want := range wantKeys {
 		var keys []string
-		for _, ev := range got[ch] { keys = append(keys, ev.Key) }
+		for _, ev := range got[ch] {
+			keys = append(keys, ev.Key)
+		}
 		// Treat nil and empty slices as equal for comparison
-		if keys == nil { keys = []string{} }
-		if want == nil { want = []string{} }
+		if keys == nil {
+			keys = []string{}
+		}
+		if want == nil {
+			want = []string{}
+		}
 		if !reflect.DeepEqual(keys, want) {
 			t.Fatalf("inflight[%s] mismatch: got %v want %v", ch, keys, want)
 		}
@@ -126,4 +132,3 @@ func TestDynamicNIO_ChannelsAddedAfterFirstMarkerIgnored(t *testing.T) {
 		t.Fatalf("expected completion but timed out")
 	}
 }
-

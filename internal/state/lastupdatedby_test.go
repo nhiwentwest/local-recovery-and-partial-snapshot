@@ -9,7 +9,7 @@ import (
 func TestInMemory_LastUpdatedBy(t *testing.T) {
 	s := NewInMemoryStore()
 	s.SetInstanceID("B1")
-	applied, st, err := s.Apply("A#p1#100", 10, 1, 1)
+	applied, st, err := s.Apply("A#p1#100", 10, 1, 1, SourceUnspecified)
 	if err != nil || !applied {
 		t.Fatalf("apply err=%v applied=%v", err, applied)
 	}
@@ -31,7 +31,7 @@ func TestPebble_LastUpdatedBy_NotPersisted(t *testing.T) {
 	}
 	defer p.Close()
 	p.SetInstanceID("X2")
-	applied, st, err := p.Apply("A#p1#100", 10, 1, 1)
+	applied, st, err := p.Apply("A#p1#100", 10, 1, 1, SourceUnspecified)
 	if err != nil || !applied {
 		t.Fatalf("apply err=%v applied=%v", err, applied)
 	}
@@ -48,4 +48,3 @@ func TestPebble_LastUpdatedBy_NotPersisted(t *testing.T) {
 	}
 	_ = os.RemoveAll(dir)
 }
-

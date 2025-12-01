@@ -343,10 +343,10 @@ func TestRestoreChain_PebbleBaseWithDelta(t *testing.T) {
 		t.Fatalf("pebble store: %v", err)
 	}
 	defer baseStore.Close()
-	if _, _, err := baseStore.Apply("k1", 100, 1, 1); err != nil {
+	if _, _, err := baseStore.Apply("k1", 100, 1, 1, state.SourceUnspecified); err != nil {
 		t.Fatalf("apply k1: %v", err)
 	}
-	if _, _, err := baseStore.Apply("k2", 200, 2, 2); err != nil {
+	if _, _, err := baseStore.Apply("k2", 200, 2, 2, state.SourceUnspecified); err != nil {
 		t.Fatalf("apply k2: %v", err)
 	}
 	pebSnap := snapshot.NewPebbleSnapshotter(snapDir)

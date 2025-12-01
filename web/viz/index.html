@@ -53,6 +53,16 @@
       <div id="incremental-files-status" class="prom-status muted"></div>
     </div>
     <div class="prom-card">
+      <div class="prom-title">Last Restore Summary</div>
+      <div id="lrs-ttr" class="metric-line"></div>
+      <div id="lrs-restore" class="metric-line"></div>
+      <div id="lrs-replay" class="metric-line"></div>
+      <div id="lrs-snapshot" class="metric-line"></div>
+      <div id="lrs-inflight" class="metric-line"></div>
+      <div id="lrs-eos" class="metric-line"></div>
+      <div id="lrs-status" class="prom-status muted"></div>
+    </div>
+    <div class="prom-card">
       <div class="prom-title">Exact key compare (pre/post)</div>
       <div class="small muted" style="margin-bottom:6px">Nhập storeId, productId, ws; Load current. Nhấn Mark BEFORE trước khi crash; sau restore, Load lại và Mark AFTER để so.</div>
       <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:6px">

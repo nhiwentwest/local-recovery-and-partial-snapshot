@@ -23,8 +23,8 @@ func TestRestoreAndReplay_PebbleVsJSON(t *testing.T) {
 		t.Fatalf("NewPebbleStore json error: %v", err)
 	}
 	defer stJSON.Close()
-	_, _, _ = stJSON.Apply("S1#p1#100", 1000, 2, 1)
-	_, _, _ = stJSON.Apply("S1#p1#200", 500, 1, 2)
+	_, _, _ = stJSON.Apply("S1#p1#100", 1000, 2, 1, state.SourceUnspecified)
+	_, _, _ = stJSON.Apply("S1#p1#200", 500, 1, 2, state.SourceUnspecified)
 
 	// Snapshot using JSON backend.
 	fsSnap := snapshot.NewFilesystemSnapshotter(snapDir, snapshot.FormatJSON, 1)
@@ -58,8 +58,8 @@ func TestRestoreAndReplay_PebbleVsJSON(t *testing.T) {
 		t.Fatalf("NewPebbleStore pebble error: %v", err)
 	}
 	defer stPebble.Close()
-	_, _, _ = stPebble.Apply("S1#p1#100", 1000, 2, 1)
-	_, _, _ = stPebble.Apply("S1#p1#200", 500, 1, 2)
+	_, _, _ = stPebble.Apply("S1#p1#100", 1000, 2, 1, state.SourceUnspecified)
+	_, _, _ = stPebble.Apply("S1#p1#200", 500, 1, 2, state.SourceUnspecified)
 
 	pebSnap := snapshot.NewPebbleSnapshotter(snapDir)
 	metaPeb, err := pebSnap.WriteSnapshot("sid-pebble", stPebble)
@@ -91,7 +91,6 @@ func TestRestoreAndReplay_PebbleVsJSON(t *testing.T) {
 	_ = changelogDir
 }
 
-
 // TestRestorePebbleFromManifest_HappyPath verifies that restorePebbleFromManifest
 // can successfully import a Pebble checkpoint when SST checksums match.
 func TestRestorePebbleFromManifest_HappyPath(t *testing.T) {
@@ -104,10 +103,10 @@ func TestRestorePebbleFromManifest_HappyPath(t *testing.T) {
 		t.Fatalf("NewPebbleStore(src) error: %v", err)
 	}
 	defer src.Close()
-	if _, _, err := src.Apply("S1#p1#100", 1000, 2, 1); err != nil {
+	if _, _, err := src.Apply("S1#p1#100", 1000, 2, 1, state.SourceUnspecified); err != nil {
 		t.Fatalf("Apply(src) error: %v", err)
 	}
-	if _, _, err := src.Apply("S1#p2#200", 500, 1, 2); err != nil {
+	if _, _, err := src.Apply("S1#p2#200", 500, 1, 2, state.SourceUnspecified); err != nil {
 		t.Fatalf("Apply(src) error: %v", err)
 	}
 
@@ -164,7 +163,7 @@ func TestRestorePebbleFromManifest_ChecksumMismatch(t *testing.T) {
 		t.Fatalf("NewPebbleStore(src) error: %v", err)
 	}
 	defer src.Close()
-	if _, _, err := src.Apply("S1#p1#100", 1000, 2, 1); err != nil {
+	if _, _, err := src.Apply("S1#p1#100", 1000, 2, 1, state.SourceUnspecified); err != nil {
 		t.Fatalf("Apply(src) error: %v", err)
 	}
 
@@ -208,5 +207,3 @@ func TestRestorePebbleFromManifest_ChecksumMismatch(t *testing.T) {
 		t.Fatalf("expected checksum mismatch error, got: %v", err)
 	}
 }
-
-

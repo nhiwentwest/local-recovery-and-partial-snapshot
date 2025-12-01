@@ -15,7 +15,7 @@ func TestPebbleIncrementalExport(t *testing.T) {
 	defer ps.Close()
 
 	// Write initial data and export checkpoint 1.
-	_, _, err = ps.Apply("k1", 100, 1, 1)
+	_, _, err = ps.Apply("k1", 100, 1, 1, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("Apply k1: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestPebbleIncrementalExport(t *testing.T) {
 	t.Logf("snap1: %d files", len(files1))
 
 	// Write more data and export incremental checkpoint 2.
-	_, _, err = ps.Apply("k2", 200, 2, 2)
+	_, _, err = ps.Apply("k2", 200, 2, 2, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("Apply k2: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestPebbleIncrementalExport(t *testing.T) {
 	}
 
 	// Write more data and export incremental checkpoint 3.
-	_, _, err = ps.Apply("k3", 300, 3, 3)
+	_, _, err = ps.Apply("k3", 300, 3, 3, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("Apply k3: %v", err)
 	}
@@ -76,8 +76,8 @@ func TestPebbleIncrementalRestore(t *testing.T) {
 	}
 
 	// Write data and export base checkpoint.
-	_, _, _ = ps1.Apply("k1", 100, 1, 1)
-	_, _, _ = ps1.Apply("k2", 200, 2, 2)
+	_, _, _ = ps1.Apply("k1", 100, 1, 1, SourceUnspecified)
+	_, _, _ = ps1.Apply("k2", 200, 2, 2, SourceUnspecified)
 	baseDir := filepath.Join(dir, "base")
 	_, _, err = ps1.ExportSSTables(baseDir)
 	if err != nil {
@@ -85,7 +85,7 @@ func TestPebbleIncrementalRestore(t *testing.T) {
 	}
 
 	// Write more data and export incremental delta 1.
-	_, _, _ = ps1.Apply("k3", 300, 3, 3)
+	_, _, _ = ps1.Apply("k3", 300, 3, 3, SourceUnspecified)
 	delta1Dir := filepath.Join(dir, "delta1")
 	newFiles1, _, _, err := ps1.ExportIncrementalSSTables(delta1Dir)
 	if err != nil {
@@ -93,7 +93,7 @@ func TestPebbleIncrementalRestore(t *testing.T) {
 	}
 
 	// Write more data and export incremental delta 2.
-	_, _, _ = ps1.Apply("k4", 400, 4, 4)
+	_, _, _ = ps1.Apply("k4", 400, 4, 4, SourceUnspecified)
 	delta2Dir := filepath.Join(dir, "delta2")
 	newFiles2, _, _, err := ps1.ExportIncrementalSSTables(delta2Dir)
 	if err != nil {
@@ -144,7 +144,7 @@ func TestPebbleIncrementalGC(t *testing.T) {
 	defer ps.Close()
 
 	// Export base checkpoint.
-	_, _, _ = ps.Apply("k1", 100, 1, 1)
+	_, _, _ = ps.Apply("k1", 100, 1, 1, SourceUnspecified)
 	baseDir := filepath.Join(dir, "base")
 	baseFiles, _, err := ps.ExportSSTables(baseDir)
 	if err != nil {
@@ -152,7 +152,7 @@ func TestPebbleIncrementalGC(t *testing.T) {
 	}
 
 	// Export incremental delta (shares files with base).
-	_, _, _ = ps.Apply("k2", 200, 2, 2)
+	_, _, _ = ps.Apply("k2", 200, 2, 2, SourceUnspecified)
 	delta1Dir := filepath.Join(dir, "delta1")
 	newFiles1, allFiles1, _, err := ps.ExportIncrementalSSTables(delta1Dir)
 	if err != nil {

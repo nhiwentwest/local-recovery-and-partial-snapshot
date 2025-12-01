@@ -6,12 +6,12 @@ package opb
 // Channels added after the first marker are ignored for that snapshot and will participate in the next one.
 type DynamicNInputOperator struct {
 	// Callbacks
-	Propagate func(m Marker)                                // called on first marker
-	Complete  func(id string, inflight map[string][]Event)  // on completion with in-flight per channel
-	OnBlock   func(ch string)                               // when a channel gets blocked
-	OnUnblock func()                                        // when snapshot completes
-	OnData    func(ch string, ev Event)                     // optional data processing when not blocked
-	Expected  func() []string                               // optional provider of expected channels at first marker
+	Propagate func(m Marker)                               // called on first marker
+	Complete  func(id string, inflight map[string][]Event) // on completion with in-flight per channel
+	OnBlock   func(ch string)                              // when a channel gets blocked
+	OnUnblock func()                                       // when snapshot completes
+	OnData    func(ch string, ev Event)                    // optional data processing when not blocked
+	Expected  func() []string                              // optional provider of expected channels at first marker
 
 	// State
 	channels map[string]*dynCh
@@ -23,10 +23,10 @@ type DynamicNInputOperator struct {
 func (op *DynamicNInputOperator) CurCutID() string { return op.cutID }
 
 type dynCh struct {
-	seen          bool
-	blocked       bool
+	seen           bool
+	blocked        bool
 	recordInflight bool
-	inflight      []Event
+	inflight       []Event
 }
 
 func NewDynamicNInputOperator() *DynamicNInputOperator {
@@ -84,12 +84,18 @@ func (op *DynamicNInputOperator) onMarker(key string, m Marker) {
 			}
 		}
 		ch.seen, ch.blocked = true, true
-		if op.OnBlock != nil { op.OnBlock(key) }
+		if op.OnBlock != nil {
+			op.OnBlock(key)
+		}
 		for k, c := range op.channels {
-			if k == key { continue }
+			if k == key {
+				continue
+			}
 			c.recordInflight = true
 		}
-		if op.Propagate != nil { op.Propagate(m) }
+		if op.Propagate != nil {
+			op.Propagate(m)
+		}
 		return
 	}
 	// subsequent marker must match
@@ -99,7 +105,9 @@ func (op *DynamicNInputOperator) onMarker(key string, m Marker) {
 	if c := op.channels[key]; c != nil {
 		c.seen, c.blocked = true, true
 		c.recordInflight = false
-		if op.OnBlock != nil { op.OnBlock(key) }
+		if op.OnBlock != nil {
+			op.OnBlock(key)
+		}
 	}
 	op.maybeComplete()
 }
@@ -122,8 +130,11 @@ func (op *DynamicNInputOperator) maybeComplete() {
 		copy(buf, c.inflight)
 		res[k] = buf
 	}
-	if op.Complete != nil { op.Complete(op.cutID, res) }
-	if op.OnUnblock != nil { op.OnUnblock() }
+	if op.Complete != nil {
+		op.Complete(op.cutID, res)
+	}
+	if op.OnUnblock != nil {
+		op.OnUnblock()
+	}
 	op.Reset()
 }
-

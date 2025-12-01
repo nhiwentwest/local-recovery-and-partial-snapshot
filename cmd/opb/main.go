@@ -80,6 +80,7 @@ type Config struct {
 	RestoreParallelism      int  // parallelism for snapshot restore (0=auto)
 	RestoreValidateChain    bool // validate chain integrity before restore (default true)
 	RestoreSkipMissingDelta bool // skip missing delta files instead of failing (default false)
+	RestoreTrustManifest    bool // trust manifest freeze hints to skip changelog replay
 	ReplayWorkers           int  // workers for Kafka changelog replay (0=auto)
 	RebalanceImportState    bool // on partition assignment, attempt to import state from a peer (best-effort)
 	// Snapshot compaction policy
@@ -121,6 +122,10 @@ type restorePhaseTimings struct {
 	ChangelogMs      int64 `json:"changelogMs,omitempty"`
 	MetricsMs        int64 `json:"metricsMs,omitempty"`
 	TotalMs          int64 `json:"totalMs,omitempty"`
+}
+
+func manifestAllowsReplaySkip(m manifest.Manifest) bool {
+	return m.ReplayRequired != nil && !*m.ReplayRequired && m.InflightFile != ""
 }
 
 type ingestCommand struct {
@@ -188,6 +193,7 @@ func readFlags() Config {
 	flag.IntVar(&cfg.RestoreParallelism, "restore-parallelism", 0, "parallelism for snapshot restore (0=auto)")
 	flag.BoolVar(&cfg.RestoreValidateChain, "restore-validate-chain", true, "validate chain integrity before restore")
 	flag.BoolVar(&cfg.RestoreSkipMissingDelta, "restore-skip-missing-delta", false, "skip missing delta files instead of failing")
+	flag.BoolVar(&cfg.RestoreTrustManifest, "restore-trust-manifest", false, "trust manifest hint (replayRequired=false) to skip Kafka changelog replay")
 	flag.IntVar(&cfg.ReplayWorkers, "replay-workers", 0, "workers for Kafka changelog replay (0=auto)")
 	flag.BoolVar(&cfg.RebalanceImportState, "rebalance-import-state", false, "on partition assignment, attempt to import state from a peer (best-effort)")
 	flag.IntVar(&cfg.SnapMaxDeltas, "snap-max-deltas", 3, "after this many deltas, force full (<=0 disables)")
@@ -957,6 +963,8 @@ func run(cfg Config) error {
 
 			producerFunc := func() {
 				rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+				// Epoch token shared across this injection batch for fencing / diagnostics.
+				epoch := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
 				var wg sync.WaitGroup
 				for _, job := range jobs {
 					job := job
@@ -964,6 +972,13 @@ func run(cfg Config) error {
 					go func(rr injectJob) {
 						defer wg.Done()
 						defer func() { recover() }()
+						// Simple per-job vector clock: single dimension tied to instance-id to
+						// make causal headers visible in inflight.json and manifests.
+						vc := opb.NewVectorClock()
+						vcID := cfg.InstanceID
+						if vcID == "" {
+							vcID = "injector"
+						}
 						for i := 0; i < rr.N; i++ {
 							store := rr.StoreID
 							prod := rr.ProductID
@@ -1036,8 +1051,15 @@ func run(cfg Config) error {
 							}
 							val, _ := json.Marshal(payload)
 							key := []byte(fmt.Sprintf("%s#%s#%d", store, prod, ws))
-							headers := []ck.Header{{Key: "epoch", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))}}
-							_ = injP.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.TopicEnriched, Partition: ck.PartitionAny}, Key: key, Value: val, Headers: headers}, nil)
+							// Tick vector clock and attach standard t0/t1 + epoch + VC headers.
+							vc = vc.Tick(vcID)
+							headers := opb.BuildHeadersWithEpochAndVC(opb.RealClock{}, nil, epoch, vc)
+							_ = injP.Produce(&ck.Message{
+								TopicPartition: ck.TopicPartition{Topic: &cfg.TopicEnriched, Partition: ck.PartitionAny},
+								Key:            key,
+								Value:          val,
+								Headers:        headers,
+							}, nil)
 						}
 					}(job)
 				}
@@ -1793,7 +1815,10 @@ func run(cfg Config) error {
 				var changelogStart time.Time
 				if cfg.ChangelogSource == "kafka" && cfg.KafkaBootstrap != "" {
 					var skipKafkaReplay bool
-					if m.Changelog != nil && m.Changelog.Topic != "" && len(m.Changelog.Offsets) > 0 {
+					if cfg.RestoreTrustManifest && manifestAllowsReplaySkip(m) {
+						skipKafkaReplay = true
+						log.Printf("restore: freeze hint => skipping changelog replay (manifest replayRequired=false)")
+					} else if m.Changelog != nil && m.Changelog.Topic != "" && len(m.Changelog.Offsets) > 0 {
 						if hasBacklog, err := kafkautil.ChangelogHasBacklog(cfg.KafkaBootstrap, m.Changelog.Topic, m.Changelog.Offsets); err != nil {
 							log.Printf("restore: changelog backlog check error: %v", err)
 						} else if !hasBacklog {
@@ -1857,6 +1882,42 @@ func run(cfg Config) error {
 						if err := writeRestoreMetrics(metricsPath, newMetrics); err != nil {
 							log.Printf("restore history: write error: %v", err)
 						}
+					}
+					// Expose "Last Restore Summary" metrics to Prometheus for viz panels.
+					// Labels: instance, snapshot_id, snapshot_type, format.
+					formatLabel := string(restoreFormat)
+					if formatLabel == "" {
+						formatLabel = m.SnapshotFormat
+					}
+					lbls := []string{cfg.InstanceID, m.SnapshotID, m.SnapshotType, formatLabel}
+					if mreg.LastRestoreTTRSeconds != nil {
+						mreg.LastRestoreTTRSeconds.WithLabelValues(lbls...).Set(float64(newMetrics.TTRMs) / 1000.0)
+					}
+					if mreg.LastRestoreRestoreOnlyMs != nil {
+						mreg.LastRestoreRestoreOnlyMs.WithLabelValues(lbls...).Set(float64(phaseTimings.TotalMs))
+					}
+					if mreg.LastRestoreReplaySeconds != nil {
+						mreg.LastRestoreReplaySeconds.WithLabelValues(lbls...).Set(float64(phaseTimings.ChangelogMs) / 1000.0)
+					}
+					if mreg.LastRestoreReplayEvents != nil {
+						mreg.LastRestoreReplayEvents.WithLabelValues(lbls...).Set(float64(result.Applied + result.Skipped))
+					}
+					if mreg.LastRestoreSnapshotBytes != nil {
+						// For Pebble snapshots we don't have exact bytes at restore time; use 0 as placeholder.
+						mreg.LastRestoreSnapshotBytes.WithLabelValues(lbls...).Set(0)
+					}
+					if mreg.LastRestoreSSTFilesTotal != nil {
+						mreg.LastRestoreSSTFilesTotal.WithLabelValues(lbls...).Set(float64(len(m.PebbleAllFiles)))
+					}
+					if mreg.LastRestoreIncrementalFiles != nil {
+						mreg.LastRestoreIncrementalFiles.WithLabelValues(lbls...).Set(float64(len(m.PebbleIncrementalFiles)))
+					}
+					if mreg.LastRestoreInflightReplayed != nil {
+						mreg.LastRestoreInflightReplayed.WithLabelValues(lbls...).Set(float64(newMetrics.InflightEvents))
+					}
+					if mreg.LastRestoreEOSOK != nil {
+						// Treat a successful restore (no replay error) as EOS OK=1.
+						mreg.LastRestoreEOSOK.WithLabelValues(lbls...).Set(1)
 					}
 					phaseTimings.MetricsMs = time.Since(metricsStart).Milliseconds()
 					phaseTimings.TotalMs = time.Since(restoreTsStart).Milliseconds()
@@ -2482,6 +2543,12 @@ func run(cfg Config) error {
 			}
 			if vc != nil {
 				rec.VC = vc.Copy()
+				// Gộp vector clock của từng event vào snapshot-level vector clock
+				// để manifest.vectorClock phản ánh bound nhân quả của toàn cut.
+				if currentCut.vectorClock == nil {
+					currentCut.vectorClock = opb.NewVectorClock()
+				}
+				currentCut.vectorClock = currentCut.vectorClock.Merge(vc)
 			}
 			currentCut.inflight[ch] = append(currentCut.inflight[ch], rec)
 		}
@@ -2660,6 +2727,11 @@ func run(cfg Config) error {
 							if err != nil {
 								log.Printf("barrier-cut: perform error: %v", err)
 							} else {
+								// Default: Kafka replay required unless another component explicitly flips this.
+								if m.ReplayRequired == nil {
+									replay := true
+									m.ReplayRequired = &replay
+								}
 								durMs := float64(time.Since(t0).Milliseconds())
 								mreg.SnapshotTimeMs.Observe(durMs)
 								var bytes float64

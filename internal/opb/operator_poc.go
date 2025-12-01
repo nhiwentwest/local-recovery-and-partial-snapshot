@@ -25,13 +25,13 @@ type TwoInputOperator struct {
 	Complete  func(id string, inflightFrom1 []Event, inflightFrom2 []Event)
 
 	// internal state
-	cutID                 string
-	seen1, seen2          bool
-	blocked1, blocked2    bool
-	recordInflight1       bool
-	recordInflight2       bool
-	inflightFrom1         []Event
-	inflightFrom2         []Event
+	cutID              string
+	seen1, seen2       bool
+	blocked1, blocked2 bool
+	recordInflight1    bool
+	recordInflight2    bool
+	inflightFrom1      []Event
+	inflightFrom2      []Event
 }
 
 // Reset clears operator state (used after completion).
@@ -128,4 +128,3 @@ func (op *TwoInputOperator) maybeComplete() {
 	// Unblock both channels and reset for next snapshot
 	op.Reset()
 }
-

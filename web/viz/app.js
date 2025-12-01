@@ -252,6 +252,59 @@ async function renderPromPanel(canvasId, statusEl, query, color) {
   }
 }
 
+async function refreshLastRestoreSummary() {
+  const statusEl = document.getElementById('lrs-status');
+  const elTtr = document.getElementById('lrs-ttr');
+  const elRestore = document.getElementById('lrs-restore');
+  const elReplay = document.getElementById('lrs-replay');
+  const elSnap = document.getElementById('lrs-snapshot');
+  const elInfl = document.getElementById('lrs-inflight');
+  const elEOS = document.getElementById('lrs-eos');
+  if (!promUrlInput || !elTtr) return;
+  const base = getPromBase();
+  if (!base) {
+    if (statusEl) { statusEl.textContent = 'Set Prometheus URL'; statusEl.classList.add('err'); }
+    return;
+  }
+  try {
+    const seconds = 7200;
+    const [ttrVals, restoreMsVals, replaySecsVals, replayEvVals, snapBytesVals, sstVals, incVals, inflVals, eosVals] = await Promise.all([
+      queryPromRange('max(opb_last_restore_ttr_seconds)', seconds),
+      queryPromRange('max(opb_last_restore_restore_only_ms)', seconds),
+      queryPromRange('max(opb_last_restore_replay_seconds)', seconds),
+      queryPromRange('max(opb_last_restore_replay_events)', seconds),
+      queryPromRange('max(opb_last_restore_snapshot_bytes)', seconds),
+      queryPromRange('max(opb_last_restore_sst_files_total)', seconds),
+      queryPromRange('max(opb_last_restore_incremental_files)', seconds),
+      queryPromRange('max(opb_last_restore_inflight_replayed)', seconds),
+      queryPromRange('max(opb_last_restore_eos_ok)', seconds)
+    ]);
+    const last = arr => (arr && arr.length ? Number(arr[arr.length-1][1]) : NaN);
+    const ttr = last(ttrVals);
+    const restMs = last(restoreMsVals);
+    const replayS = last(replaySecsVals);
+    const replayEv = last(replayEvVals);
+    const snapB = last(snapBytesVals);
+    const sst = last(sstVals);
+    const inc = last(incVals);
+    const infl = last(inflVals);
+    const eos = last(eosVals);
+    const rate = (replayS > 0) ? (replayEv / replayS) : 0;
+    if (!isNaN(ttr)) elTtr.textContent = `TTR: ${ttr.toFixed(2)}s`;
+    if (!isNaN(restMs)) elRestore.textContent = `Restore: ${Math.round(restMs)} ms`;
+    if (!isNaN(replayS)) elReplay.textContent = `Replay: ${replayS.toFixed(2)} s @ ${rate ? rate.toFixed(1) : '0'} eps (N=${isNaN(replayEv)?'0':Math.round(replayEv)})`;
+    if (!isNaN(snapB) || !isNaN(sst)) {
+      const humanB = isNaN(snapB) ? '?' : (snapB >= 1e9 ? (snapB/1e9).toFixed(2)+' GB' : snapB >= 1e6 ? (snapB/1e6).toFixed(1)+' MB' : Math.round(snapB)+' B');
+      elSnap.textContent = `Snapshot: ${humanB}${isNaN(sst)?'':`, ${Math.round(sst)} SSTs`} ${isNaN(inc)||inc<=0?'':`(Δ files=${Math.round(inc)})`}`;
+    }
+    if (!isNaN(infl)) elInfl.textContent = `Inflight replayed: ${Math.round(infl)}`;
+    if (!isNaN(eos)) elEOS.textContent = `EOS: ${eos >= 0.5 ? 'OK' : 'FAIL'}`;
+    if (statusEl) { statusEl.textContent = 'updated'; statusEl.classList.remove('err'); }
+  } catch (err) {
+    if (statusEl) { statusEl.textContent = `error: ${err.message}`; statusEl.classList.add('err'); }
+  }
+}
+
 function refreshPromPanels(manual = false) {
   if (!promUrlInput) return;
   const base = getPromBase();
@@ -263,7 +316,9 @@ function refreshPromPanels(manual = false) {
 }
 
 refreshPromPanels();
+refreshLastRestoreSummary();
 setInterval(refreshPromPanels, 15000);
+setInterval(refreshLastRestoreSummary, 15000);
 
 async function refreshSnapshotPanels(manual = false) {
   try {

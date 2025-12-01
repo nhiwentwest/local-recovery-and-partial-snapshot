@@ -1,8 +1,6 @@
 package opb
 
-import (
-	"hpb/internal/state"
-)
+import "hpb/internal/state"
 
 // AggregateAndBuildOutput applies the order to state and returns an OutputRecord if applied.
 // seq is derived from state's LastSeq+1 per key (Phase 1 behavior).
@@ -13,7 +11,8 @@ func AggregateAndBuildOutput(st state.Store, windowSizeSec int, ord OrderEnriche
 	nextSeq := prev.LastSeq + 1
 	deltaAmount := ord.Price * ord.Qty
 	deltaQty := ord.Qty
-	applied, newState, err := st.Apply(key, deltaAmount, deltaQty, nextSeq)
+	src := state.SourceKind(ord.Source)
+	applied, newState, err := st.Apply(key, deltaAmount, deltaQty, nextSeq, src)
 	if err != nil {
 		return false, OutputRecord{}, 0, err
 	}

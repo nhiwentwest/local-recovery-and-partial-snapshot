@@ -45,4 +45,3 @@ func TestVectorClockJSON(t *testing.T) {
 		t.Fatalf("roundtrip mismatch: %v vs %v", vc, dec)
 	}
 }
-

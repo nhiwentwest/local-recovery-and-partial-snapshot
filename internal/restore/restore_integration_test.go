@@ -24,10 +24,10 @@ func TestIntegration_RestoreAndReplay_EndToEnd(t *testing.T) {
 	// 1) Prepare initial state and write snapshot
 	prep := state.NewInMemoryStore()
 	// key1: A#p1#100 -> seq=2, amount=200, qty=2
-	_, _, _ = prep.Apply("A#p1#100", 100, 1, 1)
-	_, _, _ = prep.Apply("A#p1#100", 100, 1, 2)
+	_, _, _ = prep.Apply("A#p1#100", 100, 1, 1, state.SourceUnspecified)
+	_, _, _ = prep.Apply("A#p1#100", 100, 1, 2, state.SourceUnspecified)
 	// key2: B#p2#100 -> seq=1, amount=50, qty=1
-	_, _, _ = prep.Apply("B#p2#100", 50, 1, 1)
+	_, _, _ = prep.Apply("B#p2#100", 50, 1, 1, state.SourceUnspecified)
 
 	snap := snapshot.NewFilesystemSnapshotter(base, snapshot.FormatJSON, 1)
 	sid := "sid-int"

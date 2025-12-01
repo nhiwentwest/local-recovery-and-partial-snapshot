@@ -68,6 +68,30 @@ VIEW_WAIT_SEC=${VIEW_WAIT_SEC:-0}              # extra seconds to wait after res
 CHECK_EXACT_RETRIES=${CHECK_EXACT_RETRIES:-30}  # seconds to wait for Exact mode to show up (reduced)
 MANIFEST_OFFSETS_TIMEOUT=${MANIFEST_OFFSETS_TIMEOUT:-180}  # seconds to wait for manifest with offsets (barrier cut)
 PRE_CUT_PRIME=${PRE_CUT_PRIME:-1}  # 1=prime small data before first full cut to ensure polling across partitions
+CAUSAL_FREEZE_MODE=${CAUSAL_FREEZE_MODE:-0}
+FREEZE_LAG_TIMEOUT=${FREEZE_LAG_TIMEOUT:-60}
+FOCUS_INFLIGHT_DEMO=${FOCUS_INFLIGHT_DEMO:-0}
+
+# High-level scenario presets for teaching/demo:
+# - baseline: legacy pause-based recovery with Kafka replay
+# - causal: causal inflight (Beaver-style), may still replay Kafka tail
+# - freeze: causal snapshot freeze (epoch closed), aims for replay_s≈0
+SCENARIO=${SCENARIO:-}
+if [[ -n "$SCENARIO" ]]; then
+  case "$SCENARIO" in
+    baseline)
+      CAUSAL_FREEZE_MODE=0
+      # keep default POST_CUT_EVENTS to show replay tail
+      ;;
+    causal)
+      CAUSAL_FREEZE_MODE=0
+      ;;
+    freeze)
+      CAUSAL_FREEZE_MODE=1
+      POST_CUT_EVENTS=0
+      ;;
+  esac
+fi
 
 wait_manifest_offsets() {
   local dir=${1:-$SNAPSHOT_DIR}
@@ -148,6 +172,55 @@ wait_manifest_inflight() {
   done
   say "WARN: inflightFile not observed within timeout"
   return 1
+}
+
+freeze_epoch_after_cut() {
+  local manifest_file="$SNAPSHOT_DIR/manifest.latest.json"
+  say "Freeze mode: sealing epoch for window ${WS:-unknown} (pausing ingestion, waiting lag=0)"
+  curl -s -X POST "$OPB1_HTTP/admin/ingest/pause" >/dev/null || true
+  local timeout=${FREEZE_LAG_TIMEOUT:-60}
+  local lag=0
+  for ((i=1;i<=timeout;i++)); do
+    lag=$(get_status_field "lagTotal")
+    printf "\r  [freeze %2d/%2d] lag=%s" "$i" "$timeout" "${lag:-unknown}"
+    if [[ "$lag" =~ ^[0-9]+$ ]] && (( lag == 0 )); then
+      break
+    fi
+    sleep 1
+  done
+  printf "\n"
+  if ! [[ "$lag" =~ ^[0-9]+$ ]] || (( lag != 0 )); then
+    say "Freeze mode: WARN lag did not drain to 0 (last value=$lag)"
+  else
+    say "Freeze mode: lag drained to 0; marking manifest replayRequired=false"
+  fi
+  if [[ -f "$manifest_file" ]]; then
+    local tmp
+    tmp=$(mktemp) || true
+    if [[ -n "$tmp" ]] && jq '.replayRequired=false' "$manifest_file" > "$tmp"; then
+      mv "$tmp" "$manifest_file"
+      say "Freeze mode: updated $manifest_file (replayRequired=false)"
+    else
+      say "Freeze mode: WARN unable to update $manifest_file"
+      rm -f "$tmp" 2>/dev/null || true
+    fi
+  else
+    say "Freeze mode: WARN manifest file not found at $manifest_file"
+  fi
+  if [[ -n "${MANIFEST_SNAPSHOT_ID:-}" ]]; then
+    local archived="$SNAPSHOT_DIR/${MANIFEST_SNAPSHOT_ID}/manifest.json"
+    if [[ -f "$archived" ]]; then
+      local tmp2
+      tmp2=$(mktemp) || true
+      if [[ -n "$tmp2" ]] && jq '.replayRequired=false' "$archived" > "$tmp2"; then
+        mv "$tmp2" "$archived"
+        say "Freeze mode: updated archived manifest $archived"
+      else
+        say "Freeze mode: WARN unable to update archived manifest $archived"
+        rm -f "$tmp2" 2>/dev/null || true
+      fi
+    fi
+  fi
 }
 
 # Stable group-id across start & restart (can override via env)
@@ -332,6 +405,18 @@ inject_delta_batch() {
   say "Injected $DELTA_TOTAL_EVENTS events for $STORE plus $extra_total events across ${#DELTA_STORES[@]} extra stores"
 }
 
+# Focused inflight demo: inject a small backlog only for the demo key (STORE, PROD, WS)
+# This increases the chance that inflight.json will contain events exactly for ${STORE}#${PROD}#${WS}.
+inject_demo_key_inflight() {
+  local n=${1:-256}
+  local extra_fields
+  extra_fields=$(build_extra_fields)
+  local payload="[{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${n},\"start\":900000,\"sync\":false${extra_fields}}]"
+  say "FOCUS_INFLIGHT_DEMO=1: injecting focused inflight batch for key ${STORE}#${PROD}#${WS} (n=${n})"
+  RESP=$(post_inject "$payload")
+  if command -v jq >/dev/null 2>&1; then echo "$RESP" | jq .; else echo "$RESP"; fi
+}
+
 inject_post_cut_events() {
   local count=${1:-0}
   local start_ls=${2:-0}
@@ -385,6 +470,11 @@ get_status_field() {
     printf '%s' "$data" | sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" | head -n1
   fi
 }
+
+if [[ "$CAUSAL_FREEZE_MODE" == "1" ]]; then
+  say "Causal Freeze mode enabled: disabling post-cut events and preparing replay-free manifest hints"
+  POST_CUT_EVENTS=0
+fi
 
 wait_heatmap_value() {
   local url=$1; local store=$2; local expected=$3; local timeout=${4:-30}; local i
@@ -988,7 +1078,12 @@ ensure_delete_topic() {
 ensure_delete_topic "p1.opb-changelog"
 
 say "Start OpB (B1) with PebbleDB and snapshot interval=${SNAPSHOT_INTERVAL}s"
-EXTRA_OPB_FLAGS=(--topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog --manifest-sink both --manifest-source kafka --changelog-sink both --changelog-source kafka --injector-linger-ms ${INJECTOR_LINGER_MS:-10})
+if [[ "$CAUSAL_FREEZE_MODE" == "1" ]]; then
+  MANIFEST_SOURCE=${MANIFEST_SOURCE:-file}
+else
+  MANIFEST_SOURCE=${MANIFEST_SOURCE:-kafka}
+fi
+EXTRA_OPB_FLAGS=(--topic-snapshots p1.opb-snapshots --topic-changelog p1.opb-changelog --manifest-sink both --manifest-source ${MANIFEST_SOURCE} --changelog-sink both --changelog-source kafka --injector-linger-ms ${INJECTOR_LINGER_MS:-10})
 if [[ -n "$PEBBLE_PHASE3_FLAG" ]]; then
   EXTRA_OPB_FLAGS+=("$PEBBLE_PHASE3_FLAG")
 fi
@@ -1209,6 +1304,12 @@ say "Step 2: Injecting delta data to create backlog (while paused)"
 inject_delta_batch
 log_causal_status "delta-backlog-built"
 
+if [[ "$FOCUS_INFLIGHT_DEMO" == "1" ]]; then
+  # Inject a small, focused batch for the demo key after main backlog is built,
+  # so that tail inflight will include ${STORE}#${PROD}#${WS}.
+  inject_demo_key_inflight "${FOCUS_INFLIGHT_N:-256}"
+fi
+
 say "Step 3: Triggering delta snapshot to initiate barrier cut (markers appended AFTER backlog)"
 curl -s -X POST "$OPB1_HTTP/admin/snapshot-cut?type=delta" >/dev/null || true
 
@@ -1247,6 +1348,11 @@ expected_total=$(( base_sq + DELTA_TOTAL_EVENTS + POST_CUT_EVENTS ))
 if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
   INFLIGHT_PATH="$SNAPSHOT_DIR/${MANIFEST_SNAPSHOT_ID:-}/$MANIFEST_INFLIGHT_FILE"
   log_snapshot_metrics "delta-snapshot" "$SNAPSHOT_DIR/manifest.latest.json"
+  # Hiển thị snapshot-level vector clock (đa chiều) nếu có
+  if command -v jq >/dev/null 2>&1; then
+    SNAP_VC=$(jq -c '.vectorClock // {}' "$SNAPSHOT_DIR/manifest.latest.json" 2>/dev/null || echo "{}")
+    say "Snapshot vectorClock: $SNAP_VC"
+  fi
   verify_pebble_manifest "$SNAPSHOT_DIR/manifest.latest.json"
   verify_pebble_incremental "$SNAPSHOT_DIR/manifest.latest.json" || true
   if [[ -n "${MANIFEST_SNAPSHOT_ID:-}" ]]; then
@@ -1275,6 +1381,11 @@ if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
       say "✓ Causal snapshot captured: $INFLIGHT_EVENT_COUNT inflight events across $INFLIGHT_CHANNELS channels"
       say "  File: $MANIFEST_INFLIGHT_FILE"
       say "  Inflight for key ${STORE}#${PROD}#${WS}: $INFLIGHT_FOR_KEY events"
+      # In thêm một vài event inflight kèm vector clock để minh hoạ nhân quả đa chiều
+      if command -v jq >/dev/null 2>&1 && [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
+        say "  Sample inflight events with vector clocks (tối đa 5):"
+        jq -r '.events[] | .[] | {key, vectorClock} | @json' "$INFLIGHT_PATH" 2>/dev/null | head -n 5 || true
+      fi
       if [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
         say "  ✓ Channel state successfully captured - causal recovery will replay these events"
       else
@@ -1301,6 +1412,9 @@ if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
     else
       say "  inflight.json not found anywhere under $SNAPSHOT_DIR (will rely on changelog replay if needed)"
     fi
+  fi
+  if [[ "$CAUSAL_FREEZE_MODE" == "1" ]]; then
+    freeze_epoch_after_cut
   fi
 else
   say "WARN: inflightFile not observed in manifest within timeout"
@@ -1355,6 +1469,18 @@ say "Waiting for process $OPB3_PID to fully exit..."
 for i in {1..100}; do if ! kill -0 "$OPB3_PID" >/dev/null 2>&1; then break; fi; sleep 0.1; printf "."; done; echo
 unset OPB3_PID
 
+# Hiển thị phân bố partition ngay sau khi B3 down (trước khi restore)
+say "Cluster assignment immediately after B3 crash (before restore):"
+if command -v jq >/dev/null 2>&1; then
+  curl -s "$OPB1_HTTP/api/cluster" | jq '.' || true
+else
+  curl -s "$OPB1_HTTP/api/cluster" || true
+fi
+if ! ask_continue "B3 đã down và B1/B2 đã nhận lại partition — tiếp tục chạy restore/hotspare cho B3?"; then
+  say "User chose to inspect cluster state and stop before restore."
+  exit 0
+fi
+
 CRASH_STATE_DIR="$STATE_DIR_B3"
 CRASH_CHANGELOG_DIR="$CHANGELOG_DIR_B3"
 CRASH_LOG="$OPB3_LOG"
@@ -1397,7 +1523,7 @@ else
   say "WARN: Could not extract snapshotId from logs"
 fi
 
-say "Restarting B1 in two stages..."
+say "Restarting B3 in two stages..."
 
 say "Stage 1: Restore-only to rebuild state and exit (B3)"
 rm -f "$CRASH_STATE_DIR/LOCK" 2>/dev/null || true # Clean lock before restore
@@ -1408,6 +1534,9 @@ RESTORE_CMD=(
   --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
 )
 RESTORE_CMD+=( "${EXTRA_OPB_FLAGS[@]}" )
+if [[ "$CAUSAL_FREEZE_MODE" == "1" ]]; then
+  RESTORE_CMD+=( --restore-trust-manifest )
+fi
 RESTORE_CMD+=( --window-size "$WINDOW_SIZE" --http :8092 --instance-id "$CRASH_INSTANCE_ID" --restore-on-start --restore-only )
 if ! "${RESTORE_CMD[@]}" >> "$CRASH_LOG" 2>&1; then
   say "ERROR: restore-only failed — last 120 lines:"
@@ -1470,6 +1599,9 @@ RESTART_CMD=(
   --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
 )
 RESTART_CMD+=( "${EXTRA_OPB_FLAGS[@]}" )
+if [[ "$CAUSAL_FREEZE_MODE" == "1" ]]; then
+  RESTART_CMD+=( --restore-trust-manifest )
+fi
 RESTART_CMD+=( --snapshot-interval "$SNAPSHOT_INTERVAL" --window-size "$WINDOW_SIZE" --restore-on-start --http "$CRASH_HTTP_ADDR" --instance-id "$CRASH_INSTANCE_ID" )
 "${RESTART_CMD[@]}" >> "$CRASH_LOG" 2>&1 &
 OPB3_PID2=$!

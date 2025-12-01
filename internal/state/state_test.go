@@ -8,7 +8,7 @@ import (
 func TestApply_SeqRules(t *testing.T) {
 	s := NewInMemoryStore()
 
-	applied, st, err := s.Apply("k", 10, 1, 1)
+	applied, st, err := s.Apply("k", 10, 1, 1, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -20,7 +20,7 @@ func TestApply_SeqRules(t *testing.T) {
 	}
 
 	// Lower or equal seq should not apply (idempotency)
-	applied, st, err = s.Apply("k", 20, 2, 1)
+	applied, st, err = s.Apply("k", 20, 2, 1, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestApply_SeqRules(t *testing.T) {
 	}
 
 	// Gap allowed in Phase 1
-	applied, st, err = s.Apply("k", 30, 3, 3)
+	applied, st, err = s.Apply("k", 30, 3, 3, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -46,9 +46,9 @@ func TestApply_SeqRules(t *testing.T) {
 
 func TestInMemoryStore_Range_LockShortAndReadOnly(t *testing.T) {
 	s := NewInMemoryStore()
-	s.Apply("a1", 10, 1, 1)
-	s.Apply("b2", 20, 2, 2)
-	s.Apply("c3", 30, 3, 3)
+	s.Apply("a1", 10, 1, 1, SourceUnspecified)
+	s.Apply("b2", 20, 2, 2, SourceUnspecified)
+	s.Apply("c3", 30, 3, 3, SourceUnspecified)
 
 	// WARNING: Không bao giờ được gọi Apply từ trong callback Range!
 	// Nếu gọi sẽ deadlock do RWMutex (Lock + RLock không upgrade được).
@@ -58,7 +58,7 @@ func TestInMemoryStore_Range_LockShortAndReadOnly(t *testing.T) {
 	start := time.Now()
 	go func() {
 		t0 := time.Now()
-		s.Apply("d4", 40, 4, 4)
+		s.Apply("d4", 40, 4, 4, SourceUnspecified)
 		took := time.Since(t0)
 		if took > 100*time.Millisecond {
 			t.Errorf("Apply waited lock too long: %v", took)

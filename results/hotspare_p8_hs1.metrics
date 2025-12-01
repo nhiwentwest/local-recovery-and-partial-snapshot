@@ -1,0 +1,2 @@
+config: PREWARM_RESTORE_PARALLELISM=8 HOTSPARE_FAST_SWITCH=1
+hotspare_fast_switch_ms 9306

@@ -12,10 +12,10 @@ import (
 
 // ZoneAgg holds per-store aggregates (transient, for quick API).
 type ZoneAgg struct {
-	SumAmount int64           `json:"sumAmount"`
-	SumQty    int64           `json:"sumQty"`
-	Instances map[string]bool `json:"-"`
-	lastResp  []byte           // cached JSON response bytes (store mode)
+	SumAmount  int64           `json:"sumAmount"`
+	SumQty     int64           `json:"sumQty"`
+	Instances  map[string]bool `json:"-"`
+	lastResp   []byte          // cached JSON response bytes (store mode)
 	lastRespAt int64           // unix seconds of last cache build
 }
 
@@ -123,16 +123,30 @@ func NewZoneDetailsHandler(st state.Store, idx *ZoneIndex, windowSizeSec int, in
 			}
 			key := OutputKey(storeID, productID, ws)
 			if rec, ok := st.Get(key); ok {
+				// Build per-source breakdown for this exact key.
+				sourceBreakdown := map[string]any{}
+				if len(rec.Sources) > 0 {
+					for sk, stats := range rec.Sources {
+						if stats.SumQty == 0 && stats.SumAmount == 0 {
+							continue
+						}
+						sourceBreakdown[string(sk)] = map[string]any{
+							"sumAmount": stats.SumAmount,
+							"sumQty":    stats.SumQty,
+						}
+					}
+				}
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"mode":         "exact",
-					"storeId":      storeID,
-					"productId":    productID,
-					"ws":           ws,
-					"sumAmount":    rec.SumAmount,
-					"sumQty":       rec.SumQty,
-					"lastSeq":      rec.LastSeq,
-					"lastUpdatedBy": rec.LastUpdatedBy,
-					"instance":     instanceID,
+					"mode":            "exact",
+					"storeId":         storeID,
+					"productId":       productID,
+					"ws":              ws,
+					"sumAmount":       rec.SumAmount,
+					"sumQty":          rec.SumQty,
+					"lastSeq":         rec.LastSeq,
+					"lastUpdatedBy":   rec.LastUpdatedBy,
+					"instance":        instanceID,
+					"sourceBreakdown": sourceBreakdown,
 				})
 				return
 			}
@@ -143,6 +157,7 @@ func NewZoneDetailsHandler(st state.Store, idx *ZoneIndex, windowSizeSec int, in
 		// Store mode: aggregate from state store (like heatmap total) to include old data
 		// This ensures consistency with heatmap total mode
 		var totalSumQty, totalSumAmount int64
+		sourceTotals := make(map[state.SourceKind]state.SourceStats)
 		var maxLastSeq int64
 		var lastUpdatedBy string
 		_ = st.Range(func(key string, rs state.RecordState) error {
@@ -154,18 +169,40 @@ func NewZoneDetailsHandler(st state.Store, idx *ZoneIndex, windowSizeSec int, in
 					maxLastSeq = rs.LastSeq
 					lastUpdatedBy = rs.LastUpdatedBy
 				}
+				if len(rs.Sources) > 0 {
+					for sk, stats := range rs.Sources {
+						if stats.SumQty == 0 && stats.SumAmount == 0 {
+							continue
+						}
+						cur := sourceTotals[sk]
+						cur.SumAmount += stats.SumAmount
+						cur.SumQty += stats.SumQty
+						sourceTotals[sk] = cur
+					}
+				}
 			}
 			return nil
 		})
+		// Convert sourceTotals to a JSON-friendly map keyed by string.
+		sourceBreakdown := map[string]any{}
+		for sk, stats := range sourceTotals {
+			if stats.SumQty == 0 && stats.SumAmount == 0 {
+				continue
+			}
+			sourceBreakdown[string(sk)] = map[string]any{
+				"sumAmount": stats.SumAmount,
+				"sumQty":    stats.SumQty,
+			}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"mode":         "store-total",
-			"storeId":     storeID,
-			"sumAmount":   totalSumAmount,
-			"sumQty":      totalSumQty,
-			"lastSeq":     maxLastSeq,
-			"lastUpdatedBy": lastUpdatedBy,
-			"instance":    instanceID,
+			"mode":            "store-total",
+			"storeId":         storeID,
+			"sumAmount":       totalSumAmount,
+			"sumQty":          totalSumQty,
+			"lastSeq":         maxLastSeq,
+			"lastUpdatedBy":   lastUpdatedBy,
+			"instance":        instanceID,
+			"sourceBreakdown": sourceBreakdown,
 		})
 	})
 }
-

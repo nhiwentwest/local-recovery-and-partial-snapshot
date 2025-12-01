@@ -14,7 +14,7 @@ func TestAggregate_IdempotentSameSeq(t *testing.T) {
 	}
 	// Re-apply logically same next event but force same seq by poking store
 	// AggregateAndBuildOutput increments based on stored LastSeq, so we simulate duplicate by calling Apply directly.
-	applied2, st2, err := st.Apply(OutputKey(ord.StoreID, ord.ProductID, WindowStart(ord.NormTS, 300)), ord.Price*ord.Qty, ord.Qty, 1)
+	applied2, st2, err := st.Apply(OutputKey(ord.StoreID, ord.ProductID, WindowStart(ord.NormTS, 300)), ord.Price*ord.Qty, ord.Qty, 1, state.SourceUnspecified)
 	if err != nil {
 		t.Fatalf("apply duplicate seq err: %v", err)
 	}

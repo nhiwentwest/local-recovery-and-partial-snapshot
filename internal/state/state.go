@@ -5,12 +5,33 @@ import (
 	"sync"
 )
 
+// SourceKind is a lightweight, storage-level representation of the logical
+// source that produced a given delta (baseline, delta, post-cut, seed, ...).
+// It is intentionally a string to keep JSON representations backwards compatible.
+type SourceKind string
+
+const (
+	SourceUnspecified SourceKind = ""
+	SourceBaseline    SourceKind = "baseline"
+	SourceDelta       SourceKind = "delta"
+	SourcePostCut     SourceKind = "postCut"
+	SourceSeed        SourceKind = "seed"
+)
+
+// SourceStats accumulates per-source contributions to a RecordState.
+type SourceStats struct {
+	SumAmount int64 `json:"sumAmount,omitempty"`
+	SumQty    int64 `json:"sumQty,omitempty"`
+}
+
 // RecordState represents aggregated state per key.
 type RecordState struct {
 	SumAmount     int64
 	SumQty        int64
 	LastSeq       int64
 	LastUpdatedBy string `json:"-"`
+	// Sources holds per-source contributions; omitted for legacy records.
+	Sources map[SourceKind]SourceStats `json:"sources,omitempty"`
 }
 
 // Delta is a batched state change for a single key.
@@ -19,6 +40,7 @@ type Delta struct {
 	DeltaAmount int64
 	DeltaQty    int64
 	Seq         int64
+	Source      SourceKind
 }
 
 // SnapshotView is a read-only, point-in-time view over the store.
@@ -34,7 +56,7 @@ type SnapshotView interface {
 // Store abstracts the state backend.
 // Note: For Phase 1, only InMemoryStore is implemented.
 type Store interface {
-	Apply(key string, deltaAmount int64, deltaQty int64, seq int64) (applied bool, newState RecordState, err error)
+	Apply(key string, deltaAmount int64, deltaQty int64, seq int64, src SourceKind) (applied bool, newState RecordState, err error)
 	// ApplyBatch applies a batch of deltas atomically from the perspective of external readers.
 	// Implementations may choose their own internal locking/transaction semantics.
 	// The method should process deltas in-order and return counts of applied vs skipped (by seq).
@@ -159,7 +181,7 @@ func (s *InMemoryStore) Delete(key string) error {
 	return nil
 }
 
-func (s *InMemoryStore) Apply(key string, deltaAmount int64, deltaQty int64, seq int64) (bool, RecordState, error) {
+func (s *InMemoryStore) Apply(key string, deltaAmount int64, deltaQty int64, seq int64, src SourceKind) (bool, RecordState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.data[key]
@@ -173,6 +195,15 @@ func (s *InMemoryStore) Apply(key string, deltaAmount int64, deltaQty int64, seq
 	st.SumQty += deltaQty
 	st.LastSeq = seq
 	st.LastUpdatedBy = s.instanceID
+	if src != SourceUnspecified {
+		if st.Sources == nil {
+			st.Sources = make(map[SourceKind]SourceStats)
+		}
+		ss := st.Sources[src]
+		ss.SumAmount += deltaAmount
+		ss.SumQty += deltaQty
+		st.Sources[src] = ss
+	}
 	s.data[key] = st
 	s.dirty[key] = struct{}{}
 	return true, st, nil
@@ -196,6 +227,15 @@ func (s *InMemoryStore) ApplyBatch(batch []Delta) (int, int, error) {
 		st.SumQty += d.DeltaQty
 		st.LastSeq = d.Seq
 		st.LastUpdatedBy = s.instanceID
+		if d.Source != SourceUnspecified {
+			if st.Sources == nil {
+				st.Sources = make(map[SourceKind]SourceStats)
+			}
+			ss := st.Sources[d.Source]
+			ss.SumAmount += d.DeltaAmount
+			ss.SumQty += d.DeltaQty
+			st.Sources[d.Source] = ss
+		}
 		s.data[d.Key] = st
 		s.dirty[d.Key] = struct{}{}
 		applied++

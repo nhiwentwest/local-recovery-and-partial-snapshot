@@ -16,16 +16,17 @@ import (
 func main() {
 	// Backward-compatible defaults
 	var (
-		mode       string
-		count      int
-		outputFile string
-		bootstrap  string
-		topic      string
-		stores     int
-		products   int
-		nPerKey    int
-		windowSize int
-		lingerMs   int
+		mode        string
+		count       int
+		outputFile  string
+		bootstrap   string
+		topic       string
+		stores      int
+		products    int
+		nPerKey     int
+		windowSize  int
+		lingerMs    int
+		sourceLabel string
 	)
 
 	flag.StringVar(&mode, "mode", "kafka", "output mode: kafka|file")
@@ -38,17 +39,35 @@ func main() {
 	flag.IntVar(&nPerKey, "n-per-key", 1, "events per (store,product,ws) key (kafka mode)")
 	flag.IntVar(&windowSize, "window-size", 3600, "window size seconds for NormTS (kafka mode)")
 	flag.IntVar(&lingerMs, "linger-ms", 10, "producer linger.ms (kafka mode)")
+	flag.StringVar(&sourceLabel, "source", "", "logical source label: baseline|delta|postCut|seed (optional)")
 	flag.Parse()
+
+	var src opb.OrderSource
+	switch sourceLabel {
+	case "":
+		src = opb.SourceUnspecified
+	case string(opb.SourceBaseline):
+		src = opb.SourceBaseline
+	case string(opb.SourceDelta):
+		src = opb.SourceDelta
+	case string(opb.SourcePostCut):
+		src = opb.SourcePostCut
+	case string(opb.SourceSeed):
+		src = opb.SourceSeed
+	default:
+		log.Printf("unknown -source=%q, defaulting to unspecified", sourceLabel)
+		src = opb.SourceUnspecified
+	}
 
 	switch mode {
 	case "file":
-		if err := generateFile(count, outputFile); err != nil {
+		if err := generateFile(count, outputFile, src); err != nil {
 			log.Fatalf("generation failed: %v", err)
 		}
 		log.Printf("generated %d orders to %s", count, outputFile)
 		return
 	case "kafka":
-		if err := generateKafka(bootstrap, topic, stores, products, nPerKey, windowSize, lingerMs); err != nil {
+		if err := generateKafka(bootstrap, topic, stores, products, nPerKey, windowSize, lingerMs, src); err != nil {
 			log.Fatalf("kafka publish failed: %v", err)
 		}
 		return
@@ -58,7 +77,7 @@ func main() {
 }
 
 // generateFile keeps legacy behavior: write NDJSON of OrderEnriched values only.
-func generateFile(count int, outputFile string) error {
+func generateFile(count int, outputFile string, src opb.OrderSource) error {
 	file, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
@@ -82,6 +101,7 @@ func generateFile(count int, outputFile string) error {
 			TS:        baseTime + int64(i*10),
 			Validated: true,
 			NormTS:    baseTime + int64(i*10),
+			Source:    src,
 		}
 		if err := enc.Encode(&order); err != nil {
 			return fmt.Errorf("encode order %d: %w", i+1, err)
@@ -91,7 +111,7 @@ func generateFile(count int, outputFile string) error {
 }
 
 // generateKafka publishes high-cardinality OrderEnriched events directly to Kafka.
-func generateKafka(bootstrap, topic string, stores, products, nPerKey, windowSize, lingerMs int) error {
+func generateKafka(bootstrap, topic string, stores, products, nPerKey, windowSize, lingerMs int, src opb.OrderSource) error {
 	if stores <= 0 || products <= 0 || nPerKey <= 0 {
 		return fmt.Errorf("invalid params: stores, products, n-per-key must be > 0")
 	}
@@ -127,6 +147,13 @@ func generateKafka(bootstrap, topic string, stores, products, nPerKey, windowSiz
 
 	now := time.Now().Unix()
 	ws := (now / int64(windowSize)) * int64(windowSize)
+	// Shared epoch token for this generator run; downstream epoch fencing will treat
+	// all these events as belonging to the same logical epoch.
+	epoch := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+	// Simple single-dimension vector clock for demo purposes. Multiple generators
+	// or upstream operators will naturally produce multi-dimensional clocks.
+	vc := opb.NewVectorClock()
+	vcID := "genorders"
 
 	total := 0
 	start := time.Now()
@@ -145,9 +172,19 @@ func generateKafka(bootstrap, topic string, stores, products, nPerKey, windowSiz
 					TS:        ws,
 					Validated: true,
 					NormTS:    ws,
+					Source:    src,
 				}
 				val, _ := json.Marshal(ord)
-				msg := &ck.Message{TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny}, Key: []byte(key), Value: val}
+				// Tick vector clock and attach epoch + VC headers so downstream OpB
+				// can reconstruct causal order in inflight.json and manifests.
+				vc = vc.Tick(vcID)
+				headers := opb.BuildHeadersWithEpochAndVC(opb.RealClock{}, nil, epoch, vc)
+				msg := &ck.Message{
+					TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny},
+					Key:            []byte(key),
+					Value:          val,
+					Headers:        headers,
+				}
 				for {
 					if err := p.Produce(msg, nil); err != nil {
 						if ke, ok := err.(ck.Error); ok && ke.Code() == ck.ErrQueueFull {

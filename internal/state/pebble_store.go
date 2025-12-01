@@ -97,7 +97,7 @@ func decodePebbleState(val []byte) (RecordState, error) {
 	return st, nil
 }
 
-func (p *PebbleStore) Apply(key string, deltaAmount int64, deltaQty int64, seq int64) (bool, RecordState, error) {
+func (p *PebbleStore) Apply(key string, deltaAmount int64, deltaQty int64, seq int64, src SourceKind) (bool, RecordState, error) {
 	k := []byte(key)
 	// Read current
 	var cur RecordState
@@ -121,6 +121,15 @@ func (p *PebbleStore) Apply(key string, deltaAmount int64, deltaQty int64, seq i
 	cur.LastSeq = seq
 	// Set transient field for the returned state (not persisted)
 	cur.LastUpdatedBy = p.instanceID
+	if src != SourceUnspecified {
+		if cur.Sources == nil {
+			cur.Sources = make(map[SourceKind]SourceStats)
+		}
+		ss := cur.Sources[src]
+		ss.SumAmount += deltaAmount
+		ss.SumQty += deltaQty
+		cur.Sources[src] = ss
+	}
 	bytes, err := encodePebbleState(cur)
 	if err != nil {
 		return false, RecordState{}, err
@@ -175,6 +184,15 @@ func (p *PebbleStore) ApplyBatch(batch []Delta) (int, int, error) {
 			cur.SumQty += d.DeltaQty
 			cur.LastSeq = d.Seq
 			cur.LastUpdatedBy = p.instanceID // transient
+			if d.Source != SourceUnspecified {
+				if cur.Sources == nil {
+					cur.Sources = make(map[SourceKind]SourceStats)
+				}
+				ss := cur.Sources[d.Source]
+				ss.SumAmount += d.DeltaAmount
+				ss.SumQty += d.DeltaQty
+				cur.Sources[d.Source] = ss
+			}
 			applied++
 			anyApplied = true
 		}

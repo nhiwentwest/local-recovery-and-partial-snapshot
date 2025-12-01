@@ -42,6 +42,17 @@ type Registry struct {
 	// Per-store live aggregates (for zone viz)
 	StoreSumQty    *prometheus.GaugeVec
 	StoreSumAmount *prometheus.GaugeVec
+
+	// Last-restore Prometheus gauges (labeled): instance, snapshot_id, snapshot_type, format
+	LastRestoreTTRSeconds       *prometheus.GaugeVec
+	LastRestoreRestoreOnlyMs    *prometheus.GaugeVec
+	LastRestoreReplaySeconds    *prometheus.GaugeVec
+	LastRestoreReplayEvents     *prometheus.GaugeVec
+	LastRestoreSnapshotBytes    *prometheus.GaugeVec
+	LastRestoreSSTFilesTotal    *prometheus.GaugeVec
+	LastRestoreIncrementalFiles *prometheus.GaugeVec
+	LastRestoreInflightReplayed *prometheus.GaugeVec
+	LastRestoreEOSOK            *prometheus.GaugeVec
 }
 
 func NewRegistry() *Registry {
@@ -85,7 +96,20 @@ func NewRegistry() *Registry {
 	storeSumQty := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_store_sum_qty"}, []string{"storeId"})
 	storeSumAmount := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_store_sum_amount"}, []string{"storeId"})
 
-	r.MustRegister(applied, skipped, ttr, replayBytes, replayRecords, lag, lastAge, snapTime, snapBytes, snapIncrBytes, snapIncrFiles, txProduced, txAborted, txLatency, txBatchDur, offsetsBoundLag, changelogAppended, partLag, evApplied, evSkipDedup, evSkipSeq, causalInflight, causalReplay, storeSumQty, storeSumAmount)
+	// Last restore labeled gauges
+	labels := []string{"instance", "snapshot_id", "snapshot_type", "format"}
+	lastTTR := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_ttr_seconds"}, labels)
+	lastRestoreOnly := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_restore_only_ms"}, labels)
+	lastReplaySecs := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_replay_seconds"}, labels)
+	lastReplayEvents := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_replay_events"}, labels)
+	lastSnapBytes := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_snapshot_bytes"}, labels)
+	lastSstTotal := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_sst_files_total"}, labels)
+	lastIncFiles := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_incremental_files"}, labels)
+	lastInflight := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_inflight_replayed"}, labels)
+	lastEOS := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "opb_last_restore_eos_ok"}, labels)
+
+	r.MustRegister(applied, skipped, ttr, replayBytes, replayRecords, lag, lastAge, snapTime, snapBytes, snapIncrBytes, snapIncrFiles, txProduced, txAborted, txLatency, txBatchDur, offsetsBoundLag, changelogAppended, partLag, evApplied, evSkipDedup, evSkipSeq, causalInflight, causalReplay, storeSumQty, storeSumAmount,
+		lastTTR, lastRestoreOnly, lastReplaySecs, lastReplayEvents, lastSnapBytes, lastSstTotal, lastIncFiles, lastInflight, lastEOS)
 	return &Registry{
 		reg:                      r,
 		Applied:                  applied,
@@ -113,6 +137,16 @@ func NewRegistry() *Registry {
 		CausalReplay:             causalReplay,
 		StoreSumQty:              storeSumQty,
 		StoreSumAmount:           storeSumAmount,
+
+		LastRestoreTTRSeconds:       lastTTR,
+		LastRestoreRestoreOnlyMs:    lastRestoreOnly,
+		LastRestoreReplaySeconds:    lastReplaySecs,
+		LastRestoreReplayEvents:     lastReplayEvents,
+		LastRestoreSnapshotBytes:    lastSnapBytes,
+		LastRestoreSSTFilesTotal:    lastSstTotal,
+		LastRestoreIncrementalFiles: lastIncFiles,
+		LastRestoreInflightReplayed: lastInflight,
+		LastRestoreEOSOK:            lastEOS,
 	}
 }
 

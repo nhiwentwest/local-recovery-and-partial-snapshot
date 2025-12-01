@@ -1,0 +1,62 @@
+{
+  "snapshotId": "2025-12-01T06:40:05Z",
+  "snapshotFormat": "pebble",
+  "snapshotShards": 1,
+  "snapshotType": "delta",
+  "baseSnapshotId": "2025-12-01T06:39:54Z",
+  "parentSnapshotId": "2025-12-01T06:39:54Z",
+  "deltaSequence": 1,
+  "lastChangelogOffset": 23620,
+  "createdAt": 1764571214,
+  "changelog": {
+    "topic": "p1.opb-changelog",
+    "partitions": 4,
+    "offsets": [
+      0,
+      23644,
+      0,
+      0
+    ]
+  },
+  "channels": [
+    "p1.orders.enriched#0",
+    "p1.orders.enriched#1",
+    "p1.orders.enriched#2",
+    "p1.orders.enriched#3"
+  ],
+  "inflightFile": "inflight.json",
+  "inflightEvents": 10808,
+  "pebbleSstFiles": [
+    "000008.log",
+    "000009.sst",
+    "CURRENT",
+    "MANIFEST-000001",
+    "OPTIONS-000003",
+    "marker.format-version.000001.001"
+  ],
+  "pebbleFormatVersion": "pebble-incremental",
+  "pebbleSstChecksums": {
+    "000008.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "000009.sst": "360f4c3c46bb2adae973e54c8009c63b51eb27020bcd60cc60fa7f9214bf039b",
+    "CURRENT": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+    "MANIFEST-000001": "8bdc9c7f6cf74a35c9688fb271aee28a84ff8da0e8c7dcf98b1f1b575a48a4a3",
+    "OPTIONS-000003": "99b98ebb510bc8bca9130e89009e3bb4ec5a253344835428738ad9b7d8e23162",
+    "marker.format-version.000001.001": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "pebbleIncrementalFiles": [
+    "000008.log",
+    "000009.sst",
+    "CURRENT",
+    "MANIFEST-000001",
+    "OPTIONS-000003",
+    "marker.format-version.000001.001"
+  ],
+  "pebbleAllFiles": [
+    "000008.log",
+    "000009.sst",
+    "CURRENT",
+    "MANIFEST-000001",
+    "OPTIONS-000003",
+    "marker.format-version.000001.001"
+  ]
+}

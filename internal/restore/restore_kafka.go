@@ -93,7 +93,7 @@ func (r *Restorer) ReplayChangelogKafka(brokers []string, topic string, fromOffs
 		if err := json.Unmarshal(m.Value, &d); err != nil {
 			return RestoreResult{Applied: applied, Skipped: skipped, Error: fmt.Errorf("unmarshal delta: %w", err)}
 		}
-		ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq)
+		ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq, state.SourceUnspecified)
 		if err != nil {
 			return RestoreResult{Applied: applied, Skipped: skipped, Error: fmt.Errorf("apply: %w", err)}
 		}

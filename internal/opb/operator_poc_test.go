@@ -85,4 +85,3 @@ func TestTwoInputOperator_MarkerOrder_In2First(t *testing.T) {
 		t.Fatalf("unexpected inflight1: %v", inflight1)
 	}
 }
-

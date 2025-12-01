@@ -17,11 +17,11 @@ func TestPebbleCheckpointRoundTrip(t *testing.T) {
 	}
 	defer st.Close()
 
-	_, _, err = st.Apply("A#p1#100", 1000, 2, 1)
+	_, _, err = st.Apply("A#p1#100", 1000, 2, 1, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
-	_, _, err = st.Apply("B#p1#100", 500, 1, 1)
+	_, _, err = st.Apply("B#p1#100", 500, 1, 1, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -68,5 +68,3 @@ func TestPebbleCheckpointRoundTrip(t *testing.T) {
 		t.Fatalf("snapshot dir missing after export: %v", err)
 	}
 }
-
-

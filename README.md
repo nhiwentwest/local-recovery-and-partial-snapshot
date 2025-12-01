@@ -39,6 +39,23 @@ Prerequisites
 Build
 - make build
 
+- Chạy nhanh demo **Local Recovery & Causal Freeze** trước tiên
+  - Khởi động Prometheus dùng cấu hình có sẵn trong repo:
+    ```bash
+    cd hpb
+    prometheus --config.file=./prometheus.yml --web.listen-address=:9090
+    ```
+  - Sau đó chạy demo recovery (script sẽ tự build `opb`, reset topics, khởi động cụm B1/B2/B3 và thực hiện crash+restore):
+    ```bash
+    cd hpb
+    AUTO_Y=1 INTERACTIVE=0 SCENARIO=freeze CAUSAL_FREEZE_MODE=1 ./scripts/demo_recovery.sh
+    ```
+  - Mở giao diện viz và panel Prometheus:
+    - Web: `http://127.0.0.1:8089/viz/` (heatmap, cluster, causal cut,…)
+    - Trong viz, ở ô **Prometheus URL**, nhập `http://127.0.0.1:9090` và nhấn Enter để kích hoạt các panel:
+      - *Causal inflight (last 5m)* — đọc `sum(opb_causal_inflight)`
+      - *Last Restore Summary* — đọc `opb_last_restore_*` từ lần restore gần nhất
+
 Chạy tối thiểu hạ tầng + pipeline
 - scripts/run_infra.sh (khởi động broker, Prom, Grafana, web viz nếu có trong repo)
 - scripts/run_opa.sh (OpA — chuẩn hoá, Exactly‑Once)

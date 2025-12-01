@@ -38,4 +38,3 @@ func (s *StoreTouchIndex) Instances(storeID string) []string {
 	s.mu.RUnlock()
 	return out
 }
-

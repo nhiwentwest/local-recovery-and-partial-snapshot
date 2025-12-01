@@ -12,7 +12,7 @@ func TestPebbleStore_ApplySeqRulesAndGet(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	applied, s, err := st.Apply("k", 10, 1, 1)
+	applied, s, err := st.Apply("k", 10, 1, 1, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("apply err: %v", err)
 	}
@@ -21,7 +21,7 @@ func TestPebbleStore_ApplySeqRulesAndGet(t *testing.T) {
 	}
 
 	// same seq => idempotent skip
-	applied, s, err = st.Apply("k", 20, 2, 1)
+	applied, s, err = st.Apply("k", 20, 2, 1, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("apply err: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestPebbleStore_ApplySeqRulesAndGet(t *testing.T) {
 	}
 
 	// gap allowed: seq=3
-	applied, s, err = st.Apply("k", 30, 3, 3)
+	applied, s, err = st.Apply("k", 30, 3, 3, SourceUnspecified)
 	if err != nil {
 		t.Fatalf("apply err: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestPebbleStore_ApplySeqRulesAndGet(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing key")
 	}
-	if got != s {
+	if got.SumAmount != s.SumAmount || got.SumQty != s.SumQty || got.LastSeq != s.LastSeq {
 		t.Fatalf("get mismatch: %v vs %v", got, s)
 	}
 }

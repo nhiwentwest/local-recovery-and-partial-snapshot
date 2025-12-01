@@ -316,7 +316,7 @@ func (r *Restorer) parseAndApplyLine(line []byte) (bool, bool, error) {
 	if err := json.Unmarshal(line, &d); err != nil {
 		return false, false, fmt.Errorf("unmarshal delta: %w", err)
 	}
-	ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq)
+	ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq, state.SourceUnspecified)
 	if err != nil {
 		return false, false, fmt.Errorf("apply: %w", err)
 	}

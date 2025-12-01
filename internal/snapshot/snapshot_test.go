@@ -11,8 +11,8 @@ import (
 func TestWriteSnapshot_WritesStateJSON(t *testing.T) {
 	dir := t.TempDir()
 	s := state.NewInMemoryStore()
-	_, _, _ = s.Apply("A#p1#100", 1500, 3, 1)
-	_, _, _ = s.Apply("A#p2#100", 700, 2, 1)
+	_, _, _ = s.Apply("A#p1#100", 1500, 3, 1, state.SourceUnspecified)
+	_, _, _ = s.Apply("A#p2#100", 700, 2, 1, state.SourceUnspecified)
 
 	snap := NewFilesystemSnapshotter(dir, FormatJSON, 1)
 	meta, err := snap.WriteSnapshot("sid", s)
@@ -40,7 +40,7 @@ func TestWriteSnapshot_WritesStateJSON(t *testing.T) {
 func TestWriteSnapshot_WritesStateMsgpack(t *testing.T) {
 	dir := t.TempDir()
 	s := state.NewInMemoryStore()
-	_, _, _ = s.Apply("B#p1#200", 2100, 5, 1)
+	_, _, _ = s.Apply("B#p1#200", 2100, 5, 1, state.SourceUnspecified)
 
 	snap := NewFilesystemSnapshotter(dir, FormatMsgpack, 1)
 	meta, err := snap.WriteSnapshot("sid", s)

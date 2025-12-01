@@ -29,6 +29,7 @@ type Manifest struct {
 	InflightFile         string            `json:"inflightFile,omitempty"`
 	InflightEvents       int               `json:"inflightEvents,omitempty"`
 	SnapshotVectorClock  map[string]uint64 `json:"vectorClock,omitempty"`
+	ReplayRequired       *bool             `json:"replayRequired,omitempty"`
 
 	// Pebble-specific fields (experimental SSTable shipping backend).
 	// When SnapshotFormat == "pebble", these describe the exported SSTables for the snapshot.

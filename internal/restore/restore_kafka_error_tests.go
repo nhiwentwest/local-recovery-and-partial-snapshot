@@ -41,11 +41,11 @@ func (f *fakeReaderSeq) Close() error { return nil }
 
 type errStore struct{ state.Store }
 
-func (e *errStore) Apply(key string, da, dq, seq int64) (bool, state.RecordState, error) {
+func (e *errStore) Apply(key string, da, dq, seq int64, _ state.SourceKind) (bool, state.RecordState, error) {
 	if seq > 1 {
 		return false, state.RecordState{}, errors.New("apply failed")
 	}
-	return e.Store.Apply(key, da, dq, seq)
+	return e.Store.Apply(key, da, dq, seq, state.SourceUnspecified)
 }
 
 func TestReplayChangelogKafkaWith_JSONError(t *testing.T) {

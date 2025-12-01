@@ -1,0 +1,2 @@
+mode,partitions,post_cut_events,ttr_s,restore_ms,replay_s,replay_events,inflight,snapshot_bytes,sst_files,inc_files,snapshot_id
+peer_migration,12,5000,0.382,327,0.055,300,2500,242138,9,6,2025-11-30T10:55:09Z

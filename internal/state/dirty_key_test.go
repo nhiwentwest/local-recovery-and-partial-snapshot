@@ -10,7 +10,7 @@ import (
 
 func testDirtyKeyTracking(t *testing.T, s Store) {
 	// 1. Apply single key, check if dirty
-	_, _, _ = s.Apply("k1", 10, 1, 1)
+	_, _, _ = s.Apply("k1", 10, 1, 1, SourceUnspecified)
 	dirty1 := s.GetDirtyKeys()
 	if len(dirty1) != 1 || dirty1[0] != "k1" {
 		t.Fatalf("after Apply, expected [k1], got %v", dirty1)
@@ -45,7 +45,7 @@ func testDirtyKeyTracking(t *testing.T, s Store) {
 	}
 
 	// 5. LoadAll should reset dirty keys
-	_, _, _ = s.Apply("k-before-load", 1, 1, 1)
+	_, _, _ = s.Apply("k-before-load", 1, 1, 1, SourceUnspecified)
 	s.LoadAll(map[string]RecordState{"new-k1": {SumAmount: 1}})
 	dirty5 := s.GetDirtyKeys()
 	if len(dirty5) != 0 {
@@ -79,8 +79,8 @@ func TestPebbleStore_DirtyKeyTracking(t *testing.T) {
 func testPartialDirtyReset(t *testing.T, s Store) {
 	// Seed two dirty keys
 	s.MarkSnapshotDone()
-	_, _, _ = s.Apply("k2", 1, 1, 1)
-	_, _, _ = s.Apply("k3", 1, 1, 1)
+	_, _, _ = s.Apply("k2", 1, 1, 1, SourceUnspecified)
+	_, _, _ = s.Apply("k3", 1, 1, 1, SourceUnspecified)
 	// Verify both present
 	dk := s.GetDirtyKeys()
 	sort.Strings(dk)

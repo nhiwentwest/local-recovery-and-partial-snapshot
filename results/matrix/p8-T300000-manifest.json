@@ -1,0 +1,55 @@
+{
+  "snapshotId": "2025-11-30T19:15:01Z",
+  "snapshotFormat": "pebble",
+  "snapshotShards": 1,
+  "snapshotType": "full",
+  "lastChangelogOffset": 17114,
+  "createdAt": 1764530101,
+  "changelog": {
+    "topic": "p1.opb-changelog",
+    "partitions": 4,
+    "offsets": [
+      2,
+      0,
+      16745,
+      387
+    ]
+  },
+  "channels": [
+    "p1.orders.enriched#0",
+    "p1.orders.enriched#1",
+    "p1.orders.enriched#2",
+    "p1.orders.enriched#3",
+    "p1.orders.enriched#4",
+    "p1.orders.enriched#5",
+    "p1.orders.enriched#6",
+    "p1.orders.enriched#7"
+  ],
+  "inflightFile": "inflight.json",
+  "inflightEvents": 3293,
+  "pebbleSstFiles": [
+    "000008.log",
+    "000009.sst",
+    "CURRENT",
+    "MANIFEST-000001",
+    "OPTIONS-000003",
+    "marker.format-version.000001.001"
+  ],
+  "pebbleFormatVersion": "pebble-unknown",
+  "pebbleSstChecksums": {
+    "000008.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "000009.sst": "af75e9477f4140d4ddca20a03cca50082a52469944412c69d860fe1e01e0874e",
+    "CURRENT": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+    "MANIFEST-000001": "5a36118f0c2eab73b6dff6eba122c375eacc02f7c90b6c109dc00f9e1f603b15",
+    "OPTIONS-000003": "99b98ebb510bc8bca9130e89009e3bb4ec5a253344835428738ad9b7d8e23162",
+    "marker.format-version.000001.001": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "pebbleAllFiles": [
+    "000008.log",
+    "000009.sst",
+    "CURRENT",
+    "MANIFEST-000001",
+    "OPTIONS-000003",
+    "marker.format-version.000001.001"
+  ]
+}

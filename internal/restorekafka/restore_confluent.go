@@ -120,7 +120,7 @@ loop:
 				res.Skipped++
 				continue
 			}
-			ok, _, aerr := st.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq)
+			ok, _, aerr := st.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq, state.SourceUnspecified)
 			if aerr != nil {
 				log.Printf("restore changelog: apply error at %s[%d] off=%d: %v", topic, msg.TopicPartition.Partition, msg.TopicPartition.Offset, aerr)
 				res.Skipped++

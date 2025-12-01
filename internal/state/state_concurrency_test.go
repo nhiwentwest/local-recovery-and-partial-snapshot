@@ -17,7 +17,7 @@ func TestInMemoryStore_ConcurrentAppliesDifferentKeys(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 1; i <= iters; i++ {
-				_, _, err := s.Apply(k, 1, 1, int64(i))
+				_, _, err := s.Apply(k, 1, 1, int64(i), SourceUnspecified)
 				if err != nil {
 					t.Errorf("apply err: %v", err)
 					return

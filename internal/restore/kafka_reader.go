@@ -57,7 +57,7 @@ func (r *Restorer) ReplayChangelogKafkaWith(reader KafkaMessageReader, fromOffse
 		if err := json.Unmarshal(m.Value, &d); err != nil {
 			return RestoreResult{Applied: applied, Skipped: skipped, Error: err}
 		}
-		ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq)
+		ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq, state.SourceUnspecified)
 		if err != nil {
 			return RestoreResult{Applied: applied, Skipped: skipped, Error: err}
 		}

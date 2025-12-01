@@ -261,7 +261,13 @@ func drainPartitionWithHigh(parent context.Context, rd *kafka.Reader, partition 
 			*skipped++
 			continue
 		}
-		batch = append(batch, state.Delta{Key: d.Key, DeltaAmount: d.Delta, DeltaQty: d.DeltaQty, Seq: d.Seq})
+		batch = append(batch, state.Delta{
+			Key:         d.Key,
+			DeltaAmount: d.Delta,
+			DeltaQty:    d.DeltaQty,
+			Seq:         d.Seq,
+			Source:      state.SourceUnspecified,
+		})
 		*bytes += int64(len(m.Value))
 		if m.Offset > *lastOffset {
 			*lastOffset = m.Offset
@@ -333,7 +339,13 @@ func drainPartition(parent context.Context, rd *kafka.Reader, partition int, fro
 			*skipped++
 			continue
 		}
-		batch = append(batch, state.Delta{Key: d.Key, DeltaAmount: d.Delta, DeltaQty: d.DeltaQty, Seq: d.Seq})
+		batch = append(batch, state.Delta{
+			Key:         d.Key,
+			DeltaAmount: d.Delta,
+			DeltaQty:    d.DeltaQty,
+			Seq:         d.Seq,
+			Source:      state.SourceUnspecified,
+		})
 		*bytes += int64(len(m.Value))
 		if m.Offset > *lastOffset {
 			*lastOffset = m.Offset

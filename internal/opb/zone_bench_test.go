@@ -19,7 +19,9 @@ func BenchmarkZoneDetailsHandler_Store(b *testing.B) {
 		r := httptest.NewRequest("GET", "/api/zone-details?id=A", nil)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
-		if w.Code != 200 { b.Fatalf("status %d", w.Code) }
+		if w.Code != 200 {
+			b.Fatalf("status %d", w.Code)
+		}
 	}
 }
 
@@ -35,7 +37,8 @@ func BenchmarkZoneDetailsHandler_Exact(b *testing.B) {
 		r := httptest.NewRequest("GET", "/api/zone-details?id=A&productId=p1&ws=100", nil)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
-		if w.Code != 200 { b.Fatalf("status %d", w.Code) }
+		if w.Code != 200 {
+			b.Fatalf("status %d", w.Code)
+		}
 	}
 }
-

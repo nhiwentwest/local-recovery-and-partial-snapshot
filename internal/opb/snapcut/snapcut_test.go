@@ -67,8 +67,8 @@ func (p *capturePublisher) Publish(m manifest.Manifest) error { p.last = m; retu
 func TestPerformBarrierCut_Full(t *testing.T) {
 	st := state.NewInMemoryStore()
 	// seed some state and dirty keys
-	_, _, _ = st.Apply("k1", 10, 1, 1)
-	_, _, _ = st.Apply("k2", 20, 2, 1)
+	_, _, _ = st.Apply("k1", 10, 1, 1, state.SourceUnspecified)
+	_, _, _ = st.Apply("k2", 20, 2, 1, state.SourceUnspecified)
 	// fakes
 	coll := fakeCollector{out: &manifest.OffsetsInfo{Topic: "chg", Partitions: 1, Offsets: []int64{10}}}
 	w := &fakeWriter{fullRes: snapshot.Result{Format: snapshot.FormatJSON, Shards: 1, Keys: 2}}
@@ -101,8 +101,8 @@ func TestPerformBarrierCut_Delta(t *testing.T) {
 	st := state.NewInMemoryStore()
 	// mark two dirty keys
 	st.MarkSnapshotDone()
-	_, _, _ = st.Apply("ka", 10, 1, 1)
-	_, _, _ = st.Apply("kb", 20, 2, 1)
+	_, _, _ = st.Apply("ka", 10, 1, 1, state.SourceUnspecified)
+	_, _, _ = st.Apply("kb", 20, 2, 1, state.SourceUnspecified)
 	prev := &manifest.Manifest{SnapshotID: "full-1", SnapshotType: manifest.SnapshotTypeFull, Changelog: &manifest.OffsetsInfo{Topic: "chg", Partitions: 1, Offsets: []int64{100}}}
 	coll := fakeCollector{out: &manifest.OffsetsInfo{Topic: "chg", Partitions: 1, Offsets: []int64{200}}}
 	scan := fakeScanner{keys: []string{"ka"}}

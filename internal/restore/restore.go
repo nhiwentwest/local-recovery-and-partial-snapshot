@@ -161,9 +161,9 @@ func (r *Restorer) RestoreFromSnapshotWithFormat(snapshotID string, format snaps
 	if shards <= 1 {
 		path := filepath.Join(baseDir, format.FileName())
 		readStart := time.Now()
-	data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path)
 		readDur := time.Since(readStart)
-	if err != nil {
+		if err != nil {
 			if os.IsNotExist(err) && format == snapshot.FormatMsgpack {
 				format = snapshot.FormatJSON
 				path = filepath.Join(baseDir, format.FileName())
@@ -171,12 +171,12 @@ func (r *Restorer) RestoreFromSnapshotWithFormat(snapshotID string, format snaps
 				data, err = os.ReadFile(path)
 				readDur = time.Since(readStart)
 			}
-		if os.IsNotExist(err) {
-			log.Printf("restore: snapshot not found at %s, skipping", path)
-			return nil
+			if os.IsNotExist(err) {
+				log.Printf("restore: snapshot not found at %s, skipping", path)
+				return nil
+			}
+			return fmt.Errorf("read snapshot: %w", err)
 		}
-		return fmt.Errorf("read snapshot: %w", err)
-	}
 		decodeStart := time.Now()
 		dump, err := snapshot.DecodeSnapshot(data, format)
 		decodeDur := time.Since(decodeStart)
@@ -184,7 +184,7 @@ func (r *Restorer) RestoreFromSnapshotWithFormat(snapshotID string, format snaps
 			return err
 		}
 		loadStart := time.Now()
-	r.stateStore.LoadAll(dump)
+		r.stateStore.LoadAll(dump)
 		loadDur := time.Since(loadStart)
 		r.setSnapshotStats(SnapshotStats{
 			Shards:     1,
@@ -195,7 +195,7 @@ func (r *Restorer) RestoreFromSnapshotWithFormat(snapshotID string, format snaps
 			Format:     format,
 			SnapshotID: snapshotID,
 		})
-	log.Printf("restore: loaded %d keys from snapshot %s", len(dump), snapshotID)
+		log.Printf("restore: loaded %d keys from snapshot %s", len(dump), snapshotID)
 		return nil
 	}
 	firstShard := filepath.Join(baseDir, format.FileNameForShard(0, shards))
@@ -351,7 +351,7 @@ func (r *Restorer) parseAndApplyLine(line []byte) (bool, bool, error) {
 	if err := json.Unmarshal(line, &d); err != nil {
 		return false, false, fmt.Errorf("unmarshal delta: %w", err)
 	}
-	ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq)
+	ok, _, err := r.stateStore.Apply(d.Key, d.Delta, d.DeltaQty, d.Seq, state.SourceUnspecified)
 	if err != nil {
 		return false, false, fmt.Errorf("apply: %w", err)
 	}

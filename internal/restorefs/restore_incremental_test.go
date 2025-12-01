@@ -24,8 +24,8 @@ func TestRestoreChain_PebbleBaseWithIncrementalDeltas(t *testing.T) {
 	defer ps.Close()
 
 	// Create base snapshot (full Pebble checkpoint).
-	_, _, _ = ps.Apply("k1", 100, 1, 1)
-	_, _, _ = ps.Apply("k2", 200, 2, 2)
+	_, _, _ = ps.Apply("k1", 100, 1, 1, state.SourceUnspecified)
+	_, _, _ = ps.Apply("k2", 200, 2, 2, state.SourceUnspecified)
 	baseSnapDir := filepath.Join(snapshotsDir, "B")
 	baseFiles, baseVer, err := ps.ExportSSTables(baseSnapDir)
 	if err != nil {
@@ -41,7 +41,7 @@ func TestRestoreChain_PebbleBaseWithIncrementalDeltas(t *testing.T) {
 	writeManifest(t, snapshotsDir, "B", baseManifest)
 
 	// Create incremental delta 1.
-	_, _, _ = ps.Apply("k3", 300, 3, 3)
+	_, _, _ = ps.Apply("k3", 300, 3, 3, state.SourceUnspecified)
 	d1SnapDir := filepath.Join(snapshotsDir, "D1")
 	newFiles1, allFiles1, d1Ver, err := ps.ExportIncrementalSSTables(d1SnapDir)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestRestoreChain_PebbleBaseWithIncrementalDeltas(t *testing.T) {
 	writeManifest(t, snapshotsDir, "D1", d1Manifest)
 
 	// Create incremental delta 2.
-	_, _, _ = ps.Apply("k4", 400, 4, 4)
+	_, _, _ = ps.Apply("k4", 400, 4, 4, state.SourceUnspecified)
 	d2SnapDir := filepath.Join(snapshotsDir, "D2")
 	newFiles2, allFiles2, d2Ver, err := ps.ExportIncrementalSSTables(d2SnapDir)
 	if err != nil {
@@ -122,7 +122,7 @@ func TestRestoreChain_MixedIncrementalAndFullDelta(t *testing.T) {
 	defer ps.Close()
 
 	// Base snapshot.
-	_, _, _ = ps.Apply("k1", 100, 1, 1)
+	_, _, _ = ps.Apply("k1", 100, 1, 1, state.SourceUnspecified)
 	baseSnapDir := filepath.Join(snapshotsDir, "B")
 	baseFiles, baseVer, err := ps.ExportSSTables(baseSnapDir)
 	if err != nil {
@@ -138,7 +138,7 @@ func TestRestoreChain_MixedIncrementalAndFullDelta(t *testing.T) {
 	writeManifest(t, snapshotsDir, "B", baseManifest)
 
 	// Incremental delta 1.
-	_, _, _ = ps.Apply("k2", 200, 2, 2)
+	_, _, _ = ps.Apply("k2", 200, 2, 2, state.SourceUnspecified)
 	d1SnapDir := filepath.Join(snapshotsDir, "D1")
 	newFiles1, allFiles1, d1Ver, err := ps.ExportIncrementalSSTables(d1SnapDir)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestRestoreChain_MixedIncrementalAndFullDelta(t *testing.T) {
 	writeManifest(t, snapshotsDir, "D1", d1Manifest)
 
 	// JSON delta 2 (fallback to JSON for testing mixed chain).
-	_, _, _ = ps.Apply("k3", 300, 3, 3)
+	_, _, _ = ps.Apply("k3", 300, 3, 3, state.SourceUnspecified)
 	d2SnapDir := filepath.Join(snapshotsDir, "D2")
 	if err := os.MkdirAll(d2SnapDir, 0o755); err != nil {
 		t.Fatalf("mkdir D2: %v", err)

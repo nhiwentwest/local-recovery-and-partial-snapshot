@@ -8,18 +8,18 @@ package opb
 type NInputOperator struct {
 	Inputs int
 	// Callbacks
-	Propagate func(m Marker)                                        // first time seeing a marker for snapshot
-	Complete  func(id string, inflight [][]Event)                   // when all inputs have seen the marker
-	OnData    func(ch int, ev Event)                                // optional: process data when channel not blocked
-	OnBlock   func(ch int)                                          // optional: invoked when a channel gets blocked
-	OnUnblock func()                                                // optional: invoked when snapshot completes
+	Propagate func(m Marker)                      // first time seeing a marker for snapshot
+	Complete  func(id string, inflight [][]Event) // when all inputs have seen the marker
+	OnData    func(ch int, ev Event)              // optional: process data when channel not blocked
+	OnBlock   func(ch int)                        // optional: invoked when a channel gets blocked
+	OnUnblock func()                              // optional: invoked when snapshot completes
 
 	// State
-	cutID           string
-	seen            []bool
-	blocked         []bool
-	recordInflight  []bool
-	inflight        [][]Event
+	cutID          string
+	seen           []bool
+	blocked        []bool
+	recordInflight []bool
+	inflight       [][]Event
 }
 
 // NewNInputOperator constructs an N-input operator.
@@ -132,4 +132,3 @@ func (op *NInputOperator) maybeComplete() {
 	}
 	op.Reset()
 }
-

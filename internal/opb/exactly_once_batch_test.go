@@ -16,7 +16,7 @@ func TestExactlyOnceBatch_ReplayNoIncrement(t *testing.T) {
 	var totalAmt int64
 	var totalQty int64
 	for i := int64(1); i <= 5; i++ {
-		applied, cur, err := st.Apply(key, 10*i, 1, i)
+		applied, cur, err := st.Apply(key, 10*i, 1, i, state.SourceUnspecified)
 		if err != nil || !applied {
 			t.Fatalf("first pass apply failed at seq=%d err=%v applied=%v", i, err, applied)
 		}
@@ -29,7 +29,7 @@ func TestExactlyOnceBatch_ReplayNoIncrement(t *testing.T) {
 
 	// Replay same batch: should be skipped (seqs <= LastSeq)
 	for i := int64(1); i <= 5; i++ {
-		applied, cur, err := st.Apply(key, 10*i, 1, i)
+		applied, cur, err := st.Apply(key, 10*i, 1, i, state.SourceUnspecified)
 		if err != nil {
 			t.Fatalf("replay apply err at seq=%d: %v", i, err)
 		}

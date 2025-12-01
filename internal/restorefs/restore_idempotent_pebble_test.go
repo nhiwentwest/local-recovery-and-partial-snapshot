@@ -25,7 +25,7 @@ func newTestPebbleStore() *testPebbleStore {
 }
 
 func (p *testPebbleStore) Close() error { return p.db.Close() }
-func (p *testPebbleStore) Apply(key string, da, dq, seq int64) (bool, state.RecordState, error) {
+func (p *testPebbleStore) Apply(key string, da, dq, seq int64, _ state.SourceKind) (bool, state.RecordState, error) {
 	k := []byte(key)
 	var cur state.RecordState
 	v, closer, err := p.db.Get(k)
@@ -181,7 +181,7 @@ func (p *testPebbleStore) Delete(key string) error {
 }
 
 // Dirty key tracking is not needed for this test store
-func (p *testPebbleStore) GetDirtyKeys() []string { return nil }
+func (p *testPebbleStore) GetDirtyKeys() []string          { return nil }
 func (p *testPebbleStore) MarkSnapshotDone(keys ...string) {}
 
 func TestEndToEnd_PebbleMem_SnapshotThenRestoreReplay_Idempotent_FS(t *testing.T) {

@@ -5,16 +5,36 @@ import (
 	"time"
 )
 
+// OrderSource indicates which logical phase/batch produced a given event.
+// It is intentionally a string so that JSON payloads remain readable and
+// backwards compatible (unknown/empty values simply mean "legacy/unspecified").
+type OrderSource string
+
+const (
+	// SourceUnspecified is used for legacy data where the generator did not
+	// explicitly tag the origin. UI should treat this as "mixed/unknown".
+	SourceUnspecified OrderSource = ""
+	// SourceBaseline covers the long-running baseline/backfill segment.
+	SourceBaseline OrderSource = "baseline"
+	// SourceDelta is for the focused delta batch before the snapshot cut.
+	SourceDelta OrderSource = "delta"
+	// SourcePostCut marks events that arrived strictly after the cut.
+	SourcePostCut OrderSource = "postCut"
+	// SourceSeed is reserved for small priming injections (e.g. PRE_CUT_PRIME).
+	SourceSeed OrderSource = "seed"
+)
+
 // OrderEnriched mirrors schema v1 used by OpA output and by the generator in Phase 1.
 type OrderEnriched struct {
-	OrderID    string  `json:"orderId"`
-	ProductID  string  `json:"productId"`
-	Price      int64   `json:"price"`
-	Qty        int64   `json:"qty"`
-	StoreID    string  `json:"storeId"`
-	TS         int64   `json:"ts"`
-	Validated  bool    `json:"validated"`
-	NormTS     int64   `json:"normTs"`
+	OrderID   string      `json:"orderId"`
+	ProductID string      `json:"productId"`
+	Price     int64       `json:"price"`
+	Qty       int64       `json:"qty"`
+	StoreID   string      `json:"storeId"`
+	TS        int64       `json:"ts"`
+	Validated bool        `json:"validated"`
+	NormTS    int64       `json:"normTs"`
+	Source    OrderSource `json:"source,omitempty"`
 	// Optional ride-like attributes for more realistic demos
 	DistanceKm float64 `json:"distanceKm,omitempty"`
 	FareBase   int64   `json:"fareBase,omitempty"`
