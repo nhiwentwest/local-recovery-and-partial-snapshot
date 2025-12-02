@@ -31,118 +31,43 @@ Topics mặc định (prefix p1.)
 
 ## 2) Quickstart (local)
 Prerequisites
-- Kafka tại 127.0.0.1:9092; khởi động nhanh bằng Homebrew  
-  `brew services start kafka`  
-  Kiểm tra: `brew services list | grep kafka`
-- Go toolchain + make (để build `bin/opb`, `bin/opbtool`, `bin/kadmin`)
+- Kafka tại 127.0.0.1:9092 (Homebrew: `brew services start kafka`; kiểm tra `brew services list | grep kafka`)
+- Go toolchain + make (build `bin/opb`, `bin/opbtool`, `bin/kadmin`)
 
 Build
 - make build
 
-- Chạy nhanh demo **Local Recovery & Causal Freeze** trước tiên
-  - Khởi động Prometheus dùng cấu hình có sẵn trong repo:
-    ```bash
-    cd hpb
-    prometheus --config.file=./prometheus.yml --web.listen-address=:9090
-    ```
-  - Sau đó chạy demo recovery (script sẽ tự build `opb`, reset topics, khởi động cụm B1/B2/B3 và thực hiện crash+restore):
-    ```bash
-    cd hpb
-    AUTO_Y=1 INTERACTIVE=0 SCENARIO=freeze CAUSAL_FREEZE_MODE=1 ./scripts/demo_recovery.sh
-    ```
-  - Mở giao diện viz và panel Prometheus:
-    - Web: `http://127.0.0.1:8089/viz/` (heatmap, cluster, causal cut,…)
-    - Trong viz, ở ô **Prometheus URL**, nhập `http://127.0.0.1:9090` và nhấn Enter để kích hoạt các panel:
-      - *Causal inflight (last 5m)* — đọc `sum(opb_causal_inflight)`
-      - *Last Restore Summary* — đọc `opb_last_restore_*` từ lần restore gần nhất
+Chạy nhanh demo **Local Recovery & Causal Freeze**
+- Khởi động Prometheus với cấu hình trong repo:
+  ```bash
+  cd hpb
+  prometheus --config.file=./prometheus.yml --web.listen-address=:9090
+  ```
+- Chạy demo recovery (headless, tự reset topics/state, crash+restore B3):
+  ```bash
+  cd hpb
+  AUTO_Y=1 INTERACTIVE=0 SCENARIO=freeze CAUSAL_FREEZE_MODE=1 ./scripts/demo_recovery.sh
+  ```
+- Mở viz: `http://127.0.0.1:8089/viz/`  
+  - Ô “Prometheus URL”: nhập `http://127.0.0.1:9090` → panel *Causal inflight (last 5m)* & *Last Restore Summary* sẽ có dữ liệu.
 
-Chạy tối thiểu hạ tầng + pipeline
-- scripts/run_infra.sh (khởi động broker, Prom, Grafana, web viz nếu có trong repo)
-- scripts/run_opa.sh (OpA — chuẩn hoá, Exactly‑Once)
-- scripts/run_opb.sh (OpB — tổng hợp + snapshot/changelog, **pebble-only**)
-- scripts/start_pipeline.sh (bơm dữ liệu mẫu nếu cần)
+Chạy hạ tầng/pipeline (tuỳ chọn)
+- scripts/run_infra.sh (Kafka, Prom, Grafana nếu cần)
+- scripts/run_opa.sh (OpA)
+- scripts/run_opb.sh (OpB)
+- scripts/start_pipeline.sh (bơm dữ liệu mẫu)
 
 Mở giao diện web
 - Cluster overview: http://127.0.0.1:8089/viz/cluster
-- Zone data (theo store): http://127.0.0.1:8089/viz/zone-data?id=STORE_PREFIX
+- Zone data: http://127.0.0.1:8089/viz/zone-data?id=STORE_PREFIX
 
 Ghi chú
-- Các topic opb-* có mục tiêu compacted/append như trên. Nếu cần tạo thủ công bằng rpk/kafka-topics, hãy dùng prefix p1.* và số partitions phù hợp với demo.
+- Topics opb-* dùng prefix `p1.*`, changelog `cleanup.policy=delete`, snapshots `cleanup.policy=compact`.
 
 
-## 3) Demos (bám script — mỗi demo: Mục tiêu → Cách chạy → Verify → Links)
+## 3) Demo Recovery (local)
 
-### Chuẩn bị trước mỗi demo
-Để tránh xung đột giữa các kịch bản (đặc biệt khi OpB có replica B2 đang chạy), hãy làm sạch môi trường trước MỖI demo:
-
-1. Dừng các tiến trình đang chạy  
-   `pkill -f bin/opb || true`  
-   `pkill -f bin/opa || true`  
-   `pkill -f ':8090' || true` # đảm bảo OpB2 không giữ partition
-2. Xoá và tạo lại topic sạch:  
-   `PREFIX=p1 bash scripts/run_infra.sh`
-3. Khởi động pipeline nền với Pebble + window 120s:  
-   `STATE_BACKEND=pebble WINDOW_SIZE=120 bash scripts/start_pipeline.sh`
-4. Đợi `http://127.0.0.1:8088/healthz` và `http://127.0.0.1:8089/healthz` trả `{"status":"ok"}` rồi mới chạy demo.
-
-Lưu ý: `scripts/demo_suite.sh` sẽ tự khởi động B2 (port 8090) trong pha scale-out; sau khi demo kết thúc hãy dừng B2 (`pkill -f ':8090'`) trước khi chuyển sang demo khác.
-
-### Demo 1 — Exactly‑Once (EOS)
-Mục tiêu
-- Không double‑count khi bơm bản ghi trùng (DUP) vào đường đi chuẩn.
-
-Cách chạy (headless)
-- INTERACTIVE=0 DEMO_ONLY=EOS bash scripts/demo_suite.sh
-
-Verify
-- sumQty giữ nguyên sau pha DUP (không tăng lần 2).
-- Metrics opb_events_skipped_dedup_total tăng tương ứng số DUP.
-
-Links
-- /viz/cluster, /viz/zone-data?id=EOS-TEST-D-
-
-
-### Demo 2 — Scale‑out (local)
-Mục tiêu
-- Tăng replica/số partitions để giảm lag, tăng throughput.
-
-Cách chạy (tuỳ chọn A — 1 giai đoạn)
-- INTERACTIVE=0 AUTO_Y=1 STORE=EOS-TEST-D- bash scripts/demo_scaleout.sh
-
-Cách chạy (tuỳ chọn B — 2 giai đoạn, có auto reset)
-- INTERACTIVE=0 AUTO_Y=1 \
-  RESET_AFTER_SEC=60 RESET_PARTS=4 RESET_MODE=delete_recreate \
-  STORE=EOS-TEST-D- bash scripts/demo_scaleout_2stage.sh
-
-Verify
-- Lag giảm, throughput tăng sau khi thêm replica/tăng partitions.
-- Ngay sau khi join group, LagTotal có thể >0 một thời gian rồi về 0 khi tiêu thụ xong.
-
-Links
-- /viz/cluster, /viz/zone-data?id=STORE
-
-
-### Demo 3 — Availability & Headroom (local)
-Mục tiêu
-- Một replica OpB bị kill tạm thời, hệ thống vẫn xử lý nhờ rebalance; sau đó replica trở lại và join nhóm.
-
-Cách chạy (headless)
-- INTERACTIVE=0 AUTO_Y=1 bash scripts/demo_availability_local.sh
-
-Cách chạy (clean backlog + drain lag trước khi gây lỗi)
-- INTERACTIVE=0 AUTO_Y=1 CLEAN_TOPICS=1 CLEAN_LAG=1 LAG_THRESH=0 LAG_TIMEOUT=180 bash scripts/demo_availability_local.sh
-  - CLEAN_TOPICS=1: xoá và tạo lại topics demo (enriched/output = 4 partitions; các topic compacted giữ cleanup.policy=compact)
-  - CLEAN_LAG=1: đợi tổng lag trên cụm về ≤ LAG_THRESH (mặc định 0) trong tối đa LAG_TIMEOUT giây trước khi bắt đầu bơm tải/gây lỗi
-
-Verify
-- Khi B2 down: B1/B3 tiếp quản partitions của B2, hệ thống vẫn xử lý.
-- Khi B2 phục hồi: partitions phân phối lại đều. Quan sát được trên /viz/cluster.
-
-Links
-- /viz/cluster
-
-
-### Demo 4 — Recovery (local)
+### Demo — Recovery (local)
 Mục tiêu
 - Khởi động lại OpB, phục hồi nhanh nhờ manifest snapshot + replay changelog, và chứng minh thời gian khôi phục (TTR) dưới 10 giây sau tối ưu.
 
@@ -218,6 +143,29 @@ Trích đoạn manifest (mẫu)
   "lastChangelogOffset": 7534221,
   "createdAt": 1694499600 }
 ```
+
+## 7) Kỹ thuật chính & Liên hệ KIP / FLIP / EOS
+
+- **Exactly-Once đường đi chuẩn (KIP-98 / KIP-447)**  
+  OpA dùng transactional producer, OpB dedup theo `eventID=orderId#ws`, track `LastSeq` và epoch fencing → mỗi event chỉ cập nhật state một lần. Khi khôi phục, engine luôn áp dụng `snapshot → inflight → changelog`, nên state sau recover giữ nguyên EOS.
+
+- **Barrier-based partial snapshot (Chandy–Lamport)**  
+  `internal/opb/operator_n.go` + `cmd/opb/main.go` cài đặt barrier-cut: inject marker, ghi offsets per partition, scan dirty keys và ghi full/delta snapshot mà không block ingest.
+
+- **Causal inflight snapshot (Beaver-style / FLIP-158)**  
+  `cmd/opb/causal_inflight.go` ghi `inflight.json` với `{key, payload, vectorClock}`, manifest chứa `InflightFile`, `InflightEvents`, `SnapshotVectorClock`. Khi restore, `replayInflightEvents` chạy giữa snapshot và Kafka tail để tránh “effect without cause”.
+
+- **Pebble SSTable shipping & incremental checkpoint (Phase 2/3)**  
+  `internal/snapshot/*` xuất snapshot thành Pebble SSTable (full hoặc incremental), `internal/restore/restore.go` import trực tiếp (`CheckpointCapable.ImportSSTables`). Manifest lưu `PebbleSSTFiles`, `PebbleIncrementalFiles`, `PebbleAllFiles` để mô tả chain và phục vụ GC.
+
+- **Manifest-driven restore & selective replay**  
+  Restore pipeline đọc manifest.latest, khôi phục chain full+delta, sau đó đối chiếu offsets với Kafka head: nếu `ReplayRequired=false` hoặc không backlog thì skip Kafka tail (Causal Freeze). Đây là lý do demo đạt `replay_s≈0`.
+
+- **Peer-assisted state migration (KIP-319 / KIP-345 / KIP-429)**  
+  Với `--rebalance-import-state=true`, replica mới pause ingest, gọi `importStateFromPeer` để copy snapshot từ peer, phù hợp cooperative rebalance/static membership/sticky assignor. Tính năng này hỗ trợ scale-out/HA mặc dù demo mặc định không bật.
+
+- **Observability & đo lường**  
+  `/status`, `/viz/heatmap`, `/viz/zone-data`, `/viz/snapshot-insights` cùng Prometheus gauges `opb_last_restore_*`, `opb_causal_inflight`, `opb_causal_replay_total` giúp theo dõi toàn bộ cut → restore → replay. Các script bundle (baseline vs kỹ thuật) và `measure_ttr.sh` dựa trên những metric này để tạo CSV so sánh.
 
 
 ## 7) Ghi chú phạm vi & đồng bộ
@@ -365,3 +313,115 @@ git push origin <branch>
 ```
 
 Gợi ý: Các script demo sẽ tự tạo lại thư mục khi chạy nên việc xoá là an toàn. Nếu cần giữ mẫu nhỏ cho báo cáo, hãy lưu dưới `docs/examples/` (không dùng cho runtime).
+
+Mình đề xuất kế hoạch 3 bước: **(1) gom kỹ thuật theo nhóm khái niệm**, **(2) map từng nhóm vào code/file cụ thể**, **(3) chọn cái nào đưa vào demo chính, cái nào ghi vào báo cáo/phụ lục**. Dưới đây là bản nhóm trước, gom tất cả kỹ thuật “nâng cao” liên quan EOS, partial snapshot, local recovery trong project (kể cả không nằm trong `demo_recovery.sh`):
+
+---
+
+### Nhóm A – Exactly‑Once & Idempotency (EOS đường đi chuẩn)
+
+- **Transactional producer + idempotent sink (OpA → OpB)**  
+  - `cmd/opa` + `cmd/opb/main.go`: dùng transactional producer, `eventID = orderId#ws`, kiểm tra `dedupSeen` và `LastSeq` để tránh double‑apply.
+  - `internal/opb/aggregate_idempotency_test.go`, `internal/opb/exactly_once_batch_test.go`: test đảm bảo không double‑count.
+- **Vector clock + epoch fencing**  
+  - `internal/opb/tx.go`: `BuildHeadersWithEpochAndVC`, `ExtractVectorClock`, header `epoch`, `vc`.  
+  - `cmd/opb/main.go`: đọc VC từ header, tick VC cho operator, dùng epoch để drop message “ngoài epoch”.
+- Đây là “kỹ thuật EOS nâng cao” → nên gom thành 1 mục riêng trong báo cáo.
+
+---
+
+### Nhóm B – Barrier‑based Partial Snapshot (Chandy‑Lamport style)
+
+- **N‑input operator & marker logic**  
+  - `internal/opb/operator_n.go`, `operator_dyn.go`, `operator_poc.go`: tổng quát hoá Chandy‑Lamport cho N input; record inflight giữa 2 marker.
+- **Barrier injection & cut pipeline**  
+  - `cmd/opb/main.go`:
+    - `/admin/snapshot-cut` + worker `snapshotCutReq` + `barrierCut` struct.  
+    - Inject marker vào tất cả partition `p1.orders.enriched`, pause consumer, commit offset, gọi `snapcut.PerformBarrierCut`.
+- Phần này là “non‑blocking barrier snapshot” – nền tảng cho partial snapshot/local recovery.
+
+---
+
+### Nhóm C – Causal inflight snapshot (Beaver‑style) + vector clock
+
+- **Ghi inflight snapshot**  
+  - `cmd/opb/causal_inflight.go`: `inflightRecord{key, payload, vectorClock}`, `writeInflightSnapshot` → ghi `inflight.json`.
+  - `recordInflightEvent` trong `cmd/opb/main.go`: copy payload + VC cho từng event; merge VC vào `barrierCut.vectorClock`.
+- **Wiring vào manifest**  
+  - `internal/opb/snapcut/snapcut.go`: `CausalInfo{Channels, InflightFile, InflightEvents, VectorClock}`; gán vào:
+    - `manifest.InflightFile`, `InflightEvents`, `SnapshotVectorClock`.
+- **Replay inflight khi restore**  
+  - `replayInflightEvents` trong `cmd/opb/causal_inflight.go`: đọc `inflight.json`, apply lại `OrderEnriched` theo channel order.
+
+Đây chính là “Causal inflight + multi‑vector” – dùng trong `demo_recovery.sh` và `demo_causal_snapshot.sh` (dù script sau anh đã xoá, nhưng kỹ thuật vẫn nằm trong core).
+
+---
+
+### Nhóm D – Pebble SSTable shipping & Incremental snapshot (Phase 2/3)
+
+- **Full + incremental Pebble snapshot**  
+  - `internal/snapshot/snapshot.go`: `FormatPebble`, `FilesystemSnapshotter.WriteSnapshotFromView`, `WriteDeltaSnapshotFromView`.
+  - `internal/restore/restore.go`: `RestoreFromSnapshotWithFormat` có nhánh `FormatPebble` → gọi `CheckpointCapable.ImportSSTables`.
+- **Manifest metadata**  
+  - `internal/manifest/manifest.go`: `PebbleSSTFiles`, `PebbleSSTChecksums`, `PebbleIncrementalFiles`, `PebbleAllFiles`.
+- **GC & retention**  
+  - `internal/snapshot/gc.go` (nếu có) + `/admin/snapshot-gc`: dọn chain snapshot dựa trên ref‑count `PebbleAllFiles`.
+
+Đây là kỹ thuật “local recovery bằng shipping SSTable” + incremental checkpoint, hỗ trợ partial snapshot rất mạnh.
+
+---
+
+### Nhóm E – Manifest‑driven Restore & Local Recovery
+
+- **Restore pipeline chính**  
+  - `cmd/opb/main.go` đoạn `if cfg.RestoreOnStart`:  
+    - Đọc manifest.latest → restore snapshot chain (full+delta) bằng Pebble shipping.  
+    - Đọc `inflight.json` → `replayInflightEvents`.  
+    - Quyết định replay Kafka tail hay không (changelog) dựa trên:
+      - `ReplayRequired` + `ChangelogHasBacklog`.
+- **Freeze / epoch closed**  
+  - Field `ReplayRequired` trong `internal/manifest/manifest.go`.  
+  - Flag `--restore-trust-manifest` + hàm `manifestAllowsReplaySkip` trong `cmd/opb/main.go`.  
+  - `scripts/demo_recovery.sh`: `freeze_epoch_after_cut` set `replayRequired=false` trong manifest + archived manifest → restore bỏ Kafka replay tail.
+
+Đây là kỹ thuật “local recovery guided by manifest”: snapshot+inflight đủ thì không cần replay tail, đạt `replay_s≈0`.
+
+---
+
+### Nhóm F – Peer‑assisted state migration (rebalance/import từ peer)
+
+- **Import state từ peer khi rebalance**  
+  - `cmd/opb/main.go` và `cmd/opb/multi_runtime.go`: trong rebalance callback của Kafka consumer, nếu `--rebalance-import-state=true`:
+    - Pause ingest, chọn một peer từ `--peers`, gọi `importStateFromPeer`, sau đó resume ingest.
+  - `internal/state` + `state.CheckpointCapable`: export/import snapshot từ peer (pebble SST).
+- **Scripts test**  
+  - `scripts/test_state_import.sh`: kịch bản kiểm tra state import.  
+  - Một số logic này không nằm trong `demo_recovery.sh` mà trong demo khác (giờ anh đã xoá scripts, nhưng kỹ thuật vẫn có trong code).
+
+Đây là kỹ thuật “peer‑assisted state migration” giống KIP‑319/KIP‑345.
+
+---
+
+### Nhóm G – Đo TTR, metrics & viz cho địa phương hoá recovery
+
+- **Restore metrics & Prometheus**  
+  - `internal/metrics/metrics.go`: `opb_last_restore_*`, `opb_causal_inflight`, `opb_causal_replay_total`.  
+  - `cmd/opb/main.go`: sau restore, ghi `restore-metrics.json` + set gauge Prom cho Last Restore Summary.
+- **Đo TTR file‑based**  
+  - `scripts/measure_ttr.sh` + `internal/restore/restore_ttr_test.go`: đo TTR coarse‑grained khi dùng file manifest + JSON changelog.
+
+Phần này giúp “lượng hoá” hiệu quả các kỹ thuật trên.
+
+---
+
+### Hướng đi tiếp theo
+
+- **Bước 1** (anh vừa yêu cầu): mình đã liệt kê và nhóm theo kỹ thuật + file gốc.  
+- **Bước 2**: chọn ra **3–4 nhóm** để đưa vào bài chính (gợi ý: A, B+C, D+E) và 1–2 nhóm (F,G) cho phần “bonus/roadmap”.  
+- **Bước 3**: mỗi nhóm viết 1–2 trang tóm tắt:
+  - Ý tưởng lý thuyết,
+  - Nơi code implement,
+  - Cách demo (nếu có script),
+  - Liên hệ đến local recovery / partial snapshot / EOS.
+
+Nếu anh muốn, bước sau mình có thể đi từng nhóm một, chi tiết hóa: “nhóm nào sẽ viết thành section nào trong báo cáo, dùng hình minh hoạ gì, log nào chụp screenshot”.
