@@ -1893,9 +1893,7 @@ func run(cfg Config) error {
 					if mreg.LastRestoreTTRSeconds != nil {
 						mreg.LastRestoreTTRSeconds.WithLabelValues(lbls...).Set(float64(newMetrics.TTRMs) / 1000.0)
 					}
-					if mreg.LastRestoreRestoreOnlyMs != nil {
-						mreg.LastRestoreRestoreOnlyMs.WithLabelValues(lbls...).Set(float64(phaseTimings.TotalMs))
-					}
+					// Lưu các metric phụ thuộc vào phaseTimings sau khi đã tính MetricsMs/TotalMs ở bên dưới.
 					if mreg.LastRestoreReplaySeconds != nil {
 						mreg.LastRestoreReplaySeconds.WithLabelValues(lbls...).Set(float64(phaseTimings.ChangelogMs) / 1000.0)
 					}
@@ -1921,6 +1919,9 @@ func run(cfg Config) error {
 					}
 					phaseTimings.MetricsMs = time.Since(metricsStart).Milliseconds()
 					phaseTimings.TotalMs = time.Since(restoreTsStart).Milliseconds()
+					if mreg.LastRestoreRestoreOnlyMs != nil {
+						mreg.LastRestoreRestoreOnlyMs.WithLabelValues(lbls...).Set(float64(phaseTimings.TotalMs))
+					}
 					if phaseTimings.TotalMs > 0 {
 						line := map[string]any{
 							"phase":   "restore-phases",
