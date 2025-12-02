@@ -7,6 +7,7 @@ bin/
 # Runtime state / generated data
 data/
 logs/
+runlogs/
 *.log
 
 # Snapshots & changelogs (generated)

@@ -1369,12 +1369,12 @@ if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
     if command -v jq >/dev/null 2>&1; then
       INFLIGHT_EVENT_COUNT=$(jq '(.events | map(length) | add) // 0' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
       INFLIGHT_CHANNELS=$(jq -r '.channels | length' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
-      INFLIGHT_FOR_KEY=$(jq -r --arg k "${STORE}#${PROD}#${WS}" '
-        (.events // {})
-        | to_entries
-        | map(.value | map(select(.key == $k)) | length)
-        | add // 0
-      ' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+        INFLIGHT_FOR_KEY=$(jq -r --arg k "${STORE}#${PROD}#${WS}" '
+          (.events // {})
+          | to_entries
+          | map(.value | map(select(.key == $k)) | length)
+          | add // 0
+        ' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
       # Nếu key demo mặc định không có inflight nhưng snapshot có inflight cho key khác,
       # tự động chọn một key có inflight để dùng cho các checkpoint sau, tránh cần export STORE/PROD thủ công.
       if [[ "$INFLIGHT_FOR_KEY" -eq 0 && "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
@@ -1400,11 +1400,11 @@ if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
     else
       INFLIGHT_EVENT_COUNT=$(grep -c '"key"' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
       INFLIGHT_CHANNELS=0
-      INFLIGHT_FOR_KEY=0
+        INFLIGHT_FOR_KEY=0
     fi
     say "✓ Causal snapshot captured: $INFLIGHT_EVENT_COUNT inflight events across $INFLIGHT_CHANNELS channels"
     say "  File: $MANIFEST_INFLIGHT_FILE"
-    say "  Inflight for key ${STORE}#${PROD}#${WS}: $INFLIGHT_FOR_KEY events"
+      say "  Inflight for key ${STORE}#${PROD}#${WS}: $INFLIGHT_FOR_KEY events"
       # In thêm một vài event inflight kèm vector clock để minh hoạ nhân quả đa chiều
       if command -v jq >/dev/null 2>&1 && [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
         say "  Sample inflight events with vector clocks (tối đa 5):"
