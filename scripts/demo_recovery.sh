@@ -462,8 +462,9 @@ seed_baseline_state() {
 
 get_status_field() {
   local field=$1
+  local base=${2:-$OPB1_HTTP}
   local data
-  data=$(curl -s "$OPB1_HTTP/status" || true)
+  data=$(curl -s "$base/status" || true)
   if command -v jq >/dev/null 2>&1; then
     jq -r ".$field // 0" <<<"$data" 2>/dev/null || echo 0
   else
@@ -593,7 +594,8 @@ PROM_CHECK_TIMEOUT=${PROM_CHECK_TIMEOUT:-10}
 log_metrics() {
   local msg=$1
   mkdir -p "$(dirname "$METRICS_LOG")" 2>/dev/null || true
-  printf '[metrics] %s\n' "$msg" | tee -a "$METRICS_LOG"
+  # Ghi metrics vào file riêng, không spam ra stdout
+  printf '[metrics] %s\n' "$msg" >> "$METRICS_LOG"
 }
 
 prom_query_value() {
@@ -1268,26 +1270,26 @@ echo "Exact URL (window): $EXACT_URL_WS"
 echo "Exact sumQty (total)=$base_sq lastSeq=$base_ls"
 
 say "Phase 2: Validate peer instance B2 import"
-say "Waiting for import logs from B2..."
-import_logged=0
+  say "Waiting for import logs from B2..."
+  import_logged=0
 for ((i=1;i<=120;i++)); do
-  if grep -q "import: finished loading" "$OPB2_LOG" 2>/dev/null; then
-    say "✓ Peer import completed (see $OPB2_LOG)"
-    import_logged=1
-    break
-  fi
+    if grep -q "import: finished loading" "$OPB2_LOG" 2>/dev/null; then
+      say "✓ Peer import completed (see $OPB2_LOG)"
+      import_logged=1
+      break
+    fi
   if grep -q "import: no data" "$OPB2_LOG" 2>/dev/null || grep -q "opb: ready" "$OPB2_LOG" 2>/dev/null; then
     say "✓ Peer has no state to import (ready)"
     import_logged=1
     break
   fi
-  sleep 1
-done
-if [[ $import_logged -ne 1 ]]; then
-  say "WARN: Did not observe 'import: finished loading' in B2 logs (check $OPB2_LOG)"
-fi
-log_status_endpoint "b2-import-status" "$OPB2_HTTP"
-log_cluster_viz "cluster-after-b2-import" "$OPB1_HTTP"
+    sleep 1
+  done
+  if [[ $import_logged -ne 1 ]]; then
+    say "WARN: Did not observe 'import: finished loading' in B2 logs (check $OPB2_LOG)"
+  fi
+  log_status_endpoint "b2-import-status" "$OPB2_HTTP"
+  log_cluster_viz "cluster-after-b2-import" "$OPB1_HTTP"
 say "B2 will remain online through heavy seeding to increase throughput."
 
 say "Phase 2: Create Delta Data with Causal Snapshot Capture"
@@ -1296,13 +1298,13 @@ say "=== Causal Snapshot Technique (Beaver-style) ==="
 # Goal: Ensure messages are CONSUMED after cut begins but BEFORE barrier arrival.
 # We achieve this by pausing ingestion, creating backlog, injecting barriers, then resuming.
 
-say "Step 1: Pausing ingestion to build backlog"
-curl -s -X POST "$OPB1_HTTP/admin/ingest/pause" >/dev/null || true
-sleep 0.5
+  say "Step 1: Pausing ingestion to build backlog"
+  curl -s -X POST "$OPB1_HTTP/admin/ingest/pause" >/dev/null || true
+  sleep 0.5
 
-say "Step 2: Injecting delta data to create backlog (while paused)"
-inject_delta_batch
-log_causal_status "delta-backlog-built"
+  say "Step 2: Injecting delta data to create backlog (while paused)"
+  inject_delta_batch
+  log_causal_status "delta-backlog-built"
 
 if [[ "$FOCUS_INFLIGHT_DEMO" == "1" ]]; then
   # Inject a small, focused batch for the demo key after main backlog is built,
@@ -1310,8 +1312,8 @@ if [[ "$FOCUS_INFLIGHT_DEMO" == "1" ]]; then
   inject_demo_key_inflight "${FOCUS_INFLIGHT_N:-256}"
 fi
 
-say "Step 3: Triggering delta snapshot to initiate barrier cut (markers appended AFTER backlog)"
-curl -s -X POST "$OPB1_HTTP/admin/snapshot-cut?type=delta" >/dev/null || true
+  say "Step 3: Triggering delta snapshot to initiate barrier cut (markers appended AFTER backlog)"
+  curl -s -X POST "$OPB1_HTTP/admin/snapshot-cut?type=delta" >/dev/null || true
 
 # Wait for barrier injection to complete (check log for exact pattern)
 say "Step 4: Waiting for barrier messages to be injected into Kafka..."
@@ -1331,7 +1333,7 @@ fi
 
 say "Step 5: Resuming ingestion so backlog flows and gets captured as inflight"
 curl -s -X POST "$OPB1_HTTP/admin/ingest/resume" >/dev/null || true
-log_causal_status "delta-after-resume"
+  log_causal_status "delta-after-resume"
 
 # Track causal barrier progress via /status instead of grepping logs
 wait_causal_finalized "$OPB1_HTTP" 120 || true
@@ -1363,36 +1365,58 @@ if wait_manifest_inflight "$SNAPSHOT_DIR" 60; then
     if [[ -f "$INFLIGHT_PATH" ]]; then break; fi
     sleep 1
   done
-    if [[ -f "$INFLIGHT_PATH" ]]; then
-      if command -v jq >/dev/null 2>&1; then
-        INFLIGHT_EVENT_COUNT=$(jq '(.events | map(length) | add) // 0' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
-        INFLIGHT_CHANNELS=$(jq -r '.channels | length' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
-        INFLIGHT_FOR_KEY=$(jq -r --arg k "${STORE}#${PROD}#${WS}" '
-          (.events // {})
-          | to_entries
-          | map(.value | map(select(.key == $k)) | length)
-          | add // 0
-        ' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
-      else
-        INFLIGHT_EVENT_COUNT=$(grep -c '"key"' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
-        INFLIGHT_CHANNELS=0
-        INFLIGHT_FOR_KEY=0
+  if [[ -f "$INFLIGHT_PATH" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      INFLIGHT_EVENT_COUNT=$(jq '(.events | map(length) | add) // 0' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+      INFLIGHT_CHANNELS=$(jq -r '.channels | length' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+      INFLIGHT_FOR_KEY=$(jq -r --arg k "${STORE}#${PROD}#${WS}" '
+        (.events // {})
+        | to_entries
+        | map(.value | map(select(.key == $k)) | length)
+        | add // 0
+      ' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+      # Nếu key demo mặc định không có inflight nhưng snapshot có inflight cho key khác,
+      # tự động chọn một key có inflight để dùng cho các checkpoint sau, tránh cần export STORE/PROD thủ công.
+      if [[ "$INFLIGHT_FOR_KEY" -eq 0 && "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
+        auto_key=$(jq -r 'first(.events[] | .[0].key) // empty' "$INFLIGHT_PATH" 2>/dev/null || echo "")
+        if [[ -n "$auto_key" ]]; then
+          old_store="$STORE"; old_prod="$PROD"; old_ws="$WS"
+          STORE="${auto_key%%#*}"
+          rest="${auto_key#*#}"
+          PROD="${rest%%#*}"
+          WS="${rest##*#}"
+          EXACT_URL="$OPB1_HTTP/api/zone-details?id=$STORE"
+          EXACT_URL_WS="$OPB1_HTTP/api/zone-details?id=$STORE&productId=$PROD&ws=$WS"
+          say "Auto-selected demo key from inflight: ${STORE}#${PROD}#${WS} (was ${old_store}#${old_prod}#${old_ws})"
+          # Tính lại INFLIGHT_FOR_KEY cho key mới (để log đúng)
+          INFLIGHT_FOR_KEY=$(jq -r --arg k "${STORE}#${PROD}#${WS}" '
+            (.events // {})
+            | to_entries
+            | map(.value | map(select(.key == $k)) | length)
+            | add // 0
+          ' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+        fi
       fi
-      say "✓ Causal snapshot captured: $INFLIGHT_EVENT_COUNT inflight events across $INFLIGHT_CHANNELS channels"
-      say "  File: $MANIFEST_INFLIGHT_FILE"
-      say "  Inflight for key ${STORE}#${PROD}#${WS}: $INFLIGHT_FOR_KEY events"
+    else
+      INFLIGHT_EVENT_COUNT=$(grep -c '"key"' "$INFLIGHT_PATH" 2>/dev/null || echo 0)
+      INFLIGHT_CHANNELS=0
+      INFLIGHT_FOR_KEY=0
+    fi
+    say "✓ Causal snapshot captured: $INFLIGHT_EVENT_COUNT inflight events across $INFLIGHT_CHANNELS channels"
+    say "  File: $MANIFEST_INFLIGHT_FILE"
+    say "  Inflight for key ${STORE}#${PROD}#${WS}: $INFLIGHT_FOR_KEY events"
       # In thêm một vài event inflight kèm vector clock để minh hoạ nhân quả đa chiều
       if command -v jq >/dev/null 2>&1 && [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
         say "  Sample inflight events with vector clocks (tối đa 5):"
         jq -r '.events[] | .[] | {key, vectorClock} | @json' "$INFLIGHT_PATH" 2>/dev/null | head -n 5 || true
       fi
-      if [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
-        say "  ✓ Channel state successfully captured - causal recovery will replay these events"
-      else
-        say "  WARN: Inflight file exists but contains 0 events"
-        say "  This may indicate all messages were processed before barriers arrived"
-      fi
+    if [[ "$INFLIGHT_EVENT_COUNT" -gt 0 ]]; then
+      say "  ✓ Channel state successfully captured - causal recovery will replay these events"
     else
+      say "  WARN: Inflight file exists but contains 0 events"
+      say "  This may indicate all messages were processed before barriers arrived"
+    fi
+  else
     say "WARN: inflight file $INFLIGHT_PATH not found (manifest references it but file missing)"
     # Best-effort diagnostics and fallback search
     say "  Listing snapshot dir: $SNAPSHOT_DIR/${MANIFEST_SNAPSHOT_ID:-}"
@@ -1525,70 +1549,70 @@ fi
 
 say "Restarting B3 in two stages..."
 
-say "Stage 1: Restore-only to rebuild state and exit (B3)"
-rm -f "$CRASH_STATE_DIR/LOCK" 2>/dev/null || true # Clean lock before restore
-RESTORE_CMD=(
-  "$BIN_OPB"
-  --state-backend pebble --state-dir "$CRASH_STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR"
-  --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID"
-  --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
-)
-RESTORE_CMD+=( "${EXTRA_OPB_FLAGS[@]}" )
+  say "Stage 1: Restore-only to rebuild state and exit (B3)"
+  rm -f "$CRASH_STATE_DIR/LOCK" 2>/dev/null || true # Clean lock before restore
+  RESTORE_CMD=(
+    "$BIN_OPB"
+    --state-backend pebble --state-dir "$CRASH_STATE_DIR" --snapshot-dir "$SNAPSHOT_DIR"
+    --kafka-bootstrap "$BOOTSTRAP" --group-id "$GROUP_ID"
+    --input-source kafka --topic-enriched "$ENRICHED_TOPIC"
+  )
+  RESTORE_CMD+=( "${EXTRA_OPB_FLAGS[@]}" )
 if [[ "$CAUSAL_FREEZE_MODE" == "1" ]]; then
   RESTORE_CMD+=( --restore-trust-manifest )
 fi
-RESTORE_CMD+=( --window-size "$WINDOW_SIZE" --http :8092 --instance-id "$CRASH_INSTANCE_ID" --restore-on-start --restore-only )
-if ! "${RESTORE_CMD[@]}" >> "$CRASH_LOG" 2>&1; then
-  say "ERROR: restore-only failed — last 120 lines:"
-  tail -n 120 "$CRASH_LOG" || true
-  exit 1
-fi
-
-# Verify snapshot was restored
-say "Verifying snapshot restoration..."
-if [[ "$SNAPSHOT_FORMAT" == "pebble" ]]; then
-  # Pebble backend: verify SSTable shipping was used
-  verify_pebble_restore "$CRASH_LOG"
-  # Verify atomic import into STATE_DIR
-  ORIG_STATE_DIR="$STATE_DIR"
-  STATE_DIR="$CRASH_STATE_DIR"
-  verify_pebble_atomic_import
-  STATE_DIR="$ORIG_STATE_DIR"
-else
-  # JSON/msgpack backend: verify logical load
-  if grep -q "restore: snapshot restored\|restore: loaded.*keys from snapshot" "$CRASH_LOG" 2>/dev/null; then
-  RESTORED_SNAPSHOT=$(grep "restore: snapshot restored" "$CRASH_LOG" | tail -n1 | sed -E 's/.*snapshotId=([^ ]+).*/\1/' || echo "")
-  if [[ -n "$RESTORED_SNAPSHOT" ]]; then
-    say "✓ Snapshot restored successfully: $RESTORED_SNAPSHOT"
+  RESTORE_CMD+=( --window-size "$WINDOW_SIZE" --http :8092 --instance-id "$CRASH_INSTANCE_ID" --restore-on-start --restore-only )
+  if ! "${RESTORE_CMD[@]}" >> "$CRASH_LOG" 2>&1; then
+    say "ERROR: restore-only failed — last 120 lines:"
+    tail -n 120 "$CRASH_LOG" || true
+    exit 1
   fi
-  # Extract number of keys loaded from snapshot (format: "restore: loaded X keys from snapshot Y")
-  KEYS_LOADED=$(grep "restore: loaded.*keys from snapshot" "$CRASH_LOG" | tail -n1 | sed -E 's/.*loaded ([0-9]+) keys.*/\1/' || echo "")
-  if [[ -n "$KEYS_LOADED" && "$KEYS_LOADED" =~ ^[0-9]+$ ]]; then
-    say "✓ Loaded $KEYS_LOADED keys from snapshot"
-  fi
-else
-  say "WARN: Snapshot restoration log not found"
-fi
-fi
 
-# Report restore phases and whether changelog replay was skipped
-phases=$(parse_restore_phases "$CRASH_LOG" || true)
-if [[ -n "$phases" ]]; then
-  say "restore phases: $phases"
-fi
-assert_skip_replay "$CRASH_LOG"
-
-# Verify causal replay: Check for inflight events being replayed
-if grep -q "inflight replay applied" "$CRASH_LOG" 2>/dev/null; then
-  REPLAY_COUNT=$(grep "inflight replay applied" "$CRASH_LOG" | tail -n1 | sed -E 's/.*events=([0-9]+).*/\1/' 2>/dev/null || echo "")
-  if [[ -n "$REPLAY_COUNT" && "$REPLAY_COUNT" =~ ^[0-9]+$ ]]; then
-    say "✓ Causal inflight replay applied: $REPLAY_COUNT events replayed"
+  # Verify snapshot was restored
+  say "Verifying snapshot restoration..."
+  if [[ "$SNAPSHOT_FORMAT" == "pebble" ]]; then
+    # Pebble backend: verify SSTable shipping was used
+    verify_pebble_restore "$CRASH_LOG"
+    # Verify atomic import into STATE_DIR
+    ORIG_STATE_DIR="$STATE_DIR"
+    STATE_DIR="$CRASH_STATE_DIR"
+    verify_pebble_atomic_import
+    STATE_DIR="$ORIG_STATE_DIR"
   else
-    say "✓ Causal inflight replay detected in logs"
+    # JSON/msgpack backend: verify logical load
+    if grep -q "restore: snapshot restored\|restore: loaded.*keys from snapshot" "$CRASH_LOG" 2>/dev/null; then
+      RESTORED_SNAPSHOT=$(grep "restore: snapshot restored" "$CRASH_LOG" | tail -n1 | sed -E 's/.*snapshotId=([^ ]+).*/\1/' || echo "")
+      if [[ -n "$RESTORED_SNAPSHOT" ]]; then
+        say "✓ Snapshot restored successfully: $RESTORED_SNAPSHOT"
+      fi
+      # Extract number of keys loaded from snapshot (format: "restore: loaded X keys from snapshot Y")
+      KEYS_LOADED=$(grep "restore: loaded.*keys from snapshot" "$CRASH_LOG" | tail -n1 | sed -E 's/.*loaded ([0-9]+) keys.*/\1/' || echo "")
+      if [[ -n "$KEYS_LOADED" && "$KEYS_LOADED" =~ ^[0-9]+$ ]]; then
+        say "✓ Loaded $KEYS_LOADED keys from snapshot"
+      fi
+    else
+      say "WARN: Snapshot restoration log not found"
+    fi
   fi
-else
-  say "WARN: Causal replay log not detected (check $CRASH_LOG for 'inflight replay')"
-  say "  If inflightFile was captured, this indicates a problem with causal recovery"
+
+  # Report restore phases and whether changelog replay was skipped
+  phases=$(parse_restore_phases "$CRASH_LOG" || true)
+  if [[ -n "$phases" ]]; then
+    say "restore phases: $phases"
+  fi
+  assert_skip_replay "$CRASH_LOG"
+
+  # Verify causal replay: Check for inflight events being replayed
+  if grep -q "inflight replay applied" "$CRASH_LOG" 2>/dev/null; then
+    REPLAY_COUNT=$(grep "inflight replay applied" "$CRASH_LOG" | tail -n1 | sed -E 's/.*events=([0-9]+).*/\1/' 2>/dev/null || echo "")
+    if [[ -n "$REPLAY_COUNT" && "$REPLAY_COUNT" =~ ^[0-9]+$ ]]; then
+      say "✓ Causal inflight replay applied: $REPLAY_COUNT events replayed"
+    else
+      say "✓ Causal inflight replay detected in logs"
+    fi
+  else
+    say "WARN: Causal replay log not detected (check $CRASH_LOG for 'inflight replay')"
+    say "  If inflightFile was captured, this indicates a problem with causal recovery"
 fi
 
 say "Stage 2: Restart B3 to rejoin cluster"
@@ -1613,8 +1637,11 @@ log_zone_viz "post-recovery-zone" "$STORE"
 log_heatmap_viz "post-recovery-heatmap"
 
 say "Phase 4: Verification"
-EXPECTED_AFTER_SQ=$(( PRE_CRASH_SUM + ${INFLIGHT_FOR_KEY:-0} ))
-EXPECTED_AFTER_LS=$(( PRE_CRASH_LASTSEQ + ${INFLIGHT_FOR_KEY:-0} ))
+# Với causal inflight hiện tại, mục tiêu là khôi phục lại đúng trạng thái trước crash.
+# inflightForKey thể hiện số event đã được replay để rebuild PRE_CRASH_* từ snapshot,
+# không phải phần delta cộng thêm trên PRE_CRASH_SUM.
+EXPECTED_AFTER_SQ=$PRE_CRASH_SUM
+EXPECTED_AFTER_LS=$PRE_CRASH_LASTSEQ
 if wait_for_exact "$EXACT_URL_WS" "$EXPECTED_AFTER_LS" $CHECK_EXACT_RETRIES; then
   after_ls=$(get_lastseq "$EXACT_URL_WS"); after_sq=$(get_exact_sumqty "$EXACT_URL")
 else
@@ -1643,8 +1670,8 @@ if [[ -n "${PRE_CRASH_SUM:-}" ]]; then
 fi
 
 # Check causal metrics from /status endpoint
-CAUSAL_REPLAY_TOTAL=$(get_status_field "causalReplayTotal")
-CAUSAL_INFLIGHT_GAUGE=$(get_status_field "causalInflight")
+CAUSAL_REPLAY_TOTAL=$(get_status_field "causalReplayTotal" "$CRASH_HTTP")
+CAUSAL_INFLIGHT_GAUGE=$(get_status_field "causalInflight" "$CRASH_HTTP")
 say "Causal metrics from /status:"
 say "  - causalReplayTotal: $CAUSAL_REPLAY_TOTAL (events replayed during restore)"
 say "  - causalInflight: $CAUSAL_INFLIGHT_GAUGE (current inflight events, should be 0 after recovery)"
