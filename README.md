@@ -412,16 +412,3 @@ Mình đề xuất kế hoạch 3 bước: **(1) gom kỹ thuật theo nhóm kh�
 
 Phần này giúp “lượng hoá” hiệu quả các kỹ thuật trên.
 
----
-
-### Hướng đi tiếp theo
-
-- **Bước 1** (anh vừa yêu cầu): mình đã liệt kê và nhóm theo kỹ thuật + file gốc.  
-- **Bước 2**: chọn ra **3–4 nhóm** để đưa vào bài chính (gợi ý: A, B+C, D+E) và 1–2 nhóm (F,G) cho phần “bonus/roadmap”.  
-- **Bước 3**: mỗi nhóm viết 1–2 trang tóm tắt:
-  - Ý tưởng lý thuyết,
-  - Nơi code implement,
-  - Cách demo (nếu có script),
-  - Liên hệ đến local recovery / partial snapshot / EOS.
-
-Nếu anh muốn, bước sau mình có thể đi từng nhóm một, chi tiết hóa: “nhóm nào sẽ viết thành section nào trong báo cáo, dùng hình minh hoạ gì, log nào chụp screenshot”.
