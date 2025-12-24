@@ -89,12 +89,6 @@ Ghi chú
 ## 3) Demo Recovery (local)
 
 ### Demo — Recovery (local)
-- Topics opb-* dùng prefix `p1.*`, changelog `cleanup.policy=delete`, snapshots `cleanup.policy=compact`.
-
-
-## 3) Demo Recovery (local)
-
-### Demo — Recovery (local)
 Mục tiêu
 - Khởi động lại OpB, phục hồi nhanh nhờ manifest snapshot + replay changelog, và chứng minh thời gian khôi phục (TTR) dưới 10 giây sau tối ưu.
 
@@ -170,6 +164,9 @@ Trích đoạn manifest (mẫu)
   "lastChangelogOffset": 7534221,
   "createdAt": 1694499600 }
 ```
+Đây là phiên bản thu gọn nhưng vẫn giữ đầy đủ chi tiết kỹ thuật:
+
+---
 
 ## 7) Kỹ thuật chính & Liên hệ KIP / FLIP / EOS
 
@@ -180,7 +177,7 @@ Trích đoạn manifest (mẫu)
   `internal/opb/operator_n.go` + `cmd/opb/main.go` cài đặt barrier-cut: inject marker, ghi offsets per partition, scan dirty keys và ghi full/delta snapshot mà không block ingest.
 
 - **Bundle 3: Causal Safety (Inflight, Freeze & Epoch Fencing) (Beaver-style / FLIP-158)**  
-  `cmd/opb/causal_inflight.go` ghi `inflight.json` với `{key, payload, vectorClock}`, manifest chứa `InflightFile`, `InflightEvents`, `SnapshotVectorClock`. Khi restore, `replayInflightEvents` chạy giữa snapshot và Kafka tail để tránh “effect without cause”.
+  `cmd/opb/causal_inflight.go` ghi `inflight.json` với `{key, payload, vectorClock}`, manifest chứa `InflightFile`, `InflightEvents`, `SnapshotVectorClock`. Khi restore, `replayInflightEvents` chạy giữa snapshot và Kafka tail để tránh "effect without cause".
 
 - **Pebble SSTable shipping & incremental checkpoint (Phase 2/3)**  
   `internal/snapshot/*` xuất snapshot thành Pebble SSTable (full hoặc incremental), `internal/restore/restore.go` import trực tiếp (`CheckpointCapable.ImportSSTables`). Manifest lưu `PebbleSSTFiles`, `PebbleIncrementalFiles`, `PebbleAllFiles` để mô tả chain và phục vụ GC.
@@ -192,79 +189,7 @@ Trích đoạn manifest (mẫu)
   Với `--rebalance-import-state=true`, replica mới pause ingest, gọi `importStateFromPeer` để copy snapshot từ peer, phù hợp cooperative rebalance/static membership/sticky assignor. Tính năng này hỗ trợ scale-out/HA mặc dù demo mặc định không bật.
 
 - **Observability & đo lường**  
-  `/status`, `/viz/heatmap`, `/viz/zone-data`, `/viz/snapshot-insights` cùng Prometheus gauges `opb_last_restore_*`, `opb_causal_inflight`, `opb_causal_replay_total` giúp theo dõi toàn bộ cut → restore → replay. Các script bundle (baseline vs kỹ thuật) và `measure_ttr.sh` dựa trên những metric này để tạo CSV so sánh.
-
-## 7) Kỹ thuật chính & Liên hệ KIP / FLIP / EOS
-
-- **Bundle 2: EOS & Idempotent Replay (KIP-98 / KIP-447)**  
-  OpA dùng transactional producer, OpB dedup theo `eventID=orderId#ws`, track `LastSeq` và epoch fencing → mỗi event chỉ cập nhật state một lần. Khi khôi phục, engine luôn áp dụng `snapshot → inflight → changelog`, nên state sau recover giữ nguyên EOS.
-
-- **Barrier-based partial snapshot (Chandy–Lamport)**  
-  `internal/opb/operator_n.go` + `cmd/opb/main.go` cài đặt barrier-cut: inject marker, ghi offsets per partition, scan dirty keys và ghi full/delta snapshot mà không block ingest.
-
-- **Bundle 3: Causal Safety (Inflight, Freeze & Epoch Fencing) (Beaver-style / FLIP-158)**  
-  `cmd/opb/causal_inflight.go` ghi `inflight.json` với `{key, payload, vectorClock}`, manifest chứa `InflightFile`, `InflightEvents`, `SnapshotVectorClock`. Khi restore, `replayInflightEvents` chạy giữa snapshot và Kafka tail để tránh “effect without cause”.
-
-- **Pebble SSTable shipping & incremental checkpoint (Phase 2/3)**  
-  `internal/snapshot/*` xuất snapshot thành Pebble SSTable (full hoặc incremental), `internal/restore/restore.go` import trực tiếp (`CheckpointCapable.ImportSSTables`). Manifest lưu `PebbleSSTFiles`, `PebbleIncrementalFiles`, `PebbleAllFiles` để mô tả chain và phục vụ GC.
-
-- **Manifest-driven restore & selective replay**  
-  Restore pipeline đọc manifest.latest, khôi phục chain full+delta, sau đó đối chiếu offsets với Kafka head: nếu `ReplayRequired=false` hoặc không backlog thì skip Kafka tail (Causal Freeze). Đây là lý do demo đạt `replay_s≈0`.
-
-- **Peer-assisted state migration (KIP-319 / KIP-345 / KIP-429)**  
-  Với `--rebalance-import-state=true`, replica mới pause ingest, gọi `importStateFromPeer` để copy snapshot từ peer, phù hợp cooperative rebalance/static membership/sticky assignor. Tính năng này hỗ trợ scale-out/HA mặc dù demo mặc định không bật.
-
-- **Observability & đo lường**  
-  `/status`, `/viz/heatmap`, `/viz/zone-data`, `/viz/snapshot-insights` cùng Prometheus gauges `opb_last_restore_*`, `opb_causal_inflight`, `opb_causal_replay_total` giúp theo dõi toàn bộ cut → restore → replay. Các script bundle (baseline vs kỹ thuật) và `measure_ttr.sh` dựa trên những metric này để tạo CSV so sánh.
-
-
-
-## 7) Đo TTR với Barrier-based Non-blocking Snapshot
-Mục tiêu
-- Đo chính xác thời gian khôi phục (Time-To-Recover) của OpB khi khởi động lại, dựa trên snapshot + replay changelog.
-- Làm rõ hai góc nhìn đo: “nội bộ” (in-app) và “ngoại vi” (wall‑clock), đồng thời tránh hiểu nhầm “bypass” khi không có backlog.
-
-Khái niệm đo
-- In-app (nội bộ):
-  - Trường `ttrMs` trên `/status` đo phần cốt lõi: restore snapshot + replay changelog (nếu có backlog), đến khi hoàn tất khôi phục state.
-  - Log “restore phases” (ManifestMs, SnapshotTotalMs, ChangelogMs, MetricsMs, TotalMs) giúp soi chi tiết từng pha; `TotalMs` là tổng thời gian khối restore (bao gồm ManifestMs).
-- Wall-clock (ngoại vi):
-  - `scripts/measure_ttr.sh` đo thời gian từ khi chạy `opb --restore-only` đến khi tiến trình thoát. Bao gồm overhead start/stop tiến trình + IO log/metrics → gần với trải nghiệm restart thực tế.
-
-Barrier-based Non-blocking snapshot là gì?
-- Khi gọi `/admin/snapshot-cut`, OpB inject “barrier” vào tất cả partitions của topic input, đợi thấy barrier trên từng partition được assign, chụp snapshot qua Pebble SnapshotView (không chặn writer), rồi ghi `manifest` kèm offsets per‑partition của changelog.
-- Khôi phục: đọc `manifest.changelog.offsets` và chỉ replay phần “sau” snapshot.
-- Nếu ngay sau cut chưa có backlog (watermarks ≈ offsets), phần replay ≈ 0 → TTR nhỏ là hợp lý theo thiết kế (không phải bypass).
-
-Cách chạy benchmark TTR
-- Mặc định non‑blocking snapshot dùng `scripts/measure_ttr.sh`:
-  ```bash
-  BOOTSTRAP=127.0.0.1:9092 \
-  HTTP_ADDR=:8089 RESTORE_HTTP_ADDR=:8099 \
-  SNAPSHOT_DIR=./snapshots \
-  STATE_DIR=./data/opb RESTORE_STATE_DIR=./data/opb-restore-only \
-  PUMP_AFTER_CUT=20000 \
-  bash scripts/measure_ttr.sh
-  ```
-  - Script sẽ:
-    1) Gọi `/admin/snapshot-cut` → chờ `manifest` có `.changelog.offsets[]` (barrier ready).
-    2) “Pin” manifest để giữ mốc đo.
-    3) (Tuỳ chọn) Bơm thêm tải sau cut (`PUMP_AFTER_CUT`) → đợi backlog hình thành dựa trên watermarks vs offsets.
-    4) Chạy `opb --restore-only` và in thời gian wall‑clock; đồng thời đọc “restore phases” trong log.
-- Ép có replay rõ ràng (tuỳ chọn):
-  - Đặt `STRIP_OFFSETS=1` để xoá `.changelog` khỏi manifest pinned (replay từ đầu hoặc từ `lastChangelogOffset`), hoặc tăng `PUMP_AFTER_CUT` + `WAIT_BACKLOG_SEC`.
-
-Báo cáo nên công bố 2 con số
-- TTR‑snapshot‑only: khi không có backlog (hoặc deliberately strip offsets để tách riêng snapshot). Dựa trên `ttrMs` và `SnapshotTotalMs`/`TotalMs`; kèm wall‑clock.
-- TTR‑snapshot+replay(N): tạo backlog cỡ N; xác nhận wm.high − manifest.offsets ≥ N trước restore. Báo `ChangelogMs`, `TotalMs`, `ttrMs` và wall‑clock, kèm số bản ghi áp dụng/skipped để đối chiếu.
-
-Lưu ý để phép đo ổn định
-- Chạy nhiều lần và lấy p50/p95 (hoặc min) để giảm nhiễu IO/GC.
-- Cố định môi trường: `--snapshot-interval 0` cho tiến trình ingest, dùng `RESTORE_STATE_DIR` riêng, tránh job nền.
-- Với Kafka: tăng `WAIT_BACKLOG_SEC` nếu bơm lớn sau cut; xác thực backlog qua watermarks.
-
-Thông điệp quan trọng khi trình bày
-- TTR nhỏ khi không có backlog sau barrier là mục tiêu của kỹ thuật (không phải bypass). Để công bằng, luôn bổ sung kịch bản có backlog và công bố `ChangelogMs`/`applied`.
+  `/status`, `/viz/heatmap`, `/viz/zone-data`, `/viz/snapshot-insights` cùng Prometheus gauges `opb_last_restore_*`, `opb_causal_inflight`, `opb_causal_replay_total` giúp theo dõi toàn bộ cut → restore → replay.
 
 
 ## 9) Kỹ thuật Recovery & Snapshot (nâng cao) — trạng thái hiện tại
@@ -351,9 +276,6 @@ git commit -m "chore: add .gitignore; docs: update recovery/snapshot techniques;
 git push origin <branch>
 ```
 
-Gợi ý: Các script demo sẽ tự tạo lại thư mục khi chạy nên việc xoá là an toàn. Nếu cần giữ mẫu nhỏ cho báo cáo, hãy lưu dưới `docs/examples/` (không dùng cho runtime).
-
-Mình đề xuất kế hoạch 3 bước: **(1) gom kỹ thuật theo nhóm khái niệm**, **(2) map từng nhóm vào code/file cụ thể**, **(3) chọn cái nào đưa vào demo chính, cái nào ghi vào báo cáo/phụ lục**. Dưới đây là bản nhóm trước, gom tất cả kỹ thuật “nâng cao” liên quan EOS, partial snapshot, local recovery trong project (kể cả không nằm trong `demo_recovery.sh`):
 
 ---
 
