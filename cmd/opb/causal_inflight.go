@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 
 	"hpb/internal/opb"
 	"hpb/internal/state"
@@ -77,7 +79,28 @@ func replayInflightEvents(cfg Config, st state.Store, snap inflightSnapshot) err
 		}
 		sort.Strings(order)
 	}
-	for _, ch := range order {
+
+	// --- Parallel Replay Logic ---
+	numWorkers := cfg.ReplayWorkers
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+		if numWorkers > 8 {
+			numWorkers = 8 // Cap at 8 to avoid excessive I/O contention
+		}
+	}
+	if numWorkers > len(order) {
+		numWorkers = len(order)
+	}
+
+	jobs := make(chan string, len(order))
+	results := make(chan error, len(order))
+	var wg sync.WaitGroup
+
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for ch := range jobs {
 		for _, rec := range snap.Events[ch] {
 			if len(rec.Payload) == 0 {
 				continue
@@ -87,9 +110,27 @@ func replayInflightEvents(cfg Config, st state.Store, snap inflightSnapshot) err
 				continue
 			}
 			if _, _, _, err := opb.AggregateAndBuildOutput(st, cfg.WindowSizeSec, ev); err != nil {
-				return fmt.Errorf("replay inflight channel=%s key=%s: %w", ch, rec.Key, err)
+						results <- fmt.Errorf("worker %d: replay inflight channel=%s key=%s: %w", workerID, ch, rec.Key, err)
+						return
 			}
 		}
 	}
+		}(w)
+	}
+
+	for _, ch := range order {
+		jobs <- ch
+	}
+	close(jobs)
+
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }

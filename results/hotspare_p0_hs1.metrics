@@ -1,2 +1,0 @@
-config: PREWARM_RESTORE_PARALLELISM=0 HOTSPARE_FAST_SWITCH=1
-hotspare_fast_switch_ms 7405

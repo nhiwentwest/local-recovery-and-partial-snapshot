@@ -1,2 +1,0 @@
-partitions,burst_total_events,ttr_s,restore_ms,replay_s,replay_events,inflight,snapshot_kb,sst_files,inc_files
-12,100000,0.186,186,0.093,0,0,,0,0

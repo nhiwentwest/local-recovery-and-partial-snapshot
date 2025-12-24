@@ -1,9 +1,0 @@
-opb_last_restore_eos_ok{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 1
-opb_last_restore_incremental_files{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 0
-opb_last_restore_inflight_replayed{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 0
-opb_last_restore_replay_events{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 45000
-opb_last_restore_replay_seconds{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 0.128
-opb_last_restore_restore_only_ms{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 69
-opb_last_restore_snapshot_bytes{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 160895
-opb_last_restore_sst_files_total{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 6
-opb_last_restore_ttr_seconds{format="pebble",instance="B2",snapshot_id="2025-11-30T07:34:26Z",snapshot_type="full"} 0.197

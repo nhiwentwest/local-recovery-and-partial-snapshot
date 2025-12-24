@@ -13,7 +13,7 @@ metricSel.addEventListener('change', () => {
 });
 toggleWsSelector();
 
-// Ghi nhớ giá trị lần trước để hiển thị xu hướng ▲/▼ theo phút
+// Remember previous values to show trend ▲/▼ per minute
 const prevValues = new Map();
 
 // Prometheus helpers
@@ -131,34 +131,34 @@ function render(data){
     let valueDisplay = '0';
     
     if (!c.value) {
-      // Không có data: màu xám
+      // No data: gray background
       el.classList.add('no-data');
       el.style.background = '#e0e0e0';
       el.title = `${storeId}: no data`;
     } else {
       valueDisplay = Number(c.value).toLocaleString('en-US');
       const ratio = (c.value - min) / (max - min || 1); // Normalize 0-1
-      // Gradient đơn giản: xanh lá (thấp) → vàng (trung) → đỏ (cao)
+      // Simple gradient: green (low) -> yellow (mid) -> red (high)
       let r, g, b;
       if (ratio < 0.5) {
-        // Xanh lá (0-50%): xanh đậm → xanh nhạt
+        // Green (0-50%): dark green -> light green
         const subRatio = ratio / 0.5;
         r = Math.round(34 + 221 * subRatio);  // 34->255
         g = Math.round(139 + 116 * subRatio); // 139->255
         b = Math.round(34);                     // 34
       } else {
-        // Vàng → Đỏ (50-100%): vàng → đỏ đậm
+        // Yellow -> Red (50-100%): yellow -> dark red
         const subRatio = (ratio - 0.5) / 0.5;
         r = Math.round(255);                    // 255
         g = Math.round(255 - 215 * subRatio);  // 255->40
         b = Math.round(0);                      // 0
       }
       el.style.background = `rgb(${r},${g},${b})`;
-      // Xu hướng theo lần hiển thị trước
+      // Trend based on previous render
       const prev = prevValues.get(storeId) ?? c.value;
       const delta = c.value - prev;
       if (Math.abs(delta) > Math.max(5, 0.02 * prev)) {
-        // tăng: viền xanh đậm; giảm: viền đỏ đậm
+        // increase: dark green border; decrease: dark red border
         el.classList.add(delta > 0 ? 'up' : 'down');
         const trend = document.createElement('span');
         trend.className = 'trend';
@@ -169,13 +169,13 @@ function render(data){
       prevValues.set(storeId, c.value);
     }
     
-    // Label storeId (rút gọn để dễ đọc)
+    // Shortened storeId label for readability
     const label = document.createElement('span');
     label.className = 'cell-label';
     label.textContent = shortStoreId(storeId);
     el.appendChild(label);
 
-    // Numerical value to chứng minh EOS (sumQty)
+    // Numerical value to prove EOS (sumQty)
     const val = document.createElement('span');
     val.className = 'cell-value';
     val.textContent = valueDisplay;
@@ -547,3 +547,6 @@ if (cmpMarkA) {
   if (cmpWs && !cmpWs.value) { const w = await defaultWs(); if (w) cmpWs.value = String(w); }
   ensureBeforeAfterUI();
 })();
+
+
+

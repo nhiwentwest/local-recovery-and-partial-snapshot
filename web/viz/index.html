@@ -64,10 +64,10 @@
     </div>
     <div class="prom-card">
       <div class="prom-title">Exact key compare (pre/post)</div>
-      <div class="small muted" style="margin-bottom:6px">Nhập storeId, productId, ws; Load current. Nhấn Mark BEFORE trước khi crash; sau restore, Load lại và Mark AFTER để so.</div>
+      <div class="small muted" style="margin-bottom:6px">Enter storeId, productId, ws; Load current. Click Mark BEFORE before crash; after restore, Load again and Mark AFTER to compare.</div>
       <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:6px">
-        <input id="cmp-store" placeholder="storeId (VD: RECOVERY-0001)" style="width:210px" />
-        <input id="cmp-prod" placeholder="productId (VD: p0001)" style="width:130px" />
+        <input id="cmp-store" placeholder="storeId (e.g. RECOVERY-0001)" style="width:210px" />
+        <input id="cmp-prod" placeholder="productId (e.g. p0001)" style="width:130px" />
         <input id="cmp-ws" placeholder="ws epoch" style="width:150px" />
         <button id="cmp-load">Load current</button>
         <button id="cmp-mark-before">Mark BEFORE</button>
@@ -84,6 +84,6 @@
   </div>
   <div id="legend"></div>
   <div id="grid" class="grid"></div>
-  <script src="/viz/app.js"></script>
+  <script src="/viz/heatmap.js"></script>
 </body>
 </html>

@@ -77,12 +77,23 @@ type Config struct {
 	// Restore control
 	RestoreOnStart          bool // perform restore at process start (use true on restart)
 	RestoreOnly             bool // perform restore then exit (no consume); useful for staged restart
+	SkipInflightReplay      bool // when true, skip replaying inflight snapshot (useful for stage-2 restart in demo)
 	RestoreParallelism      int  // parallelism for snapshot restore (0=auto)
 	RestoreValidateChain    bool // validate chain integrity before restore (default true)
 	RestoreSkipMissingDelta bool // skip missing delta files instead of failing (default false)
 	RestoreTrustManifest    bool // trust manifest freeze hints to skip changelog replay
 	ReplayWorkers           int  // workers for Kafka changelog replay (0=auto)
-	RebalanceImportState    bool // on partition assignment, attempt to import state from a peer (best-effort)
+	// Bundle 2 / EOS idempotent replay demo: extra replay passes on the same changelog.
+	// When >1 and used together with --restore-on-start --restore-only, the restore
+	// phase will:
+	//   - run the normal snapshot+changelog replay once (pass=1),
+	//   - then invoke the same replay function multiple additional times on the
+	//     already-restored state store (pass=2..N), logging per-pass applied/skipped.
+	// This is intentionally a *diagnostic/demo* feature: metrics/TTR are reported
+	// for the first pass only; extra passes are visible via log lines
+	//   "bundle2: replay pass=X applied=... skipped=...".
+	ReplayExtraPasses    int
+	RebalanceImportState bool // on partition assignment, attempt to import state from a peer (best-effort)
 	// Snapshot compaction policy
 	SnapMaxDeltas  int // after this many deltas -> cut full (<=0 disables delta)
 	SnapMaxDeltaMB int // after delta chain bytes exceed this (MB) -> cut full (0=ignore)
@@ -190,11 +201,13 @@ func readFlags() Config {
 	// Restore control: perform restore at process start only when explicitly enabled (use true on restart)
 	flag.BoolVar(&cfg.RestoreOnStart, "restore-on-start", false, "perform restore at process start (use true on restart)")
 	flag.BoolVar(&cfg.RestoreOnly, "restore-only", false, "perform restore then exit (no consume); useful for staged restart")
+	flag.BoolVar(&cfg.SkipInflightReplay, "skip-inflight-replay", false, "skip inflight snapshot replay (useful for stage-2 restart in demo)")
 	flag.IntVar(&cfg.RestoreParallelism, "restore-parallelism", 0, "parallelism for snapshot restore (0=auto)")
 	flag.BoolVar(&cfg.RestoreValidateChain, "restore-validate-chain", true, "validate chain integrity before restore")
 	flag.BoolVar(&cfg.RestoreSkipMissingDelta, "restore-skip-missing-delta", false, "skip missing delta files instead of failing")
 	flag.BoolVar(&cfg.RestoreTrustManifest, "restore-trust-manifest", false, "trust manifest hint (replayRequired=false) to skip Kafka changelog replay")
 	flag.IntVar(&cfg.ReplayWorkers, "replay-workers", 0, "workers for Kafka changelog replay (0=auto)")
+	flag.IntVar(&cfg.ReplayExtraPasses, "replay-extra-passes", 1, "for EOS/idempotent replay demos: total replay passes to run during restore (>=1; 1=normal behaviour)")
 	flag.BoolVar(&cfg.RebalanceImportState, "rebalance-import-state", false, "on partition assignment, attempt to import state from a peer (best-effort)")
 	flag.IntVar(&cfg.SnapMaxDeltas, "snap-max-deltas", 3, "after this many deltas, force full (<=0 disables)")
 	flag.IntVar(&cfg.SnapMaxDeltaMB, "snap-max-delta-mb", 128, "after delta chain bytes exceed this (MB), force full (0=ignore)")
@@ -1407,9 +1420,10 @@ func run(cfg Config) error {
 			fmt.Fprintf(w, "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:16px;background:#0b1021;color:#e6e9ef}table{border-collapse:collapse;margin:8px 0;width:100%%;max-width:1100px}th,td{border:1px solid #2b3152;padding:8px 10px}th{background:#1b2244;color:#cdd6f4}tr:nth-child(even){background:#0f1530}tr:nth-child(odd){background:#0c1229}.tag{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;border:1px solid #2b3152}.ok{background:#16331f;color:#a6e3a1;border-color:#204a2c}.down{background:#381a1a;color:#f38ba8;border-color:#5a2a2a}.muted{color:#a6accd}.small{font-size:12px;color:#a6accd}</style></head><body>")
 			fmt.Fprintf(w, "<h3 style='margin:0 0 8px'>Cluster View <span class='small'>(auto-refresh 5s)</span></h3>")
 			// Recovery summary panel (status-specific fields only)
-			fmt.Fprintf(w, "<div style='display:flex; gap:16px; flex-wrap:wrap'>")
-			fmt.Fprintf(w, "<div style='flex:1 1 420px; border:1px solid #2b3152; padding:12px; border-radius:8px; background:#0c1229'>")
-			fmt.Fprintf(w, "<div id='recovery-summary' class='small muted'>loading...</div>")
+			// removed recovery summary container
+			fmt.Fprintf(w, "<div style='display:none'>")
+			fmt.Fprintf(w, "<div style='display:none'>")
+			fmt.Fprintf(w, "<!-- recovery summary removed -->")
 			fmt.Fprintf(w, "</div>")
 			fmt.Fprintf(w, "</div>")
 			// Fetch API
@@ -1461,7 +1475,7 @@ func run(cfg Config) error {
 			fmt.Fprintf(w, "</table>")
 			fmt.Fprintf(w, "<hr/><div><a href='/viz/' style='color:#89b4fa'>Back to heatmap</a></div>")
 			// Minimal JS for Recovery Summary and Zone Probe
-			fmt.Fprintf(w, "<script>\n(async function(){\n  async function loadStatus(){\n    try{\n      const res = await fetch('/status', {cache:'no-store'});\n      const j = await res.json();\n      const el = document.getElementById('recovery-summary');\n      if(!el) return;\n      const ttr = (j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');\n      const snap = (j.restoringSnapshotId||'N/A');\n      const off = (j.lastChangelogOffset!==undefined? j.lastChangelogOffset:'N/A');\n      const ap = (j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');\n      const sk = (j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');\n      el.innerHTML = `<div>ttrMs: <b>${ttr}</b></div>`+\n                     `<div>snapshotId: <span class='muted'>${snap}</span></div>`+\n                     `<div>lastChangelogOffset: <span class='muted'>${off}</span></div>`+\n                     `<div>restore applied/skipped: <span class='muted'>${ap}</span>/<span class='muted'>${sk}</span></div>`;\n      // Default ws suggestion\n      const wsInput = document.getElementById('pf-ws');\n      if(wsInput && !wsInput.value && j.windowSizeSec){\n        const now = Math.floor(Date.now()/1000);\n        const ws = Math.floor(now / j.windowSizeSec) * j.windowSizeSec;\n        wsInput.value = String(ws);\n      }\n    }catch(e){\n      const el = document.getElementById('recovery-summary');\n      if(el) el.textContent = 'N/A';\n    }\n  }\n  function setupProbe(){\n    const btn = document.getElementById('pf-run');\n    if(!btn) return;\n    btn.addEventListener('click', async function(){\n      const s = document.getElementById('pf-store').value.trim();\n      const p = document.getElementById('pf-prod').value.trim();\n      const w = document.getElementById('pf-ws').value.trim();\n      if(!s || !p || !w){ return; }\n      const url = `/viz/zone-data?id=${encodeURIComponent(s)}&productId=${encodeURIComponent(p)}&ws=${encodeURIComponent(w)}`;\n      const pu = document.getElementById('probe-url');\n      if(pu) pu.textContent = url;\n      const fr = document.getElementById('probe-frame');\n      if(fr) fr.src = url;\n    });\n  }\n  await loadStatus();\n  setupProbe();\n})();\n</script>")
+			fmt.Fprintf(w, "<script>\n(async function(){\n  async function loadStatus(){\n    try{\n      const res = await fetch('/status', {cache:'no-store'});\n      const j = await res.json();\n      const el = null;\n      if(!el) return;\n      const ttr = (j.ttrMs!==undefined? j.ttrMs+' ms':'N/A');\n      const snap = (j.restoringSnapshotId||'N/A');\n      const off = (j.lastChangelogOffset!==undefined? j.lastChangelogOffset:'N/A');\n      const ap = (j.lastRestoreApplied!==undefined? j.lastRestoreApplied:'N/A');\n      const sk = (j.lastRestoreSkipped!==undefined? j.lastRestoreSkipped:'N/A');\n      el.innerHTML = `<div>ttrMs: <b>${ttr}</b></div>`+\n                     `<div>snapshotId: <span class='muted'>${snap}</span></div>`+\n                     `<div>lastChangelogOffset: <span class='muted'>${off}</span></div>`+\n                     `<div>restore applied/skipped: <span class='muted'>${ap}</span>/<span class='muted'>${sk}</span></div>`;\n      // Default ws suggestion\n      const wsInput = document.getElementById('pf-ws');\n      if(wsInput && !wsInput.value && j.windowSizeSec){\n        const now = Math.floor(Date.now()/1000);\n        const ws = Math.floor(now / j.windowSizeSec) * j.windowSizeSec;\n        wsInput.value = String(ws);\n      }\n    }catch(e){\n      const el = null;\n      if(el) el.textContent = 'N/A';\n    }\n  }\n  function setupProbe(){\n    const btn = document.getElementById('pf-run');\n    if(!btn) return;\n    btn.addEventListener('click', async function(){\n      const s = document.getElementById('pf-store').value.trim();\n      const p = document.getElementById('pf-prod').value.trim();\n      const w = document.getElementById('pf-ws').value.trim();\n      if(!s || !p || !w){ return; }\n      const url = `/viz/zone-data?id=${encodeURIComponent(s)}&productId=${encodeURIComponent(p)}&ws=${encodeURIComponent(w)}`;\n      const pu = document.getElementById('probe-url');\n      if(pu) pu.textContent = url;\n      const fr = document.getElementById('probe-frame');\n      if(fr) fr.src = url;\n    });\n  }\n  await loadStatus();\n  setupProbe();\n})();\n</script>")
 			fmt.Fprintf(w, "</body></html>")
 		})
 
@@ -1792,26 +1806,41 @@ func run(cfg Config) error {
 				if m.InflightFile != "" {
 					if snap, ierr := readInflightSnapshot(cfg.SnapshotDir, m.SnapshotID, m.InflightFile); ierr != nil {
 						log.Printf("restore: inflight read error: %v", ierr)
-					} else if err := replayInflightEvents(cfg, st, snap); err != nil {
-						log.Printf("restore: inflight replay error: %v", err)
-					} else if snap.Events != nil && len(snap.Events) > 0 {
+					} else {
 						var replayTotal int
 						for _, evs := range snap.Events {
 							replayTotal += len(evs)
 						}
-						mreg.CausalReplay.Add(float64(replayTotal))
-						appStatus.AddCausalReplay(int64(replayTotal))
-						causalReplayEvents = int64(replayTotal)
-						inflightEventCount = replayTotal
-						if snap.Events != nil {
+						if cfg.SkipInflightReplay {
+							log.Printf("restore: skip inflight replay: channels=%d events=%d (flag set)", len(snap.Events), replayTotal)
+							// Still record the inflight count for status/metrics even when replay is skipped (stage-2 restart).
+							causalReplayEvents = int64(replayTotal)
+							inflightEventCount = replayTotal
 							inflightChannelCount = len(snap.Events)
-						} else if snap.Channels != nil {
-							inflightChannelCount = len(snap.Channels)
+							if inflightChannelCount == 0 && snap.Channels != nil {
+								inflightChannelCount = len(snap.Channels)
+							}
+						} else if err := replayInflightEvents(cfg, st, snap); err != nil {
+							log.Printf("restore: inflight replay error: %v", err)
+						} else if len(snap.Events) > 0 {
+							mreg.CausalReplay.Add(float64(replayTotal))
+							appStatus.AddCausalReplay(int64(replayTotal))
+							causalReplayEvents = int64(replayTotal)
+							inflightEventCount = replayTotal
+							inflightChannelCount = len(snap.Events)
+							if inflightChannelCount == 0 && snap.Channels != nil {
+								inflightChannelCount = len(snap.Channels)
+							}
+							log.Printf("restore: inflight replay applied channels=%d events=%d", len(snap.Events), replayTotal)
 						}
-						log.Printf("restore: inflight replay applied channels=%d events=%d", len(snap.Events), replayTotal)
 					}
 				}
 				var result rf.RestoreResult
+				// replayFn captures the exact replay function (Kafka or file) used for the
+				// initial changelog replay so that we can optionally invoke it multiple
+				// additional times on the already-restored state store (Bundle 2 EOS demo).
+				var replayFn func() rf.RestoreResult
+				replayedOnce := false
 				var changelogStart time.Time
 				if cfg.ChangelogSource == "kafka" && cfg.KafkaBootstrap != "" {
 					var skipKafkaReplay bool
@@ -1827,17 +1856,27 @@ func run(cfg Config) error {
 						}
 					}
 					if !skipKafkaReplay {
-						changelogStart = time.Now()
 						if m.Changelog != nil && m.Changelog.Topic != "" && len(m.Changelog.Offsets) > 0 {
-							result = rk.ReplayChangelogKafkaParallel(st, []string{cfg.KafkaBootstrap}, m.Changelog.Topic, m.Changelog.Offsets, 0, cfg.ReplayWorkers)
+							replayFn = func() rf.RestoreResult {
+								return rk.ReplayChangelogKafkaParallel(st, []string{cfg.KafkaBootstrap}, m.Changelog.Topic, m.Changelog.Offsets, 0, cfg.ReplayWorkers)
+							}
 						} else {
-							result = rk.ReplayChangelogKafkaParallel(st, []string{cfg.KafkaBootstrap}, cfg.TopicChangelog, nil, m.LastChangelogOffset, cfg.ReplayWorkers)
+							replayFn = func() rf.RestoreResult {
+								return rk.ReplayChangelogKafkaParallel(st, []string{cfg.KafkaBootstrap}, cfg.TopicChangelog, nil, m.LastChangelogOffset, cfg.ReplayWorkers)
+							}
 						}
+						changelogStart = time.Now()
+						result = replayFn()
+						replayedOnce = true
 					}
 				} else {
 					// file mode
 					changelogStart = time.Now()
-					result = restorer.ReplayChangelog(fmt.Sprintf("%s/opb.jsonl", cfg.ChangelogDir), m.LastChangelogOffset)
+					replayFn = func() rf.RestoreResult {
+						return restorer.ReplayChangelog(fmt.Sprintf("%s/opb.jsonl", cfg.ChangelogDir), m.LastChangelogOffset)
+					}
+					result = replayFn()
+					replayedOnce = true
 				}
 				if !changelogStart.IsZero() {
 					phaseTimings.ChangelogMs = time.Since(changelogStart).Milliseconds()
@@ -1848,6 +1887,25 @@ func run(cfg Config) error {
 						return fmt.Errorf("replay failed: %w", result.Error)
 					}
 				} else {
+					// Log the primary replay pass (pass=1). This is the canonical restore.
+					if replayedOnce {
+						log.Printf("bundle2: replay pass=%d applied=%d skipped=%d", 1, result.Applied, result.Skipped)
+					}
+					// For EOS/idempotent replay demos (Bundle 2), optionally run the same
+					// replay function multiple additional times against the already
+					// restored state store. With an idempotent backend (Pebble+LastSeq),
+					// subsequent passes should have applied=0 and skipped>0.
+					if cfg.RestoreOnly && cfg.ReplayExtraPasses > 1 && replayFn != nil && replayedOnce {
+						for pass := 2; pass <= cfg.ReplayExtraPasses; pass++ {
+							extra := replayFn()
+							if extra.Error != nil {
+								log.Printf("bundle2: replay pass=%d error=%v", pass, extra.Error)
+								break
+							}
+							log.Printf("bundle2: replay pass=%d applied=%d skipped=%d", pass, extra.Applied, extra.Skipped)
+						}
+					}
+
 					elapsed := time.Since(t0)
 					appStatus.SetRecovered(elapsed, int64(result.Applied), int64(result.Skipped))
 					// After restore, seed per-store gauges for Prometheus
@@ -1856,6 +1914,11 @@ func run(cfg Config) error {
 					log.Printf("restore completed: applied=%d skipped=%d elapsedMs=%.0f finishedAt=%s", result.Applied, result.Skipped, elapsed.Seconds()*1000, restoreTsDone.Format(time.RFC3339Nano))
 					log.Printf("restore ts: start=%s done=%s", restoreTsStart.Format(time.RFC3339Nano), restoreTsDone.Format(time.RFC3339Nano))
 					metricsStart := time.Now()
+					// Finalize phase timings before persisting them to restore-metrics.json.
+					// NOTE: phaseTimings is a value type; if we copy it into restoreMetrics before filling TotalMs/MetricsMs,
+					// the JSON file will show an empty "phases" object (all fields omitted).
+					phaseTimings.TotalMs = time.Since(restoreTsStart).Milliseconds()
+					phaseTimings.MetricsMs = time.Since(metricsStart).Milliseconds()
 					newMetrics := restoreMetrics{
 						SnapshotID:          m.SnapshotID,
 						LastChangelogOffset: m.LastChangelogOffset,
@@ -1901,8 +1964,20 @@ func run(cfg Config) error {
 						mreg.LastRestoreReplayEvents.WithLabelValues(lbls...).Set(float64(result.Applied + result.Skipped))
 					}
 					if mreg.LastRestoreSnapshotBytes != nil {
-						// For Pebble snapshots we don't have exact bytes at restore time; use 0 as placeholder.
-						mreg.LastRestoreSnapshotBytes.WithLabelValues(lbls...).Set(0)
+						var snapBytes float64
+						// Compute size using on-disk snapshot files; fall back to listed SSTs/incremental files.
+						if strings.ToLower(m.SnapshotType) == manifest.SnapshotTypeDelta {
+							snapBytes = deltaSnapshotSizeBytes(m.SnapshotID, restoreFormat, restoreShards)
+							if snapBytes == 0 && len(m.PebbleIncrementalFiles) > 0 {
+								snapBytes = snapshotIncrementalBytes(m.SnapshotID, m.PebbleIncrementalFiles)
+							}
+						} else {
+							snapBytes = snapshotSizeBytes(m.SnapshotID, restoreFormat, restoreShards)
+							if snapBytes == 0 && len(m.PebbleSSTFiles) > 0 {
+								snapBytes = snapshotIncrementalBytes(m.SnapshotID, m.PebbleSSTFiles)
+							}
+						}
+						mreg.LastRestoreSnapshotBytes.WithLabelValues(lbls...).Set(snapBytes)
 					}
 					if mreg.LastRestoreSSTFilesTotal != nil {
 						mreg.LastRestoreSSTFilesTotal.WithLabelValues(lbls...).Set(float64(len(m.PebbleAllFiles)))
@@ -1917,15 +1992,14 @@ func run(cfg Config) error {
 						// Treat a successful restore (no replay error) as EOS OK=1.
 						mreg.LastRestoreEOSOK.WithLabelValues(lbls...).Set(1)
 					}
-					phaseTimings.MetricsMs = time.Since(metricsStart).Milliseconds()
-					phaseTimings.TotalMs = time.Since(restoreTsStart).Milliseconds()
+					// Use the finalized timings already embedded in newMetrics.
 					if mreg.LastRestoreRestoreOnlyMs != nil {
-						mreg.LastRestoreRestoreOnlyMs.WithLabelValues(lbls...).Set(float64(phaseTimings.TotalMs))
+						mreg.LastRestoreRestoreOnlyMs.WithLabelValues(lbls...).Set(float64(newMetrics.Phases.TotalMs))
 					}
-					if phaseTimings.TotalMs > 0 {
+					if newMetrics.Phases.TotalMs > 0 {
 						line := map[string]any{
 							"phase":   "restore-phases",
-							"timings": phaseTimings,
+							"timings": newMetrics.Phases,
 						}
 						if b, err := json.Marshal(line); err == nil {
 							log.Printf("restore phases: %s", b)

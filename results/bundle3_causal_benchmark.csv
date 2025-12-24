@@ -1,0 +1,54 @@
+parts,inflightEvents,postCutEvents,manifestMs,snapshotMs,inflightMs,changelogMs,totalMs,ttrMs,applied,causalReplay
+
+[1;36m[B3C][0m BEGIN causal_freeze benchmark
+
+[1;36m[B3C][0m Reset topics
+deleted
+deleted
+deleted
+created
+created
+created
+
+[1;36m[B3C][0m Start B1
+
+[1;36m[B3C][0m Start B2
+
+[1;36m[B3C][0m Start B3
+
+[1;36m[B3C][0m Seeding base events
+
+[1;36m[B3C][0m Cut full snapshot
+
+[1;36m[B3C][0m Wait manifest with offsets (up to 300s)
+
+[1;36m[B3C][0m Pause ingest, inject inflight backlog n=100000
+
+[1;36m[B3C][0m Cut delta snapshot
+manifest ready: snapshotId=2025-12-23T06:29:12Z
+
+[1;36m[B3C][0m Draining remaining lag before freeze...
+
+[1;36m[B3C][0m Lag is zero. Pausing to seal epoch.
+manifest ready: snapshotId=2025-12-23T06:29:12Z
+
+[1;36m[B3C][0m Freeze: mark replayRequired=false on manifest(s)
+manifest ready: snapshotId=2025-12-23T06:29:12Z
+
+[1;36m[B3C][0m Stopping B3 instance on :8091...
+
+[1;36m[B3C][0m ✓ B3 process (PID 73832
+74187
+74332
+78358) exited.
+
+[1;36m[B3C][0m WARN: Lock file /Users/nhi/Documents/school/251/hpb/data/b3c.b3/LOCK still exists. Waiting a bit more...
+
+[1;36m[B3C][0m ERROR: Lock file still exists. Manual intervention may be needed.
+
+[1;36m[B3C][0m Force-removed lock file.
+
+[1;36m[B3C][0m Waiting for restore-only to complete...
+
+[1;36m[B3C][0m WARN: Restore did not complete within timeout. Parsing partial logs.
+12,364705,0,,,,,,,,0
