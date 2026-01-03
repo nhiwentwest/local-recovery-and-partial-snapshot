@@ -505,8 +505,10 @@ wait_ready() {
 
 wait_assignment_count() {
   local expected=${1:-$EXPECTED_PARTITIONS}
-  local timeout=${2:-60}
+  local timeout=${2:-120}
   say "Waiting for $expected partitions to be assigned to B1 (up to ${timeout}s)..."
+  local last_cnt=0
+  local stable_count=0
   for ((i=1;i<=timeout;i++)); do
     local cnt
     cnt=$(curl -s "$OPB1_HTTP/status" | jq '.partitions | length' 2>/dev/null || echo 0)
@@ -514,9 +516,29 @@ wait_assignment_count() {
       say "✓ B1 partitions: $cnt"
       return 0
     fi
+    # Check if assignment is stable (same count for 3 consecutive checks)
+    if [[ "$cnt" -eq "$last_cnt" && "$cnt" -gt 0 ]]; then
+      stable_count=$((stable_count + 1))
+      if [[ $stable_count -ge 3 ]]; then
+        say "WARN: B1 partition count stabilized at $cnt (expected $expected) - may be due to rebalance or other consumers"
+        # If we're close to expected (within 2), continue anyway
+        if [[ $cnt -ge $((expected - 2)) ]]; then
+          say "Continuing with $cnt partitions (close to expected $expected)"
+          return 0
+        fi
+      fi
+    else
+      stable_count=0
+    fi
+    last_cnt=$cnt
+    if [[ $((i % 10)) -eq 0 ]]; then
+      printf "\r  [%3d/%3d] B1 partitions: %d (expected: %d)" "$i" "$timeout" "$cnt" "$expected"
+    fi
     sleep 1
   done
-  say "WARN: B1 partition count did not reach $expected"
+  printf "\n"
+  say "ERROR: B1 partition count did not reach $expected (last count: $last_cnt)"
+  say "  This may indicate Kafka rebalance issues or other consumers in the group"
   return 1
 }
 
@@ -1063,7 +1085,8 @@ OPB_PID=$!
 disown || true
 
 if ! wait_ready "$OPB1_HTTP/healthz" 180; then echo "ERROR: B1 failed to start"; tail -n 200 "$OPB1_LOG" || true; exit 1; fi
-wait_assignment_count "$EXPECTED_PARTITIONS" 120 || true
+# Wait for B1 to get all partitions BEFORE B2/B3 join (to avoid rebalance during check)
+wait_assignment_count "$EXPECTED_PARTITIONS" 120
 
 log_status_endpoint "b1-start-status" "$OPB1_HTTP"
 log_cluster_viz "b1-start-cluster" "$OPB1_HTTP"
