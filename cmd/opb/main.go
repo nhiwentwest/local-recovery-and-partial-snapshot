@@ -144,6 +144,34 @@ type ingestCommand struct {
 	done  chan error
 }
 
+// sendIngestCommand sends an ingest command (pause/resume) and waits for acknowledgment.
+func sendIngestCommand(ingestCtrl chan ingestCommand, pause bool) error {
+	cmd := ingestCommand{pause: pause, done: make(chan error, 1)}
+	select {
+	case ingestCtrl <- cmd:
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("timeout enqueue ingest command")
+	}
+	select {
+	case err := <-cmd.done:
+		return err
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timeout waiting ingest ack")
+	}
+}
+
+// makeSelfURL constructs the self URL from HTTP address configuration.
+func makeSelfURL(httpAddr string) string {
+	addr := strings.TrimSpace(httpAddr)
+	if strings.HasPrefix(addr, ":") {
+		return "http://127.0.0.1" + addr
+	}
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return addr
+	}
+	return "http://" + addr
+}
+
 // metricsAdapter implements the opb.TxMetrics interface using a metrics.Registry.
 type metricsAdapter struct{ *metrics.Registry }
 
@@ -464,29 +492,11 @@ func run(cfg Config) error {
 		}
 		cc := &clusterCache{m: make(map[string]*peerEntry)}
 		sendIngestCmd := func(pause bool) error {
-			cmd := ingestCommand{pause: pause, done: make(chan error, 1)}
-			select {
-			case ingestCtrl <- cmd:
-			case <-time.After(5 * time.Second):
-				return fmt.Errorf("timeout enqueue ingest command")
-			}
-			select {
-			case err := <-cmd.done:
-				return err
-			case <-time.After(10 * time.Second):
-				return fmt.Errorf("timeout waiting ingest ack")
-			}
+			return sendIngestCommand(ingestCtrl, pause)
 		}
 
 		mkSelf := func() string {
-			addr := strings.TrimSpace(cfg.HTTPAddr)
-			if strings.HasPrefix(addr, ":") {
-				return "http://127.0.0.1" + addr
-			}
-			if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
-				return addr
-			}
-			return "http://" + addr
+			return makeSelfURL(cfg.HTTPAddr)
 		}
 		peersList := func() []string {
 			self := mkSelf()
@@ -2270,30 +2280,11 @@ func run(cfg Config) error {
 						go func() {
 							// helper to send ingest command and wait ack
 							sendIngestCmd := func(pause bool) error {
-								cmd := ingestCommand{pause: pause, done: make(chan error, 1)}
-								select {
-								case ingestCtrl <- cmd:
-									// ok
-								case <-time.After(5 * time.Second):
-									return fmt.Errorf("timeout enqueue ingest command")
-								}
-								select {
-								case err := <-cmd.done:
-									return err
-								case <-time.After(10 * time.Second):
-									return fmt.Errorf("timeout waiting ingest ack")
-								}
+								return sendIngestCommand(ingestCtrl, pause)
 							}
 							// derive self url
 							mkSelf := func() string {
-								addr := strings.TrimSpace(cfg.HTTPAddr)
-								if strings.HasPrefix(addr, ":") {
-									return "http://127.0.0.1" + addr
-								}
-								if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
-									return addr
-								}
-								return "http://" + addr
+								return makeSelfURL(cfg.HTTPAddr)
 							}
 							self := mkSelf()
 							var peer string

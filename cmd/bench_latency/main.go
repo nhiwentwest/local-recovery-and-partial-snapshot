@@ -66,6 +66,111 @@ func metadataPartitionCount(c *ck.Consumer, topic string, timeout time.Duration)
 	return 1
 }
 
+// produceBurstEvents produces a burst of enriched events for the same key.
+func produceBurstEvents(prod *ck.Producer, topicIn, store, pid string, ws int64, bursts, sleepMs int, sampleNum int) time.Time {
+	t0send := time.Now()
+	topic := topicIn
+	for b := 0; b < bursts; b++ {
+		value := fmt.Sprintf(`{"orderId":"lt-%d-%d-%d","productId":"%s","price":9000,"qty":1,"storeId":"%s","ts":%d,"validated":true,"normTs":%d}`,
+			sampleNum, b, time.Now().UnixNano(), pid, store, ws+1, ws+1)
+		delivery := make(chan ck.Event, 1)
+		err := prod.Produce(&ck.Message{
+			TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny},
+			Key:            []byte(fmt.Sprintf("%s#%s", store, pid)),
+			Value:          []byte(value),
+			Headers:        []ck.Header{{Key: "t0", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))}},
+		}, delivery)
+		if err != nil {
+			log.Fatalf("produce: %v", err)
+		}
+		select {
+		case ev := <-delivery:
+			m := ev.(*ck.Message)
+			if m.TopicPartition.Error != nil {
+				log.Fatalf("delivery error: %v", m.TopicPartition.Error)
+			}
+		case <-time.After(5 * time.Second):
+			log.Fatalf("delivery timeout")
+		}
+		if sleepMs > 0 {
+			time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+		}
+	}
+	return t0send
+}
+
+// measureLatency polls for messages and measures latency until deadline or hit.
+func measureLatency(cons *ck.Consumer, measureTopic, keyOut string, part int32, t0send time.Time, deadline time.Time) (time.Duration, bool) {
+	for time.Now().Before(deadline) {
+		ev := cons.Poll(200)
+		if ev == nil {
+			continue
+		}
+		switch m := ev.(type) {
+		case *ck.Message:
+			if m.TopicPartition.Topic != nil {
+				if strings.EqualFold(*m.TopicPartition.Topic, measureTopic) && string(m.Key) == keyOut {
+					// prefer t1-t0 from headers if available
+					var lat time.Duration
+					var have bool
+					var t0h, t1h []byte
+					for _, h := range m.Headers {
+						if h.Key == "t0" {
+							t0h = h.Value
+						}
+						if h.Key == "t1" {
+							t1h = h.Value
+						}
+					}
+					if len(t0h) > 0 && len(t1h) > 0 {
+						var t0v, t1v int64
+						_, _ = fmt.Sscan(string(t0h), &t0v)
+						_, _ = fmt.Sscan(string(t1h), &t1v)
+						if t1v > 0 && t0v > 0 {
+							lat = time.Duration(t1v - t0v)
+							have = true
+						}
+					}
+					if !have {
+						lat = time.Since(t0send)
+					}
+					return lat, true
+				}
+			}
+		case ck.Error:
+			// ignore transient
+		default:
+			// ignore
+		}
+	}
+	return 0, false
+}
+
+// calculatePercentiles calculates p50, p95, p99 from latency measurements.
+func calculatePercentiles(lats []time.Duration) (p50, p95, p99 time.Duration) {
+	// sort latencies (simple bubble sort)
+	sorted := make([]time.Duration, len(lats))
+	copy(sorted, lats)
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j] < sorted[i] {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+	p := func(q float64) time.Duration {
+		idx := int(float64(len(sorted)-1) * q)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx > len(sorted)-1 {
+			idx = len(sorted) - 1
+		}
+		return sorted[idx]
+	}
+	return p(0.50), p(0.95), p(0.99)
+}
+
 func main() {
 	var (
 		bootstrap    string
@@ -136,83 +241,14 @@ func main() {
 		}
 
 		// produce burst of enriched events for same key (ws+1)
-		t0send := time.Now()
-		topic := topicIn
-		for b := 0; b < bursts; b++ {
-			value := fmt.Sprintf(`{"orderId":"lt-%d-%d-%d","productId":"%s","price":9000,"qty":1,"storeId":"%s","ts":%d,"validated":true,"normTs":%d}`,
-				i, b, time.Now().UnixNano(), pid, store, ws+1, ws+1)
-			delivery := make(chan ck.Event, 1)
-			err = prod.Produce(&ck.Message{
-				TopicPartition: ck.TopicPartition{Topic: &topic, Partition: ck.PartitionAny},
-				Key:            []byte(fmt.Sprintf("%s#%s", store, pid)),
-				Value:          []byte(value),
-				Headers:        []ck.Header{{Key: "t0", Value: []byte(fmt.Sprintf("%d", time.Now().UnixNano()))}},
-			}, delivery)
-			if err != nil {
-				log.Fatalf("produce: %v", err)
-			}
-			select {
-			case ev := <-delivery:
-				m := ev.(*ck.Message)
-				if m.TopicPartition.Error != nil {
-					log.Fatalf("delivery error: %v", m.TopicPartition.Error)
-				}
-			case <-time.After(5 * time.Second):
-				log.Fatalf("delivery timeout")
-			}
-			if sleepMs > 0 {
-				time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-			}
-		}
+		t0send := produceBurstEvents(prod, topicIn, store, pid, ws, bursts, sleepMs, i)
 
 		deadline := time.Now().Add(30 * time.Second)
-		var hit bool
-		for time.Now().Before(deadline) {
-			ev := cons.Poll(200)
-			if ev == nil {
-				continue
-			}
-			switch m := ev.(type) {
-			case *ck.Message:
-				if m.TopicPartition.Topic != nil {
-					if strings.EqualFold(*m.TopicPartition.Topic, measureTopic) && string(m.Key) == keyOut {
-						// prefer t1-t0 from headers if available
-						var lat time.Duration
-						var have bool
-						var t0h, t1h []byte
-						for _, h := range m.Headers {
-							if h.Key == "t0" {
-								t0h = h.Value
-							}
-							if h.Key == "t1" {
-								t1h = h.Value
-							}
-						}
-						if len(t0h) > 0 && len(t1h) > 0 {
-							var t0v, t1v int64
-							_, _ = fmt.Sscan(string(t0h), &t0v)
-							_, _ = fmt.Sscan(string(t1h), &t1v)
-							if t1v > 0 && t0v > 0 {
-								lat = time.Duration(t1v - t0v)
-								have = true
-							}
-						}
-						if !have {
-							lat = time.Since(t0send)
-						}
-						lats = append(lats, lat)
-						log.Printf("sample %d: HIT key=%s part=%d in %v", i, keyOut, part, lat)
-						hit = true
-						break
-					}
-				}
-			case ck.Error:
-				// ignore transient
-			default:
-				// ignore
-			}
-		}
-		if !hit {
+		lat, hit := measureLatency(cons, measureTopic, keyOut, part, t0send, deadline)
+		if hit {
+			lats = append(lats, lat)
+			log.Printf("sample %d: HIT key=%s part=%d in %v", i, keyOut, part, lat)
+		} else {
 			log.Printf("sample %d: MISS key=%s part=%d", i, keyOut, part)
 		}
 		_ = cons.Unassign()
@@ -223,25 +259,6 @@ func main() {
 		fmt.Println("Latency: all MISS")
 		os.Exit(1)
 	}
-	// compute p50/p95/p99
-	sorted := make([]time.Duration, len(lats))
-	copy(sorted, lats)
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if sorted[j] < sorted[i] {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
-	p := func(q float64) time.Duration {
-		idx := int(float64(len(sorted)-1) * q)
-		if idx < 0 {
-			idx = 0
-		}
-		if idx > len(sorted)-1 {
-			idx = len(sorted) - 1
-		}
-		return sorted[idx]
-	}
-	fmt.Printf("Latency: p50=%v p95=%v p99=%v (n=%d)\n", p(0.50), p(0.95), p(0.99), len(lats))
+	p50, p95, p99 := calculatePercentiles(lats)
+	fmt.Printf("Latency: p50=%v p95=%v p99=%v (n=%d)\n", p50, p95, p99, len(lats))
 }
