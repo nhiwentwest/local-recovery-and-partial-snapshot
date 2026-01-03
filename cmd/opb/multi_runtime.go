@@ -2,20 +2,16 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	ck "github.com/confluentinc/confluent-kafka-go/v2/kafka"
 
-	"hpb/internal/kafkautil"
 	"hpb/internal/manifest"
 	"hpb/internal/opb"
 	rf "hpb/internal/restorefs"
@@ -49,46 +45,20 @@ func runMultiInputRuntime(cfg Config) error {
 	log.Printf("mi event=start topics=%v", topics)
 
 	// --- Admin HTTP and Snapshot Cut Control ---
-	type snapshotCutRequest struct {
-		cutType string
-		prev    *manifest.Manifest
-	}
-	type barrierCutContext struct {
-		id      string
-		cutType string
-		prev    *manifest.Manifest
-	}
 	cutReqCh := make(chan snapshotCutRequest, 8)
-	activeCuts := struct {
-		mu sync.Mutex
-		m  map[string]*barrierCutContext
-	}{m: make(map[string]*barrierCutContext)}
+	activeCuts := &activeCutsMap{m: make(map[string]*barrierCutContext)}
 
-	// --- State store, snapshotter, manifest publisher ---
-	if cfg.StateBackend != "pebble" {
-		return fmt.Errorf("multi-input runtime requires --state-backend=pebble")
-	}
-	if cfg.SnapshotShards < 1 {
-		cfg.SnapshotShards = 1
-	}
-	ps, err := state.NewPebbleStore(cfg.StateDir)
+	// --- State store, snapshotter, manifest publisher --- (extracted helper)
+	ctx, err := initMiStoreSnapshot(cfg)
 	if err != nil {
-		return fmt.Errorf("init pebble: %w", err)
+		return err
 	}
+	st := ctx.st
+	snap := ctx.snap
+	mani := ctx.mani
+	// Ensure Pebble store closes on function exit
+	if ps, ok := st.(*state.PebbleStore); ok {
 	defer ps.Close()
-	var st state.Store = ps
-	// Set transient instance-id to state store for LastUpdatedBy visibility
-	ps.SetInstanceID(cfg.InstanceID)
-	snap := pebbleSnapshotViewAdapter{snap: snapshot.NewPebbleSnapshotter(cfg.SnapshotDir), store: st}
-	maniFS := manifest.NewFilesystemManifest(cfg.SnapshotDir)
-	var mani manifest.Publisher = maniFS
-	if (cfg.ManifestSink == "kafka" || cfg.ManifestSink == "both") && cfg.KafkaBootstrap != "" {
-		maniK := manifest.NewKafkaManifest(cfg.KafkaBootstrap, cfg.TopicSnapshots, "opb-manifest-latest")
-		if cfg.ManifestSink == "kafka" {
-			mani = maniK
-		} else {
-			mani = manifest.MultiPublisher(maniFS, maniK)
-		}
 	}
 
 	// --- Build consumers, one per topic ---
@@ -200,253 +170,23 @@ func runMultiInputRuntime(cfg Config) error {
 		}
 	}()
 
-	// Producer for propagations (barrier markers) and admin injections
-	pCfg := &ck.ConfigMap{
-		"bootstrap.servers":  cfg.KafkaBootstrap,
-		"enable.idempotence": true,
-		"acks":               "all",
-		"transactional.id":   fmt.Sprintf("opb-mi-%s", cfg.InstanceID),
-		"linger.ms":          5,
-		"compression.type":   "lz4",
-	}
-	prod, err := ck.NewProducer(pCfg)
+	// Producer for propagations (barrier markers) and admin injections (extracted helper)
+	prod, injP, err := initMiProducers(cfg)
 	if err != nil {
-		return fmt.Errorf("multi-input: producer: %w", err)
+		return fmt.Errorf("multi-input: %w", err)
 	}
 	defer prod.Close()
-	if err := prod.InitTransactions(context.TODO()); err != nil {
-		return fmt.Errorf("multi-input: init tx: %w", err)
-	}
-	injP, injErr := ck.NewProducer(&ck.ConfigMap{"bootstrap.servers": cfg.KafkaBootstrap, "linger.ms": 5, "compression.type": "lz4"})
-	if injErr != nil {
-		log.Printf("mi event=injector status=error err=%v", injErr)
-	}
-	defer func() {
-		if injP != nil {
-			injP.Close()
+	if injP == nil {
+		log.Printf("mi event=injector status=error err=%v", fmt.Errorf("init failed"))
+	} else {
+		defer injP.Close()
 		}
-	}()
 
 	// --- Operator wiring ---
 	op := opb.NewDynamicNInputOperator()
-	// Expected provider based on current assignment across all input topics
-	op.Expected = func() []string {
-		assign.mu.RLock()
-		defer assign.mu.RUnlock()
-		var keys []string
-		for t, parts := range assign.m {
-			for _, p := range parts {
-				keys = append(keys, fmt.Sprintf("%s#%d", t, p))
-			}
-		}
-		return keys
-	}
-	// Propagate barrier: on first marker, send to ALL partitions of output topic
-	op.Propagate = func(m opb.Marker) {
-		var md *ck.Metadata
-		var merr error
-		for i := 0; i < 3; i++ {
-			md, merr = prod.GetMetadata(&cfg.OutputTopic, false, int((3 * time.Second).Milliseconds()))
-			if merr == nil {
-				break
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		if merr != nil {
-			log.Printf("mi event=propagate stage=metadata status=failed id=%s topic=%s err=%v", m.SnapshotID, cfg.OutputTopic, merr)
-			return
-		}
-		tp, ok := md.Topics[cfg.OutputTopic]
-		if !ok {
-			log.Printf("mi event=propagate status=failed id=%s topic=%s err=%s", m.SnapshotID, cfg.OutputTopic, "not-found")
-			return
-		}
-		h := opb.BarrierHeaders(m.SnapshotID)
-		_ = prod.BeginTransaction()
-		for _, part := range tp.Partitions {
-			_ = prod.Produce(&ck.Message{TopicPartition: ck.TopicPartition{Topic: &cfg.OutputTopic, Partition: int32(part.ID)}, Key: []byte("barrier"), Headers: h}, nil)
-		}
-		var cerr error
-		for i := 0; i < 2; i++ {
-			cerr = prod.CommitTransaction(context.TODO())
-			if cerr == nil {
-				break
-			}
-			time.Sleep(150 * time.Millisecond)
-		}
-		if cerr != nil {
-			log.Printf("mi event=propagate stage=commit status=failed id=%s topic=%s err=%v", m.SnapshotID, cfg.OutputTopic, cerr)
-			return
-		}
-		log.Printf("mi event=propagate status=committed id=%s topic=%s partitions=%d", m.SnapshotID, cfg.OutputTopic, len(tp.Partitions))
-	}
-	// Logging for block/unblock
-	op.OnBlock = func(ch string) { log.Printf("mi event=block channel=%s cutId=%s", ch, op.CurCutID()) }
-	op.OnUnblock = func() { log.Printf("mi event=unblock cutId=%s", op.CurCutID()) }
-	// Complete: write snapshot from state view, persist inflight.json, publish manifest
-	op.Complete = func(id string, inflight map[string][]opb.Event) {
-		activeCuts.mu.Lock()
-		cutCtx, ok := activeCuts.m[id]
-		if ok {
-			delete(activeCuts.m, id)
-		}
-		activeCuts.mu.Unlock()
-		if !ok {
-			log.Printf("mi event=complete status=error id=%s err=no_cut_context", id)
-			return
-		}
-
-		var totalInflight int
-		for _, evs := range inflight {
-			totalInflight += len(evs)
-		}
-		log.Printf("mi event=complete id=%s type=%s channels=%d inflightEvents=%d", id, cutCtx.cutType, len(inflight), totalInflight)
-
-		// Build current changelog offsets (needed for delta dirty-keys scan)
-		var offInfo *manifest.OffsetsInfo
-		if cfg.KafkaBootstrap != "" && cfg.TopicChangelog != "" {
-			if offs, parts, err := kafkautil.CollectChangelogOffsets(cfg.KafkaBootstrap, cfg.TopicChangelog); err == nil {
-				offInfo = &manifest.OffsetsInfo{Topic: cfg.TopicChangelog, Partitions: parts, Offsets: offs}
-			} else {
-				log.Printf("mi event=snapshot stage=collect-offsets status=error id=%s err=%v", id, err)
-			}
-		}
-
-		// Snapshot from a point-in-time view
-		view, err := st.NewSnapshotView()
-		if err != nil {
-			log.Printf("mi event=snapshot stage=view status=error id=%s err=%v", id, err)
-			return
-		}
-		defer view.Close()
-
-		var meta snapshot.Result
-		var serr error
-		mtype := manifest.SnapshotTypeFull
-		var baseID, parentID string
-		var dseq int
-
-		t0 := time.Now()
-		if cutCtx.cutType == manifest.SnapshotTypeDelta {
-			// Validate prev manifest and offsets
-			if cutCtx.prev == nil || cutCtx.prev.Changelog == nil || offInfo == nil || offInfo.Topic == "" || cutCtx.prev.Changelog.Topic == "" {
-				log.Printf("mi event=snapshot stage=delta-skip id=%s reason=missing-prev-or-offsets", id)
-				meta, serr = snap.WriteSnapshotFromView(id, view)
-				mtype = manifest.SnapshotTypeFull
-			} else {
-				// Determine base/parent and sequence
-				parentID = cutCtx.prev.SnapshotID
-				if cutCtx.prev.SnapshotType == manifest.SnapshotTypeDelta && cutCtx.prev.BaseSnapshotID != "" {
-					baseID = cutCtx.prev.BaseSnapshotID
-					dseq = cutCtx.prev.DeltaSequence + 1
-				} else {
-					baseID = cutCtx.prev.SnapshotID
-					dseq = 1
-				}
-				// Scan dirty keys between prev and current changelog offsets
-				keys, kerr := kafkautil.ScanDirtyKeysKafka([]string{cfg.KafkaBootstrap}, cutCtx.prev.Changelog.Topic, cutCtx.prev.Changelog.Offsets, offInfo.Offsets, 0, 1500*time.Millisecond)
-				if kerr != nil {
-					log.Printf("mi event=snapshot stage=dirty-scan status=error id=%s err=%v", id, kerr)
-					meta, serr = snap.WriteSnapshotFromView(id, view)
-					mtype = manifest.SnapshotTypeFull
-				} else {
-					log.Printf("mi event=snapshot stage=delta-start id=%s dirtyKeys=%d", id, len(keys))
-					meta, serr = snap.WriteDeltaSnapshotFromView(id, view, keys)
-					mtype = manifest.SnapshotTypeDelta
-				}
-			}
-		} else {
-			meta, serr = snap.WriteSnapshotFromView(id, view)
-		}
-		durMs := time.Since(t0).Milliseconds()
-
-		if serr != nil {
-			log.Printf("mi event=snapshot stage=write status=error id=%s type=%s err=%v", id, mtype, serr)
-			return
-		}
-		st.MarkSnapshotDone()
-
-		var channels []string
-		for ch := range inflight {
-			channels = append(channels, ch)
-		}
-		inflightRecords := make(map[string][]inflightRecord, len(inflight))
-		for ch, evs := range inflight {
-			for _, ev := range evs {
-				rec := inflightRecord{Key: ev.Key}
-				if ev.VC != nil {
-					rec.VC = ev.VC.Copy()
-				}
-				inflightRecords[ch] = append(inflightRecords[ch], rec)
-			}
-		}
-		relInflight, inflightCount, inflightErr := writeInflightSnapshot(cfg.SnapshotDir, id, channels, inflightRecords)
-		if inflightErr != nil {
-			log.Printf("mi event=inflight stage=write status=error id=%s err=%v", id, inflightErr)
-		} else if inflightCount > 0 {
-			log.Printf("mi event=inflight stage=write status=ok id=%s count=%d", id, inflightCount)
-		}
-
-		// Log delta size for tuning (if delta)
-		if mtype == manifest.SnapshotTypeDelta {
-			var totalBytes int64
-			if meta.Shards <= 1 {
-				fp := filepath.Join(cfg.SnapshotDir, id, meta.Format.FileNameDelta())
-				if fi, err := os.Stat(fp); err == nil {
-					totalBytes += fi.Size()
-				}
-			} else {
-				for i := 0; i < meta.Shards; i++ {
-					fp := filepath.Join(cfg.SnapshotDir, id, meta.Format.FileNameDeltaForShard(i, meta.Shards))
-					if fi, err := os.Stat(fp); err == nil {
-						totalBytes += fi.Size()
-					}
-				}
-			}
-			log.Printf("mi event=snapshot stage=delta-metrics id=%s keys=%d bytes=%d durMs=%d", id, meta.Keys, totalBytes, durMs)
-		}
-
-		m := manifest.Manifest{
-			SnapshotID:           id,
-			SnapshotFormat:       meta.Format.String(),
-			SnapshotShards:       meta.Shards,
-			SnapshotKeys:         meta.Keys,
-			SnapshotType:         mtype,
-			BaseSnapshotID:       baseID,
-			ParentSnapshotID:     parentID,
-			DeltaSequence:        dseq,
-			CreatedAtEpochSecond: time.Now().UTC().Unix(),
-			Changelog:            offInfo,
-			Channels:             channels,
-			InflightFile:         relInflight,
-			InflightEvents:       inflightCount,
-		}
-		// Set Pebble-specific fields if format is pebble
-		if meta.Format == snapshot.FormatPebble {
-			m.PebbleSSTFiles = meta.PebbleSSTFiles
-			m.PebbleFormatVersion = meta.PebbleFormatVersion
-			m.PebbleSSTChecksums = meta.PebbleSSTChecksums
-			m.PebbleIncrementalFiles = meta.PebbleIncrementalFiles
-			m.PebbleAllFiles = meta.PebbleSSTFiles
-		}
-		// Publish manifest with one retry
-		publishOnce := func() error {
-			if fp, ok := mani.(manifest.FullPublisher); ok {
-				return fp.Publish(m)
-			}
-			return mani.PublishLatest(id, 0)
-		}
-		perr := publishOnce()
-		if perr != nil {
-			time.Sleep(200 * time.Millisecond)
-			perr = publishOnce()
-		}
-		if perr != nil {
-			log.Printf("mi event=manifest stage=publish status=error id=%s err=%v", id, perr)
-			return
-		}
-		log.Printf("mi event=manifest stage=publish status=ok id=%s type=%s shards=%d keys=%d", id, mtype, meta.Shards, meta.Keys)
-	}
+	// Non-snapshot wiring extracted (Expected / Propagate / Block / Unblock)
+	wireOperatorBasics(op, prod, cfg, &assign)
+	wireOperatorComplete(op, cfg, st, snap, mani, activeCuts)
 
 	// Goroutine to handle cut requests and inject barriers
 	go func() {

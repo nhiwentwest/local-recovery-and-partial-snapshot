@@ -103,8 +103,8 @@ wait_manifest_offsets() {
   for ((i=1;i<=timeout;i++)); do
     if [[ -f "$dir/manifest.latest.json" ]] && jq -e '.changelog.offsets | length > 0' "$dir/manifest.latest.json" >/dev/null 2>&1; then
       say "✓ Manifest with offsets is ready."
-      return 0
-    fi
+        return 0
+      fi
     sleep 1
   done
   say "WARN: Timed out waiting for manifest with offsets."
@@ -382,7 +382,7 @@ inject_post_cut_events() {
   local payload="["
   local extra_fields
   extra_fields=$(build_extra_fields)
-payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":60000,\"sync\":false${extra_fields}}"
+  payload+="{\"storeId\":\"$STORE\",\"productId\":\"$PROD\",\"ws\":$WS,\"mode\":\"new\",\"n\":${count},\"start\":60000,\"sync\":false${extra_fields}}"
   payload+="]"
   RESP=$(post_inject "$payload")
   if command -v jq >/dev/null 2>&1; then echo "$RESP" | jq .; else echo "$RESP"; fi
@@ -1063,7 +1063,7 @@ OPB_PID=$!
 disown || true
 
 if ! wait_ready "$OPB1_HTTP/healthz" 180; then echo "ERROR: B1 failed to start"; tail -n 200 "$OPB1_LOG" || true; exit 1; fi
-wait_assignment_count "$EXPECTED_PARTITIONS" 120
+wait_assignment_count "$EXPECTED_PARTITIONS" 120 || true
 
 log_status_endpoint "b1-start-status" "$OPB1_HTTP"
 log_cluster_viz "b1-start-cluster" "$OPB1_HTTP"
@@ -1267,7 +1267,7 @@ fi
   say "Step 3: Triggering delta snapshot and resuming ingestion almost simultaneously"
   curl -s -X POST "$OPB1_HTTP/admin/snapshot-cut?type=delta" >/dev/null || true
   sleep 1 # Short delay to allow cut to initialize
-  curl -s -X POST "$OPB1_HTTP/admin/ingest/resume" >/dev/null || true
+curl -s -X POST "$OPB1_HTTP/admin/ingest/resume" >/dev/null || true
   say "  Cut triggered and ingestion resumed. Inflight capture window is now open."
 
   log_causal_status "delta-after-resume"

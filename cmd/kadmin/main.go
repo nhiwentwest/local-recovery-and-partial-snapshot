@@ -122,7 +122,7 @@ func doDeleteGroup(ac *ck.AdminClient, group string, timeout time.Duration) erro
 func main() {
 	var (
 		bootstrap = flag.String("bootstrap", "127.0.0.1:9092", "bootstrap servers")
-		cmd       = flag.String("cmd", "describe", "command: describe|delete|create|increase|delete-group|watermarks")
+		cmd       = flag.String("cmd", "describe", "command: list|describe|delete|create|increase|delete-group|watermarks")
 		topic     = flag.String("topic", "", "topic name")
 		group     = flag.String("group", "", "consumer group id for delete-group")
 		parts     = flag.Int("partitions", 4, "partitions for create/increase")
@@ -162,6 +162,29 @@ func main() {
 	}
 	cfgMap := parseConfigs(*configStr)
 	switch *cmd {
+	case "list":
+		c, err := ck.NewConsumer(&ck.ConfigMap{
+			"bootstrap.servers":  *bootstrap,
+			"group.id":           "kadmin-list",
+			"enable.auto.commit": false,
+		})
+		if err != nil {
+			log.Fatalf("list consumer: %v", err)
+		}
+		defer c.Close()
+		md, err := c.GetMetadata(nil, true, 5000)
+		if err != nil {
+			log.Fatalf("list metadata: %v", err)
+		}
+		topics := make([]string, 0, len(md.Topics))
+		for name, t := range md.Topics {
+			if t.Error.Code() == ck.ErrNoError {
+				topics = append(topics, name)
+			}
+		}
+		for _, name := range topics {
+			fmt.Println(name)
+		}
 	case "watermarks":
 		if *topic == "" {
 			log.Fatalf("missing -topic")

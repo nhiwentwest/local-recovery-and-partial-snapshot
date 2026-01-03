@@ -322,53 +322,19 @@ func run(cfg Config) error {
 		return total
 	}
 
-	// Init state store
-	var st state.Store
-	switch cfg.StateBackend {
-	case "pebble":
-		ps, err := state.NewPebbleStore(cfg.StateDir)
+	// Init state store (extracted helper)
+	st, cleanup, err := InitStateStore(cfg)
 		if err != nil {
-			return fmt.Errorf("init pebble: %w", err)
-		}
-		defer ps.Close()
-		st = ps
-	case "memory":
-		st = state.NewInMemoryStore()
-	default:
-		return fmt.Errorf("unknown state-backend: %s (use pebble|memory)", cfg.StateBackend)
+		return err
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 
-	// Set transient instance-id to state store for LastUpdatedBy visibility
-	switch v := st.(type) {
-	case *state.InMemoryStore:
-		v.SetInstanceID(cfg.InstanceID)
-	case *state.PebbleStore:
-		v.SetInstanceID(cfg.InstanceID)
-	}
-
-	// Init Pebble snapshotters (pebble-only mode).
-	var fullSnap snapshot.Snapshotter
-	var fullSnapView snapshotViewWriter
-	var deltaSnapView snapshotViewWriter
-	var deltaIncremental *snapshot.PebbleSnapshotter
-
-	pebbleSnapper := snapshot.NewPebbleSnapshotter(cfg.SnapshotDir)
-	fullSnap = pebbleSnapper
-
-	if cfg.EnablePebblePhase3 {
-		if _, ok := st.(state.IncrementalCheckpointCapable); ok {
-			deltaIncremental = pebbleSnapper
-			log.Printf("delta snapshots will use Pebble incremental shipping (Phase 3)")
-		} else {
-			log.Printf("warning: enable-pebble-phase3 set but store is not IncrementalCheckpointCapable; falling back to Phase 2 delta")
-		}
-	}
-	if deltaIncremental == nil {
-		if _, ok := st.(state.DeltaCheckpointCapable); ok {
-			deltaSnapView = pebbleDeltaWriter{snap: pebbleSnapper, st: st}
-		} else {
-			return fmt.Errorf("state store does not support Pebble delta snapshots")
-		}
+	// Init snapshotters (extracted helper)
+	fullSnap, fullSnapView, deltaSnapView, deltaIncremental, err := InitSnapshotters(cfg, st)
+	if err != nil {
+		return err
 	}
 
 	maniFS := manifest.NewFilesystemManifest(cfg.SnapshotDir)
@@ -389,26 +355,13 @@ func run(cfg Config) error {
 		maniReader = rk.NewKafkaReader([]string{cfg.KafkaBootstrap}, cfg.TopicSnapshots, "opb-manifest-latest")
 	}
 
-	// Init changelog writer (file by default; kafka optional)
-	var clog changelog.Writer
+	// Init changelog writer (helper)
+	clog, changelogKafkaEnabled, err := InitChangelog(cfg)
+		if err != nil {
+		return err
+	}
 	// Track how many changelog records have been appended so far (for manifest offset)
 	var changelogAppendedCount int64
-	if cfg.ChangelogSink == "file" || cfg.ChangelogSink == "both" || cfg.ChangelogSink == "" {
-		fw, err := changelog.NewFileWriter(cfg.ChangelogDir, "opb.jsonl")
-		if err != nil {
-			return fmt.Errorf("init changelog file: %w", err)
-		}
-		clog = fw
-	}
-	if (cfg.ChangelogSink == "kafka" || cfg.ChangelogSink == "both") && cfg.KafkaBootstrap != "" {
-		kw := changelog.NewKafkaWriter(cfg.KafkaBootstrap, cfg.TopicChangelog)
-		if clog == nil {
-			clog = kw
-		} else {
-			clog = changelog.NewMultiWriter(clog, kw)
-		}
-	}
-	changelogKafkaEnabled := cfg.ChangelogSink == "kafka" || cfg.ChangelogSink == "both"
 
 	// Prometheus metrics registry
 	mreg := metrics.NewRegistry()
@@ -1823,15 +1776,15 @@ func run(cfg Config) error {
 						} else if err := replayInflightEvents(cfg, st, snap); err != nil {
 							log.Printf("restore: inflight replay error: %v", err)
 						} else if len(snap.Events) > 0 {
-							mreg.CausalReplay.Add(float64(replayTotal))
-							appStatus.AddCausalReplay(int64(replayTotal))
-							causalReplayEvents = int64(replayTotal)
-							inflightEventCount = replayTotal
+						mreg.CausalReplay.Add(float64(replayTotal))
+						appStatus.AddCausalReplay(int64(replayTotal))
+						causalReplayEvents = int64(replayTotal)
+						inflightEventCount = replayTotal
 							inflightChannelCount = len(snap.Events)
 							if inflightChannelCount == 0 && snap.Channels != nil {
-								inflightChannelCount = len(snap.Channels)
-							}
-							log.Printf("restore: inflight replay applied channels=%d events=%d", len(snap.Events), replayTotal)
+							inflightChannelCount = len(snap.Channels)
+						}
+						log.Printf("restore: inflight replay applied channels=%d events=%d", len(snap.Events), replayTotal)
 						}
 					}
 				}
