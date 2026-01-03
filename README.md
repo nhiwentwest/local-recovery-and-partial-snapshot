@@ -168,7 +168,104 @@ Trích đoạn manifest (mẫu)
 
 ---
 
-## 7) Kỹ thuật chính & Liên hệ KIP / FLIP / EOS
+## 7) Kiến trúc thư mục project
+
+### Cấu trúc tổng quan
+```
+hpb/
+├── cmd/                    # Các ứng dụng chính (entry points)
+├── internal/              # Packages nội bộ (core logic)
+├── scripts/               # Scripts demo và setup
+├── web/                   # Web UI (visualization)
+└── tools/                 # Công cụ tiện ích
+```
+
+### cmd/ — Entry points & Applications
+**Trọng tâm:**
+- **`cmd/opb/`** — OpB Aggregator (ứng dụng chính)
+  - `main.go` — Entry point, orchestration, HTTP server setup
+  - `http_handlers.go` — Tất cả HTTP endpoints (admin, API, visualization)
+  - `restore_handler.go` — Logic restore từ snapshot + changelog
+  - `restore_helpers.go` — Helper functions cho snapshot/manifest
+  - `causal_inflight.go` — Causal inflight event tracking & replay
+  - `multi_runtime.go` — Multi-instance runtime cho HA/rebalance
+  - `mi_*.go` — Multi-instance consumers/producers/operators
+- **`cmd/opa/`** — OpA Normalizer (EOS producer)
+- **`cmd/opbtool/`** — CLI tool để inspect snapshots, verify state
+- **`cmd/kadmin/`** — Kafka admin utilities
+
+### internal/ — Core packages
+
+#### internal/opb/ — OpB core logic
+**Trọng tâm:**
+- **`operator_n.go`** — N-input operator với barrier-based snapshot (Chandy-Lamport)
+- **`aggregate.go`** — Windowed aggregation logic, idempotent apply
+- **`snapcut/`** — Snapshot cut orchestration (barrier injection, manifest generation)
+- **`tx.go`** — Transactional logic, vector clock, epoch fencing
+- **`zone.go`** — Zone/store state management
+- **`heatmap.go`** — Heatmap calculation cho visualization
+- **`vector_clock.go`** — Vector clock implementation cho causal ordering
+
+#### internal/state/ — State management
+**Trọng tâm:**
+- **`pebble_store.go`** — PebbleDB-backed state store
+  - `ExportDeltaSSTables()` — Export dirty keys thành external SSTable (zero seqnum)
+  - `IngestDeltaSSTables()` — Ingest external SSTable vào Pebble
+  - `ExportIncrementalSSTables()` — Phase 3 incremental checkpoint
+- **`state.go`** — State interface và implementations
+
+#### internal/snapshot/ — Snapshot generation
+**Trọng tâm:**
+- **`snapshot.go`** — Snapshot writer (Pebble format, JSON format)
+- **`pebble_snapshotter.go`** — Pebble-specific snapshot logic
+- **`gc.go`** — Snapshot garbage collection (ref-count based)
+
+#### internal/restore/ — Restore & recovery
+**Trọng tâm:**
+- **`restore.go`** — Main restore pipeline
+  - `RestoreFromSnapshotWithFormat()` — Restore từ snapshot chain
+  - `ReplayChangelog()` — Replay changelog từ Kafka/file
+- **`restore_pebble_test.go`** — Tests cho Pebble restore
+- **`restore_ttr_test.go`** — TTR measurement tests
+
+#### internal/manifest/ — Manifest management
+**Trọng tâm:**
+- **`manifest.go`** — Manifest schema và serialization
+  - Chứa metadata: `PebbleSSTFiles`, `PebbleIncrementalFiles`, `InflightFile`, offsets per partition
+
+#### internal/changelog/ — Changelog handling
+**Trọng tâm:**
+- **`changelog.go`** — Changelog writer/reader (file-based, Kafka-based)
+
+#### internal/restorefs/ & internal/restorekafka/
+- **`restorefs/`** — File-based restore implementation
+- **`restorekafka/`** — Kafka-based restore implementation
+
+### scripts/ — Demo & setup scripts
+**Trọng tâm:**
+- **`demo_recovery.sh`** — Demo recovery scenario (crash + restore)
+- **`run_opb.sh`** — Script khởi động OpB với cấu hình mặc định
+- **`run_opa.sh`** — Script khởi động OpA
+- **`start_pipeline.sh`** — Bơm dữ liệu mẫu vào pipeline
+
+### web/viz/ — Web visualization
+- HTML/JS/CSS cho cluster overview, zone data, heatmap visualization
+
+### Luồng dữ liệu chính (theo code)
+1. **Ingest**: `cmd/opb/main.go` → `internal/opb/operator_n.go` → `internal/opb/aggregate.go` → `internal/state/pebble_store.go`
+2. **Snapshot**: `cmd/opb/main.go` (HTTP handler) → `internal/opb/snapcut/` → `internal/snapshot/` → `internal/state/pebble_store.go` (export SSTable)
+3. **Restore**: `cmd/opb/restore_handler.go` → `internal/restore/restore.go` → `internal/state/pebble_store.go` (import SSTable) → `cmd/opb/causal_inflight.go` (replay inflight) → `internal/restore/restore.go` (replay changelog)
+
+### Điểm quan trọng
+- **Bắt đầu từ**: `cmd/opb/main.go` để hiểu entry point và orchestration
+- **State management**: `internal/state/pebble_store.go` — nơi state được lưu và export/import
+- **Snapshot logic**: `internal/opb/snapcut/` + `internal/snapshot/` — barrier cut và SSTable generation
+- **Restore logic**: `cmd/opb/restore_handler.go` + `internal/restore/restore.go` — pipeline khôi phục
+- **Tests**: Mỗi package có `*_test.go` files để hiểu behavior và edge cases
+
+---
+
+## 8) Kỹ thuật chính & Liên hệ KIP / FLIP / EOS
 
 - **Bundle 2: EOS & Idempotent Replay (KIP-98 / KIP-447)**  
   OpA dùng transactional producer, OpB dedup theo `eventID=orderId#ws`, track `LastSeq` và epoch fencing → mỗi event chỉ cập nhật state một lần. Khi khôi phục, engine luôn áp dụng `snapshot → inflight → changelog`, nên state sau recover giữ nguyên EOS.
