@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/sstable"
 )
 
 // PebbleStore implements Store using PebbleDB.
@@ -365,9 +368,35 @@ func (p *PebbleStore) ExportSSTables(dstDir string) ([]string, string, error) {
 	return files, "pebble-unknown", nil
 }
 
+// fileWritable implements objstorage.Writable by wrapping an os.File.
+type fileWritable struct {
+	f *os.File
+}
+
+var _ objstorage.Writable = (*fileWritable)(nil) // Ensure fileWritable implements objstorage.Writable
+
+func (fw *fileWritable) Write(p []byte) error {
+	_, err := fw.f.Write(p)
+	return err
+}
+
+func (fw *fileWritable) Finish() error {
+	if err := fw.f.Sync(); err != nil {
+		fw.f.Close()
+		return err
+	}
+	return fw.f.Close()
+}
+
+func (fw *fileWritable) Abort() {
+	fw.f.Close()
+	// Try to remove the file if it was created
+	os.Remove(fw.f.Name())
+}
+
 // ExportDeltaSSTables exports only the dirty keys as a new SSTable file.
-// This is Phase 2: delta SSTable shipping. Instead of checkpointing the entire
-// DB, we create a single SSTable containing only the modified keys.
+// This implementation uses sstable.Writer to create an external SSTable
+// with sequence numbers set to 0, which is required for ingestion.
 func (p *PebbleStore) ExportDeltaSSTables(dstDir string, dirtyKeys []string) ([]string, string, error) {
 	if len(dirtyKeys) == 0 {
 		return nil, "", fmt.Errorf("pebble export delta: no dirty keys")
@@ -375,77 +404,64 @@ func (p *PebbleStore) ExportDeltaSSTables(dstDir string, dirtyKeys []string) ([]
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return nil, "", fmt.Errorf("pebble export delta: mkdir: %w", err)
 	}
-	// Flush to ensure all dirty keys are in stable storage before exporting.
-	if err := p.db.Flush(); err != nil {
-		return nil, "", fmt.Errorf("pebble export delta: flush: %w", err)
-	}
-	// Create a single SSTable file for the delta using Pebble's batch write + checkpoint.
-	// Since Pebble doesn't expose a direct SSTable writer API, we'll use a workaround:
-	// create a temporary DB, write the dirty keys, checkpoint it, and copy the SSTables.
-	tmpDir := filepath.Join(dstDir, ".tmp-delta-db")
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return nil, "", fmt.Errorf("pebble export delta: mkdir tmp: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	tmpOpts := &pebble.Options{
-		MemTableSize: 64 << 20,
-		DisableWAL:   true,
-	}
-	tmpDB, err := pebble.Open(tmpDir, tmpOpts)
+
+	// Sort keys as required by sstable.Writer.
+	sort.Strings(dirtyKeys)
+
+	sstName := "delta.sst"
+	sstPath := filepath.Join(dstDir, sstName)
+
+	// Create a file and wrap it in a fileWritable to implement objstorage.Writable
+	f, err := os.Create(sstPath)
 	if err != nil {
-		return nil, "", fmt.Errorf("pebble export delta: open tmp db: %w", err)
+		return nil, "", fmt.Errorf("pebble export delta: create sst file: %w", err)
 	}
-	// Write dirty keys to tmp DB.
+	writable := &fileWritable{f: f}
+
+	w := sstable.NewWriter(writable, sstable.WriterOptions{})
+
 	for _, k := range dirtyKeys {
 		val, closer, err := p.db.Get([]byte(k))
 		if err == pebble.ErrNotFound {
-			// Key was deleted; skip.
+			// Key was deleted, represent as a tombstone.
+			if err := w.Delete([]byte(k)); err != nil {
+				w.Close()
+				writable.Abort()
+				return nil, "", fmt.Errorf("pebble export delta: write tombstone for %s: %w", k, err)
+			}
 			continue
 		}
 		if err != nil {
-			tmpDB.Close()
+			w.Close()
+			writable.Abort()
 			return nil, "", fmt.Errorf("pebble export delta: get key %s: %w", k, err)
 		}
+
+		// IMPORTANT: We must copy the value, as the buffer is only valid until closer.Close().
 		valCopy := append([]byte(nil), val...)
 		_ = closer.Close()
-		if err := tmpDB.Set([]byte(k), valCopy, pebble.NoSync); err != nil {
-			tmpDB.Close()
+
+		if err := w.Set([]byte(k), valCopy); err != nil {
+			w.Close()
+			writable.Abort()
 			return nil, "", fmt.Errorf("pebble export delta: write key %s: %w", k, err)
 		}
 	}
-	if err := tmpDB.Flush(); err != nil {
-		tmpDB.Close()
-		return nil, "", fmt.Errorf("pebble export delta: flush tmp db: %w", err)
+
+	// Close the writer. The sstable.Writer will handle finishing the writable.
+	if err := w.Close(); err != nil {
+		writable.Abort()
+		return nil, "", fmt.Errorf("pebble export delta: close writer: %w", err)
 	}
-	// Checkpoint tmp DB into dstDir.
-	sstDir := filepath.Join(dstDir, "delta")
-	if err := tmpDB.Checkpoint(sstDir); err != nil {
-		tmpDB.Close()
-		return nil, "", fmt.Errorf("pebble export delta: checkpoint: %w", err)
+	// Note: sstable.Writer.Close() should handle finishing the writable, but if it doesn't,
+	// we need to ensure the file is synced. Let's sync the file path directly.
+	sstFile, err := os.OpenFile(sstPath, os.O_RDWR, 0o644)
+	if err == nil {
+		sstFile.Sync()
+		sstFile.Close()
 	}
-	tmpDB.Close()
-	// Collect SSTable files from checkpoint.
-	entries, err := os.ReadDir(sstDir)
-	if err != nil {
-		return nil, "", fmt.Errorf("pebble export delta: readdir: %w", err)
-	}
-	var files []string
-	for _, e := range entries {
-		files = append(files, filepath.Join("delta", e.Name()))
-		full := filepath.Join(sstDir, e.Name())
-		f, err := os.Open(full)
-		if err != nil {
-			return nil, "", fmt.Errorf("pebble export delta: open %s for fsync: %w", e.Name(), err)
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			return nil, "", fmt.Errorf("pebble export delta: fsync %s: %w", e.Name(), err)
-		}
-		if err := f.Close(); err != nil {
-			return nil, "", fmt.Errorf("pebble export delta: close %s: %w", e.Name(), err)
-		}
-	}
-	return files, "pebble-delta", nil
+
+	return []string{sstName}, "pebble-delta", nil
 }
 
 // ImportSSTables implements CheckpointCapable by opening a Pebble DB from the
